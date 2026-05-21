@@ -1,0 +1,5 @@
+# Minimal placeholder. Use a validated RTKLIB config for production.
+pos1-posmode = kinematic
+pos1-frequency = l1+l2
+pos1-soltype = forward
+

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "um980-rtklib-pipeline"
+version = "0.1.0"
+description = "UM980 mixed-log extraction and RTKLIB post-processing pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+  { name = "um980-rtklib-pipeline contributors" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+config = ["PyYAML>=6.0"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+um980-ppk = "um980_rtklib_pipeline.cli:main"
+um980-rtklib-pipeline = "um980_rtklib_pipeline.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+

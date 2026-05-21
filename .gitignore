@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+
+# Local/private data and editor backups
+examples-private/
+*.unc
+*~
+.*.un~
+
+# Generated pipeline outputs
+*.clean.nmea
+*.solution.nmea
+*.solution.csv
+*.solution.gpx
+*.solution_all_records.csv
+*.observations.csv
+*.direct.obs
+*.analysis.json
+*.rover-gps.nav
+*.rtklib.stdout.log
+*.rtklib.stderr.log
+*.rtkpost-wrapper.sh
+*-rtk.nmea
+*-rtk.pos
+*-rtk.stat
+

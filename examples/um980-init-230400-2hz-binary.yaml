@@ -1,0 +1,22 @@
+port: COM1
+baud: 230400
+mode: rover
+raw:
+  format: obsvmb
+  hz: 2
+  expected_obs_per_epoch: 100
+nmea_preset: solution-20hz
+ephemeris:
+  policy: every
+  period: 300
+  systems: [gps, glo, gal, bds, bd3, qzss]
+ppp:
+  mode: e6-has
+  datum: WGS84
+  timeout: 120
+  converge: [15, 30]
+diagnostics:
+  tropinfo: true
+  gpsion: true
+save_config: true
+

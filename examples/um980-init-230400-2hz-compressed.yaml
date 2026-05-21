@@ -1,0 +1,14 @@
+port: COM1
+baud: 230400
+mode: rover
+raw:
+  format: obsvmcmpb
+  hz: 2
+  expected_obs_per_epoch: 100
+nmea_preset: solution-20hz
+ephemeris:
+  policy: every
+  period: 300
+  systems: [gps, glo, gal, bds, bd3, qzss]
+save_config: true
+

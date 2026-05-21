@@ -1,0 +1,385 @@
+"""UM980 raw observation decoding."""
+
+from __future__ import annotations
+
+import csv
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from statistics import mean, median
+from typing import Literal
+
+from .stream import StreamRecord
+from .timeutil import gps_week_tow_to_datetime
+
+
+SystemName = Literal["GPS", "GLONASS", "Galileo", "BDS", "QZSS", "SBAS", "IRNSS", "Unknown"]
+
+RINEX_SYSTEM_PREFIX = {
+    "GPS": "G",
+    "GLONASS": "R",
+    "Galileo": "E",
+    "BDS": "C",
+    "QZSS": "J",
+    "SBAS": "S",
+    "IRNSS": "I",
+    "Unknown": "U",
+}
+
+SYSTEM_ALIASES = {
+    "GPS": "GPS",
+    "GLO": "GLONASS",
+    "GLONASS": "GLONASS",
+    "GAL": "Galileo",
+    "GALILEO": "Galileo",
+    "BDS": "BDS",
+    "BD": "BDS",
+    "BEIDOU": "BDS",
+    "QZSS": "QZSS",
+    "SBAS": "SBAS",
+    "IRNSS": "IRNSS",
+}
+
+UM980_SYSTEM_IDS = {
+    0: "GPS",
+    1: "GLONASS",
+    2: "SBAS",
+    3: "Galileo",
+    4: "BDS",
+    5: "QZSS",
+    6: "IRNSS",
+    # Observed UM980 captures use extended IDs for some constellations.
+    8: "Galileo",
+    9: "BDS",
+}
+
+DEFAULT_SIGNAL_CODES = {
+    ("GPS", "L1"): "1C",
+    ("GPS", "L1CA"): "1C",
+    ("GPS", "L2"): "2L",
+    ("GPS", "L5"): "5Q",
+    ("Galileo", "E1"): "1C",
+    ("Galileo", "E5A"): "5Q",
+    ("Galileo", "E5B"): "7Q",
+    ("Galileo", "E6"): "6C",
+    ("GLONASS", "G1"): "1C",
+    ("GLONASS", "G2"): "2C",
+    ("GLONASS", "G3"): "3Q",
+    ("BDS", "B1I"): "2I",
+    ("BDS", "B1C"): "1P",
+    ("BDS", "B2I"): "7I",
+    ("BDS", "B2A"): "5P",
+    ("BDS", "B3I"): "6I",
+    ("SBAS", "L1"): "1C",
+}
+
+
+@dataclass
+class Observation:
+    gps_week: int
+    tow: float
+    sat_system: SystemName
+    sv: int
+    rinex_sat: str
+    signal_name: str
+    rinex_code: str
+    band: str
+    pseudorange_m: float | None
+    carrier_phase_cycles: float | None
+    doppler_hz: float | None
+    cn0_dbhz: float | None
+    lock_time_s: float | None
+    half_cycle: bool | None
+    lli: int
+    raw_tracking_status: int
+
+
+@dataclass
+class ObservationExtraction:
+    observations: list[Observation]
+    unsupported_records: dict[str, int]
+    metrics: dict[str, object]
+    warnings: list[str]
+
+
+def _float(value: str) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int(value: str) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_auto(value: str) -> int | None:
+    try:
+        return int(value, 0)
+    except ValueError:
+        try:
+            return int(value, 16)
+        except ValueError:
+            return _int(value)
+
+
+def _system(value: str) -> SystemName:
+    return SYSTEM_ALIASES.get(value.strip().upper(), "Unknown")  # type: ignore[return-value]
+
+
+def _system_from_id(value: int | None) -> SystemName:
+    if value is None:
+        return "Unknown"
+    return UM980_SYSTEM_IDS.get(value, "Unknown")  # type: ignore[return-value]
+
+
+def _rinex_code(system: SystemName, signal: str) -> str:
+    signal_key = signal.upper().replace("/", "").replace("-", "")
+    return DEFAULT_SIGNAL_CODES.get((system, signal_key), "1C")
+
+
+def _observation_from_tokens(tokens: list[str]) -> Observation | None:
+    # Conservative CSV-like OBSVMA subset:
+    # OBSVMA,week,tow,system,sv,signal,pseudorange,phase,doppler,cn0,lock,tracking
+    if len(tokens) < 10:
+        return None
+    week = _int(tokens[1])
+    tow = _float(tokens[2])
+    system = _system(tokens[3])
+    sv = _int(tokens[4])
+    if week is None or tow is None or sv is None:
+        return None
+    signal = tokens[5].strip() or "L1"
+    code = _rinex_code(system, signal)
+    prefix = RINEX_SYSTEM_PREFIX[system]
+    rinex_sat = f"{prefix}{sv:02d}" if prefix != "U" else f"U{sv:02d}"
+    tracking = _int(tokens[11]) if len(tokens) > 11 else 0
+    return Observation(
+        gps_week=week,
+        tow=tow,
+        sat_system=system,
+        sv=sv,
+        rinex_sat=rinex_sat,
+        signal_name=signal,
+        rinex_code=code,
+        band=code[0],
+        pseudorange_m=_float(tokens[6]),
+        carrier_phase_cycles=_float(tokens[7]),
+        doppler_hz=_float(tokens[8]),
+        cn0_dbhz=_float(tokens[9]),
+        lock_time_s=_float(tokens[10]) if len(tokens) > 10 else None,
+        half_cycle=None,
+        lli=0,
+        raw_tracking_status=tracking or 0,
+    )
+
+
+def _obsvma_payload_observations(header_tokens: list[str], payload_tokens: list[str]) -> list[Observation]:
+    if len(header_tokens) < 6:
+        return []
+    week = _int(header_tokens[4])
+    tow_ms = _float(header_tokens[5])
+    if week is None or tow_ms is None:
+        return []
+    tow = tow_ms / 1000.0
+    tokens = [token for token in payload_tokens if token != ""]
+    if not tokens:
+        return []
+    declared_count = _int(tokens[0])
+    if declared_count is not None:
+        tokens = tokens[1:]
+
+    observations: list[Observation] = []
+    group_size = 11
+    for offset in range(0, len(tokens) - group_size + 1, group_size):
+        group = tokens[offset : offset + group_size]
+        system_id = _int(group[0])
+        sv = _int(group[1])
+        if sv is None:
+            continue
+        system = _system_from_id(system_id)
+        tracking = _int_auto(group[10]) or 0
+        # Full UM980 tracking-status signal decoding is intentionally deferred.
+        # Use a conservative default code by constellation and keep the raw
+        # tracking word for later validation.
+        signal = f"TRACK_{tracking:08x}" if tracking else "L1"
+        code = _rinex_code(system, "L1")
+        prefix = RINEX_SYSTEM_PREFIX[system]
+        cn0_raw = _float(group[7])
+        observations.append(
+            Observation(
+                gps_week=week,
+                tow=tow,
+                sat_system=system,
+                sv=sv,
+                rinex_sat=f"{prefix}{sv:02d}" if prefix != "U" else f"U{sv:02d}",
+                signal_name=signal,
+                rinex_code=code,
+                band=code[0],
+                pseudorange_m=_float(group[2]),
+                carrier_phase_cycles=_float(group[3]),
+                doppler_hz=_float(group[6]),
+                cn0_dbhz=cn0_raw / 100.0 if cn0_raw is not None and cn0_raw > 100 else cn0_raw,
+                lock_time_s=_float(group[9]),
+                half_cycle=None,
+                lli=0,
+                raw_tracking_status=tracking,
+            )
+        )
+    if declared_count is not None and observations and abs(declared_count - len(observations)) > 5:
+        # The payload count differs across firmware variants; do not reject the
+        # decoded observations, but keep parsing conservative by group size.
+        return observations
+    return observations
+
+
+def decode_observations(records: list[StreamRecord]) -> ObservationExtraction:
+    observations: list[Observation] = []
+    unsupported: dict[str, int] = defaultdict(int)
+    warnings: list[str] = []
+    for record in records:
+        msg_type = (record.msg_type or "").upper()
+        if record.kind == "unicore_ascii" and msg_type == "OBSVMA" and record.text:
+            body = record.text[1:].split("*", 1)[0]
+            header, _, payload = body.partition(";")
+            header_tokens = [token.strip() for token in header.split(",")]
+            payload_tokens = [token.strip() for token in payload.replace("|", ",").split(",")]
+            parsed_payload = _obsvma_payload_observations(header_tokens, payload_tokens)
+            if parsed_payload:
+                observations.extend(parsed_payload)
+                continue
+            payload_text = payload or header
+            for chunk in payload_text.replace("\r", "").split("|"):
+                tokens = [token.strip() for token in chunk.split(",")]
+                if tokens and tokens[0].upper() != "OBSVMA":
+                    tokens.insert(0, "OBSVMA")
+                obs = _observation_from_tokens(tokens)
+                if obs is not None:
+                    observations.append(obs)
+                else:
+                    unsupported["OBSVMA"] += 1
+        elif record.kind == "unicore_ascii" and msg_type in {"OBSVMB", "OBSVMCMPB"}:
+            unsupported[msg_type] += 1
+        elif record.kind == "unicore_binary":
+            unsupported[record.msg_type or "unicore_binary"] += 1
+
+    if unsupported:
+        warnings.append(
+            "some raw observation records were not decoded: "
+            + ", ".join(f"{name}={count}" for name, count in sorted(unsupported.items()))
+        )
+    if observations and any(obs.signal_name.startswith("TRACK_") for obs in observations):
+        warnings.append(
+            "UM980 tracking-status to RINEX signal mapping is incomplete; affected observations "
+            "use conservative placeholder RINEX code 1C. Do not use this RINEX for production "
+            "multi-band RTK until the mapping is validated."
+        )
+    if observations and any(obs.sat_system == "Unknown" for obs in observations):
+        warnings.append("some observations have unknown constellation IDs and may be ignored by RTKLIB")
+    if not observations:
+        warnings.append("no raw observations were decoded")
+
+    return ObservationExtraction(observations, dict(unsupported), observation_metrics(observations), warnings)
+
+
+def observation_metrics(observations: list[Observation]) -> dict[str, object]:
+    by_epoch: dict[tuple[int, float], list[Observation]] = defaultdict(list)
+    constellations: dict[str, int] = defaultdict(int)
+    bands: dict[str, int] = defaultdict(int)
+    signals: dict[str, int] = defaultdict(int)
+    codes: dict[str, int] = defaultdict(int)
+    for obs in observations:
+        by_epoch[(obs.gps_week, obs.tow)].append(obs)
+        constellations[obs.sat_system] += 1
+        bands[obs.band] += 1
+        signals[obs.signal_name] += 1
+        codes[obs.rinex_code] += 1
+    epochs = sorted(by_epoch)
+    intervals = [right[1] - left[1] for left, right in zip(epochs, epochs[1:]) if right[1] > left[1]]
+    obs_counts = [len(v) for v in by_epoch.values()]
+    metrics: dict[str, object] = {
+        "epochs": len(epochs),
+        "observations": len(observations),
+        "constellations": dict(constellations),
+        "bands": dict(bands),
+        "signals": dict(signals),
+        "rinex_observation_codes": dict(codes),
+    }
+    if intervals:
+        hz = [1.0 / interval for interval in intervals if interval > 0]
+        med = median(intervals)
+        metrics.update(
+            {
+                "mean_hz": mean(hz),
+                "median_hz": median(hz),
+                "min_hz": min(hz),
+                "max_hz": max(hz),
+                "interval_median_s": med,
+                "interval_max_s": max(intervals),
+                "missing_est": sum(max(0, round(interval / med) - 1) for interval in intervals),
+                "large_gaps": sum(1 for interval in intervals if interval > med * 3),
+            }
+        )
+    if obs_counts:
+        metrics.update(
+            {
+                "epoch_observations_min": min(obs_counts),
+                "epoch_observations_mean": mean(obs_counts),
+                "epoch_observations_median": median(obs_counts),
+                "epoch_observations_max": max(obs_counts),
+            }
+        )
+    return metrics
+
+
+def write_observations_csv(path: Path, observations: list[Observation]) -> None:
+    fields = [
+        "epoch_index",
+        "gps_week",
+        "tow",
+        "datetime_utc",
+        "rinex_sat",
+        "system",
+        "sv",
+        "signal_name",
+        "rinex_code",
+        "band",
+        "pseudorange_m",
+        "carrier_phase_cycles",
+        "doppler_hz",
+        "cn0_dbhz",
+        "lock_time_s",
+        "lli",
+        "tracking_status",
+    ]
+    epochs = {key: idx for idx, key in enumerate(sorted({(o.gps_week, o.tow) for o in observations}))}
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for obs in observations:
+            row = asdict(obs)
+            writer.writerow(
+                {
+                    "epoch_index": epochs[(obs.gps_week, obs.tow)],
+                    "gps_week": obs.gps_week,
+                    "tow": obs.tow,
+                    "datetime_utc": gps_week_tow_to_datetime(obs.gps_week, obs.tow).isoformat(),
+                    "rinex_sat": obs.rinex_sat,
+                    "system": obs.sat_system,
+                    "sv": obs.sv,
+                    "signal_name": obs.signal_name,
+                    "rinex_code": obs.rinex_code,
+                    "band": obs.band,
+                    "pseudorange_m": row["pseudorange_m"],
+                    "carrier_phase_cycles": row["carrier_phase_cycles"],
+                    "doppler_hz": row["doppler_hz"],
+                    "cn0_dbhz": row["cn0_dbhz"],
+                    "lock_time_s": row["lock_time_s"],
+                    "lli": row["lli"],
+                    "tracking_status": row["raw_tracking_status"],
+                }
+            )

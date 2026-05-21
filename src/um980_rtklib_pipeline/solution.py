@@ -1,0 +1,321 @@
+"""Receiver solution extraction and output writers."""
+
+from __future__ import annotations
+
+import csv
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from statistics import mean, median
+from typing import Literal
+
+from .nmea import (
+    FIX_QUALITY,
+    NmeaRecord,
+    datetime_from_time_date,
+    datetime_from_time_with_context,
+    dm_to_decimal,
+    float_or_none,
+    int_or_none,
+    make_sentence,
+    parse_sentence,
+    sentence_type,
+)
+from .stream import StreamRecord
+
+
+@dataclass
+class SolutionPoint:
+    time_utc: datetime
+    source: Literal["GGA", "GNS", "RMC", "PPPNAVA", "ADRNAVA"]
+    lat: float
+    lon: float
+    h_ell: float | None = None
+    h_msl: float | None = None
+    fix_quality: int | None = None
+    fix_quality_text: str | None = None
+    pos_type: str | None = None
+    sol_status: str | None = None
+    num_sats: int | None = None
+    hdop: float | None = None
+    vdop: float | None = None
+    pdop: float | None = None
+    sigma_e: float | None = None
+    sigma_n: float | None = None
+    sigma_u: float | None = None
+    speed_mps: float | None = None
+    course_deg: float | None = None
+    age_diff: float | None = None
+
+
+@dataclass
+class SolutionExtraction:
+    clean_nmea: list[str]
+    solution_records: list[str]
+    solution_points: list[SolutionPoint]
+    all_rows: list[dict[str, object]]
+    nmea_cadence: dict[str, dict[str, float | int]]
+    warnings: list[str]
+
+
+def _gga_solution(record: NmeaRecord, context_date: datetime | None) -> SolutionPoint | None:
+    fields = record.fields
+    if len(fields) < 9:
+        return None
+    dt = datetime_from_time_with_context(fields[0], context_date)
+    lat = dm_to_decimal(fields[1], fields[2])
+    lon = dm_to_decimal(fields[3], fields[4])
+    if dt is None or lat is None or lon is None:
+        return None
+    fix = int_or_none(fields[5])
+    h_msl = float_or_none(fields[8])
+    geoid_sep = float_or_none(fields[10]) if len(fields) > 10 else None
+    return SolutionPoint(
+        time_utc=dt,
+        source="GGA",
+        lat=lat,
+        lon=lon,
+        h_msl=h_msl,
+        h_ell=(h_msl + geoid_sep) if h_msl is not None and geoid_sep is not None else None,
+        fix_quality=fix,
+        fix_quality_text=FIX_QUALITY.get(fix or -1),
+        num_sats=int_or_none(fields[6]),
+        hdop=float_or_none(fields[7]),
+        age_diff=float_or_none(fields[12]) if len(fields) > 12 else None,
+    )
+
+
+def _gns_solution(record: NmeaRecord, context_date: datetime | None) -> SolutionPoint | None:
+    fields = record.fields
+    if len(fields) < 8:
+        return None
+    dt = datetime_from_time_with_context(fields[0], context_date)
+    lat = dm_to_decimal(fields[1], fields[2])
+    lon = dm_to_decimal(fields[3], fields[4])
+    if dt is None or lat is None or lon is None:
+        return None
+    h_msl = float_or_none(fields[8]) if len(fields) > 8 else None
+    return SolutionPoint(
+        time_utc=dt,
+        source="GNS",
+        lat=lat,
+        lon=lon,
+        h_msl=h_msl,
+        fix_quality_text=fields[5] or None,
+        num_sats=int_or_none(fields[6]),
+        hdop=float_or_none(fields[7]),
+        age_diff=float_or_none(fields[10]) if len(fields) > 10 else None,
+    )
+
+
+def _rmc_solution(record: NmeaRecord) -> SolutionPoint | None:
+    fields = record.fields
+    if len(fields) < 9:
+        return None
+    dt = datetime_from_time_date(fields[0], fields[8])
+    lat = dm_to_decimal(fields[2], fields[3])
+    lon = dm_to_decimal(fields[4], fields[5])
+    if dt is None or lat is None or lon is None or fields[1] != "A":
+        return None
+    speed_knots = float_or_none(fields[6])
+    return SolutionPoint(
+        time_utc=dt,
+        source="RMC",
+        lat=lat,
+        lon=lon,
+        speed_mps=speed_knots * 0.514444 if speed_knots is not None else None,
+        course_deg=float_or_none(fields[7]),
+    )
+
+
+def _ppp_adr_solution(record: NmeaRecord, source: Literal["PPPNAVA", "ADRNAVA"]) -> SolutionPoint | None:
+    # UM980 PPPNAVA/ADRNAVA field variants are receiver-firmware dependent.
+    # This parser handles common records containing lat/lon/height as numeric
+    # decimal-degree fields and preserves status fields conservatively.
+    fields = record.fields
+    numeric = [float_or_none(field) for field in fields]
+    lat_idx = lon_idx = None
+    for idx, value in enumerate(numeric):
+        if value is None or not -90 <= value <= 90:
+            continue
+        if idx + 1 < len(numeric) and numeric[idx + 1] is not None and -180 <= numeric[idx + 1] <= 180:
+            lat_idx, lon_idx = idx, idx + 1
+            break
+    if lat_idx is None or lon_idx is None:
+        return None
+    return None
+
+
+def _cadence(timestamps: list[datetime]) -> dict[str, float | int]:
+    if not timestamps:
+        return {"records": 0, "unique_timestamps": 0, "duplicates": 0}
+    ordered = sorted(timestamps)
+    unique = sorted(set(ordered))
+    duplicates = len(ordered) - len(unique)
+    intervals = [
+        (right - left).total_seconds()
+        for left, right in zip(unique, unique[1:])
+        if (right - left).total_seconds() > 0
+    ]
+    if not intervals:
+        return {
+            "records": len(ordered),
+            "unique_timestamps": len(unique),
+            "duplicates": duplicates,
+            "large_gaps": 0,
+        }
+    med = median(intervals)
+    hz_values = [1.0 / interval for interval in intervals if interval > 0]
+    return {
+        "records": len(ordered),
+        "unique_timestamps": len(unique),
+        "mean_hz": mean(hz_values),
+        "median_hz": median(hz_values),
+        "min_hz": min(hz_values),
+        "max_hz": max(hz_values),
+        "interval_median_s": med,
+        "interval_max_s": max(intervals),
+        "duplicates": duplicates,
+        "missing_est": sum(max(0, round(interval / med) - 1) for interval in intervals) if med else 0,
+        "large_gaps": sum(1 for interval in intervals if med and interval > med * 3),
+    }
+
+
+def extract_solutions(records: list[StreamRecord]) -> SolutionExtraction:
+    clean: list[str] = []
+    solution_records: list[str] = []
+    points: list[SolutionPoint] = []
+    all_rows: list[dict[str, object]] = []
+    warnings: list[str] = []
+    context_date: datetime | None = None
+    timestamps_by_type: dict[str, list[datetime]] = {}
+
+    for stream_record in records:
+        if stream_record.kind != "nmea" or stream_record.text is None:
+            continue
+        parsed = parse_sentence(stream_record.text, stream_record.checksum_ok)
+        if parsed is None:
+            continue
+        if stream_record.checksum_ok is not False:
+            clean.append(stream_record.text)
+        typ = sentence_type(parsed.talker_type)
+        point: SolutionPoint | None = None
+        if typ == "RMC":
+            point = _rmc_solution(parsed)
+            if point is not None:
+                context_date = point.time_utc
+        elif typ == "GGA":
+            point = _gga_solution(parsed, context_date)
+        elif typ == "GNS":
+            point = _gns_solution(parsed, context_date)
+        elif parsed.talker_type == "PPPNAVA":
+            point = _ppp_adr_solution(parsed, "PPPNAVA")
+            if point is None and not any(warning.startswith("PPPNAVA records") for warning in warnings):
+                warnings.append(
+                    "PPPNAVA records are preserved in solution_all_records.csv but not converted to "
+                    "solution points because receiver timestamp field mapping is not implemented."
+                )
+        elif parsed.talker_type == "ADRNAVA":
+            point = _ppp_adr_solution(parsed, "ADRNAVA")
+            if point is None and not any(warning.startswith("ADRNAVA records") for warning in warnings):
+                warnings.append(
+                    "ADRNAVA records are preserved in solution_all_records.csv but not converted to "
+                    "solution points because receiver timestamp field mapping is not implemented."
+                )
+
+        row = {
+            "offset": stream_record.offset,
+            "type": parsed.talker_type,
+            "checksum_ok": stream_record.checksum_ok,
+            "text": stream_record.text,
+        }
+        if point is not None:
+            points.append(point)
+            solution_records.append(stream_record.text)
+            timestamps_by_type.setdefault(parsed.talker_type, []).append(point.time_utc)
+            row.update(
+                {
+                    "time_utc": point.time_utc.isoformat(),
+                    "lat": point.lat,
+                    "lon": point.lon,
+                    "height": point.h_ell if point.h_ell is not None else point.h_msl,
+                }
+            )
+        all_rows.append(row)
+
+    cadence = {name: _cadence(values) for name, values in timestamps_by_type.items()}
+    return SolutionExtraction(clean, solution_records, points, all_rows, cadence, warnings)
+
+
+def write_solution_csv(path: Path, points: list[SolutionPoint]) -> None:
+    fields = list(asdict(points[0]).keys()) if points else list(SolutionPoint.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for point in points:
+            row = asdict(point)
+            row["time_utc"] = point.time_utc.isoformat()
+            writer.writerow(row)
+
+
+def write_all_records_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    fields = ["offset", "type", "checksum_ok", "time_utc", "lat", "lon", "height", "text"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_lines(path: Path, lines: list[str]) -> None:
+    path.write_text("".join(line.rstrip("\r\n") + "\r\n" for line in lines), encoding="ascii", errors="ignore")
+
+
+def write_solution_nmea(path: Path, points: list[SolutionPoint]) -> None:
+    lines = []
+    for point in points:
+        body = (
+            f"PUM980Q,{point.source},{point.sol_status or ''},{point.pos_type or ''},"
+            f"{point.num_sats or ''},{point.sigma_e or ''},{point.sigma_n or ''},"
+            f"{point.sigma_u or ''},{point.age_diff or ''}"
+        )
+        lines.append(make_sentence(body))
+    write_lines(path, lines)
+
+
+def write_gpx(path: Path, points: list[SolutionPoint]) -> None:
+    ET.register_namespace("", "http://www.topografix.com/GPX/1/1")
+    ET.register_namespace("um980", "https://github.com/holubp/um980-rtklib-pipeline")
+    root = ET.Element(
+        "gpx",
+        {
+            "version": "1.1",
+            "creator": "um980-ppk",
+            "xmlns": "http://www.topografix.com/GPX/1/1",
+            "xmlns:um980": "https://github.com/holubp/um980-rtklib-pipeline",
+        },
+    )
+    trk = ET.SubElement(root, "trk")
+    ET.SubElement(trk, "name").text = path.stem
+    seg = ET.SubElement(trk, "trkseg")
+    for point in points:
+        trkpt = ET.SubElement(seg, "trkpt", {"lat": f"{point.lat:.10f}", "lon": f"{point.lon:.10f}"})
+        if point.h_ell is not None or point.h_msl is not None:
+            ET.SubElement(trkpt, "ele").text = f"{(point.h_ell if point.h_ell is not None else point.h_msl):.4f}"
+        ET.SubElement(trkpt, "time").text = point.time_utc.isoformat().replace("+00:00", "Z")
+        ext = ET.SubElement(trkpt, "extensions")
+        ns = "{https://github.com/holubp/um980-rtklib-pipeline}"
+        values = {
+            "source": point.source,
+            "fixQuality": point.fix_quality_text or point.fix_quality,
+            "positionType": point.pos_type,
+            "solutionStatus": point.sol_status,
+            "numSats": point.num_sats,
+            "sigmaE": point.sigma_e,
+            "sigmaN": point.sigma_n,
+            "sigmaU": point.sigma_u,
+        }
+        for name, value in values.items():
+            if value is not None:
+                ET.SubElement(ext, ns + name).text = str(value)
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
