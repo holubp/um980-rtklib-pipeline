@@ -6,12 +6,18 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from hashlib import sha256
+import logging
+from os import access, X_OK
 from pathlib import Path
 from typing import Literal
 
 from .files import classify_rinex_file, has_unresolved_wildcard
 
 RtklibPathStyle = Literal["auto", "unix", "windows"]
+
+USER_RTKLIB_BIN = Path.home() / "RTKLIB-ex-bin" / "bin"
+LOCAL_RTKLIB_BIN = Path("build-tools/RTKLIB-ex-bin/bin")
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,9 @@ def executable_for_subprocess(executable: str) -> str:
         converted = _run_cygpath("-u", executable)
         if converted:
             return converted
+    path = Path(executable)
+    if path.exists() and not access(path, X_OK):
+        return str(mirror_non_executable_tool(path))
     return executable
 
 
@@ -120,12 +129,76 @@ def executable_exists(executable: str) -> bool:
 
     if shutil.which(executable):
         return True
-    if Path(executable).exists():
+    path = Path(executable)
+    if path.exists() and (access(path, X_OK) or can_mirror_non_executable_tool(path)):
         return True
     if is_cygwin() and is_windows_path(executable):
         converted = _run_cygpath("-u", executable)
         return bool(converted and Path(converted).exists())
     return False
+
+
+def can_mirror_non_executable_tool(path: Path) -> bool:
+    """Return true if a readable local tool can be mirrored to executable storage."""
+
+    return path.is_file()
+
+
+def mirror_non_executable_tool(path: Path) -> Path:
+    """Copy a readable tool to executable temp storage and return that path.
+
+    Android shared storage often strips execute bits and may be mounted noexec.
+    This keeps `build-tools/RTKLIB-ex-bin/` as the local installation source
+    while running a mirrored copy from Termux-private executable storage.
+    """
+
+    source = path.resolve()
+    digest = sha256(str(source).encode("utf-8")).hexdigest()[:16]
+    mirror_dir = Path("/data/data/com.termux/files/usr/tmp") / "um980-rtklib-tools" / digest
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    target = mirror_dir / path.name
+    if (
+        not target.exists()
+        or target.stat().st_size != source.stat().st_size
+        or int(target.stat().st_mtime) < int(source.stat().st_mtime)
+    ):
+        shutil.copyfile(source, target)
+        target.chmod(0o755)
+    return target
+
+
+def resolve_rtklib_tool(
+    tool: str,
+    *,
+    rtklib_dir: str | Path | None = None,
+    cwd: str | Path | None = None,
+) -> str:
+    """Resolve a RTKLIB executable from explicit, local, or system locations.
+
+    Resolution order is:
+    1. explicit path supplied as `tool`;
+    2. `rtklib_dir/tool` when `--rtklib-dir` is supplied and `tool` is bare;
+    3. user-local `~/RTKLIB-ex-bin/bin/tool`;
+    4. repository-local `build-tools/RTKLIB-ex-bin/bin/tool`;
+    5. the original bare tool name for normal `PATH` lookup.
+    """
+
+    tool_path = Path(tool)
+    if tool_path.parent != Path("."):
+        return tool
+    if rtklib_dir:
+        candidate = Path(rtklib_dir) / tool
+        if candidate.exists():
+            return str(candidate)
+        return str(candidate)
+    user_candidate = USER_RTKLIB_BIN / tool
+    if user_candidate.exists():
+        return str(user_candidate)
+    root = Path(cwd) if cwd is not None else Path.cwd()
+    local_candidate = root / LOCAL_RTKLIB_BIN / tool
+    if local_candidate.exists():
+        return str(local_candidate)
+    return tool
 
 
 def _has_rinex_body_records(path: Path) -> bool:
@@ -184,27 +257,69 @@ def build_rnx2rtkp_command(
     rover_obs: Path,
     base_obs: list[Path],
     nav_files: list[Path],
+    base_ecef_xyz_m: tuple[float, float, float] | None = None,
+    base_llh: tuple[float, float, float] | None = None,
     path_style: RtklibPathStyle = "auto",
 ) -> list[str]:
     """Build an `rnx2rtkp` argv list with platform-appropriate path strings."""
 
+    if base_ecef_xyz_m is not None and base_llh is not None:
+        raise ValueError("base_ecef_xyz_m and base_llh are mutually exclusive")
     resolved_style = detect_rtklib_path_style(rnx2rtkp, path_style)
-    return [
+    args = [
         executable_for_subprocess(rnx2rtkp),
         "-k",
         path_for_rtklib_argument(rtkconf, resolved_style),
         "-o",
         path_for_rtklib_argument(output_file, resolved_style),
-        path_for_rtklib_argument(rover_obs, resolved_style),
-        *[path_for_rtklib_argument(path, resolved_style) for path in base_obs],
-        *[path_for_rtklib_argument(path, resolved_style) for path in nav_files],
     ]
+    if base_ecef_xyz_m is not None:
+        args.extend(["-r", *(f"{value:.4f}" for value in base_ecef_xyz_m)])
+    if base_llh is not None:
+        args.extend(["-l", f"{base_llh[0]:.10f}", f"{base_llh[1]:.10f}", f"{base_llh[2]:.4f}"])
+    args.append(path_for_rtklib_argument(rover_obs, resolved_style))
+    args.extend(path_for_rtklib_argument(path, resolved_style) for path in base_obs)
+    args.extend(path_for_rtklib_argument(path, resolved_style) for path in nav_files)
+    return args
 
 
 def write_wrapper(path: Path, args: list[str]) -> None:
     quoted = " ".join("'" + arg.replace("'", "'\"'\"'") + "'" for arg in args)
     path.write_text("#!/bin/sh\nset -eu\n" + quoted + "\n", encoding="utf-8")
     path.chmod(0o755)
+
+
+def _has_rtklib_solution_rows(path: Path) -> bool:
+    """Return true when an RTKLIB `.pos`/`.llh` style output has data rows."""
+
+    try:
+        lines = path.read_text(encoding="ascii", errors="ignore").splitlines()
+    except OSError:
+        return False
+    return any(line.strip() and not line.startswith("%") for line in lines)
+
+
+def _warn_about_rtklib_result(output_file: Path, stderr: str) -> None:
+    """Log predictable RTKLIB success-with-bad-output situations."""
+
+    invalid_options = [
+        line.strip()
+        for line in stderr.splitlines()
+        if line.strip().startswith("invalid option value")
+    ]
+    for line in invalid_options:
+        logging.warning("RTKLIB reported an invalid configuration option: %s", line)
+    if not output_file.exists():
+        logging.warning("RTKLIB completed but did not create output file: %s", output_file)
+        return
+    if not _has_rtklib_solution_rows(output_file):
+        logging.warning(
+            "RTKLIB output has no solution rows: %s. Check rover/base time overlap, "
+            "NAV coverage, RINEX signal mappings, and RTKLIB configuration.",
+            output_file,
+        )
+    if "Q=0" in stderr and "Q=1" not in stderr and "Q=2" not in stderr:
+        logging.warning("RTKLIB progress reported only Q=0 epochs; no usable fixed/float solution was produced.")
 
 
 def run_rnx2rtkp(
@@ -215,6 +330,8 @@ def run_rnx2rtkp(
     rover_obs: Path,
     base_obs: list[Path],
     nav_files: list[Path],
+    base_ecef_xyz_m: tuple[float, float, float] | None = None,
+    base_llh: tuple[float, float, float] | None = None,
     path_style: RtklibPathStyle = "auto",
     dry_run: bool = False,
 ) -> RtklibCommand:
@@ -226,6 +343,8 @@ def run_rnx2rtkp(
         rover_obs=rover_obs,
         base_obs=base_obs,
         nav_files=nav_files,
+        base_ecef_xyz_m=base_ecef_xyz_m,
+        base_llh=base_llh,
         path_style=path_style,
     )
     stdout_log = output_file.with_suffix(".rtklib.stdout.log")
@@ -238,4 +357,5 @@ def run_rnx2rtkp(
         stderr_log.write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:
             raise RuntimeError(f"rnx2rtkp failed with exit code {result.returncode}: {result.stderr.strip()}")
+        _warn_about_rtklib_result(output_file, result.stderr)
     return RtklibCommand(args, output_file, stdout_log, stderr_log, wrapper_file)

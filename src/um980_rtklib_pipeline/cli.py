@@ -10,7 +10,15 @@ from datetime import timedelta
 from pathlib import Path
 
 from .config import deep_get, load_config
-from .euref import download_urls, normalise_rinex_file, planned_urls, resolve_station
+from .euref import (
+    BasePosition,
+    download_urls,
+    fetch_epn_station_position,
+    normalise_rinex_file,
+    parse_rinex_approx_position,
+    planned_urls,
+    resolve_station,
+)
 from .files import basename_for, ensure_out_dir
 from .initgen import (
     InitProfile,
@@ -26,7 +34,7 @@ from .obs_decode import decode_observations, write_observations_csv
 from .quality import build_analysis, write_analysis_json
 from .rinex_nav import extract_rover_nav
 from .rinex_obs import write_rinex_obs
-from .rtklib import run_rnx2rtkp
+from .rtklib import resolve_rtklib_tool, run_rnx2rtkp
 from .solution import (
     extract_solutions,
     write_all_records_csv,
@@ -36,6 +44,8 @@ from .solution import (
     write_solution_nmea,
 )
 from .stream import parse_stream
+
+BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate")
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -96,6 +106,209 @@ def _log_analysis_warnings(analysis: dict[str, object]) -> None:
         return
     for warning in warnings:
         logging.warning("%s", warning)
+
+
+def _add_base_position_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--base-station")
+    parser.add_argument(
+        "--base-position-source",
+        choices=["auto", "euref", "rinex-header", "none"],
+        default="auto",
+    )
+    parser.add_argument("--base-ecef", nargs=3, type=float, metavar=("X", "Y", "Z"))
+    parser.add_argument("--base-llh", nargs=3, type=float, metavar=("LAT", "LON", "HEIGHT"))
+    parser.add_argument("--base-position-cache-dir")
+
+
+def _resolve_base_position(
+    args: argparse.Namespace,
+    base_obs: list[Path] | None = None,
+) -> tuple[tuple[float, float, float] | None, tuple[float, float, float] | None]:
+    if args.base_ecef and args.base_llh:
+        raise ValueError("--base-ecef and --base-llh are mutually exclusive")
+    if args.base_ecef:
+        return tuple(float(value) for value in args.base_ecef), None  # type: ignore[return-value]
+    if args.base_llh:
+        return None, tuple(float(value) for value in args.base_llh)  # type: ignore[return-value]
+    if args.base_position_source == "none":
+        return None, None
+
+    station = args.base_station or getattr(args, "station", None)
+    cache_dir = Path(args.base_position_cache_dir) if args.base_position_cache_dir else None
+    if station and args.base_position_source in {"auto", "euref"}:
+        try:
+            position = fetch_epn_station_position(station, cache_dir=cache_dir)
+            _log_base_position(position)
+            return position.ecef_xyz_m, None
+        except Exception as exc:
+            if args.base_position_source == "euref":
+                raise ValueError(f"could not resolve EUREF/EPN base coordinates for {station}: {exc}") from exc
+            logging.warning("could not resolve EUREF/EPN base coordinates for %s: %s", station, exc)
+
+    if args.base_position_source in {"auto", "rinex-header"}:
+        base_candidates = base_obs or [Path(item) for item in getattr(args, "base_obs", None) or []]
+        if not base_candidates:
+            if args.base_position_source == "rinex-header":
+                raise ValueError("--base-obs is required to resolve base position from RINEX header")
+            return None, None
+        position = parse_rinex_approx_position(base_candidates[0])
+        _log_base_position(position)
+        return position.ecef_xyz_m, None
+
+    if args.base_position_source == "euref" and not station:
+        raise ValueError("--base-station or --station is required with --base-position-source=euref")
+    return None, None
+
+
+def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station: bool) -> None:
+    parser.add_argument("--station", required=require_station)
+    parser.add_argument("--station-long")
+    parser.add_argument("--base-provider", choices=BASE_PROVIDER_CHOICES, default="bev-nrt")
+    parser.add_argument("--base-rate", choices=["30s", "1s"], default="30s")
+    parser.add_argument("--base-resolution", choices=["low", "high"], default="low")
+    parser.add_argument("--base-rinex-version", choices=["3", "2", "auto"], default="3")
+    parser.add_argument("--no-base-fallback", action="store_true")
+    parser.add_argument("--base-template")
+    parser.add_argument("--base-dir")
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--time-margin", type=int, default=300)
+    parser.add_argument("--whole-day", action="store_true")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--crx2rnx")
+    parser.add_argument("--cleanup", action="store_true")
+
+
+def _base_download_attempts(args: argparse.Namespace) -> list[tuple[str, str, str, str]]:
+    requested_resolution = args.base_resolution
+    if args.base_rate == "1s" or args.base_provider in {"bkg-euref-highrate", "bkg-euref-highrate-v2"}:
+        requested_resolution = "high"
+    versions = ["3", "2"] if args.base_rinex_version == "auto" else [args.base_rinex_version]
+    attempts: list[tuple[str, str, str, str]] = []
+    for version in versions:
+        attempts.append(_base_download_attempt(args, requested_resolution, version))
+    if requested_resolution == "high" and not args.no_base_fallback:
+        for version in versions:
+            attempts.append(_base_download_attempt(args, "low", version))
+    unique: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for attempt in attempts:
+        if attempt not in seen:
+            unique.append(attempt)
+            seen.add(attempt)
+    return unique
+
+
+def _base_download_attempt(
+    args: argparse.Namespace,
+    resolution: str,
+    rinex_version: str,
+) -> tuple[str, str, str, str]:
+    if resolution == "high":
+        provider = "bkg-euref-highrate-v2" if rinex_version == "2" else "bkg-euref-highrate"
+        return resolution, rinex_version, provider, "1s"
+    provider = args.base_provider
+    if provider == "bkg-euref-highrate":
+        provider = "bkg-euref-nrt"
+    return resolution, rinex_version, provider, "30s"
+
+
+def _download_base_files(args: argparse.Namespace) -> list[Path]:
+    if not args.station:
+        raise ValueError("--station is required to download base observations")
+    station_long = _resolve_station_for_base_download(args)
+    start, end = _time_window_from_solutions(args, args.time_margin)
+    attempts = _base_download_attempts(args)
+    planned_by_attempt: list[tuple[str, str, str, str, list[str]]] = []
+    for resolution, version, provider, rate in attempts:
+        urls = planned_urls(
+            station=args.station,
+            station_long=station_long,
+            start=start,
+            end=end,
+            provider_name=provider,
+            base_rate=rate,
+            whole_day=args.whole_day,
+            rinex_version=version,
+        )
+        planned_by_attempt.append((resolution, version, provider, rate, urls))
+
+    if args.offline or args.dry_run:
+        for _, _, _, _, urls in planned_by_attempt:
+            print("\n".join(urls))
+        return []
+
+    cache_dir = Path(args.cache_dir or args.base_dir or "euref-cache")
+    last_error: Exception | None = None
+    for index, (resolution, version, provider, rate, urls) in enumerate(planned_by_attempt):
+        try:
+            logging.info(
+                "downloading EUREF base observations: station=%s provider=%s rate=%s rinex=%s",
+                station_long,
+                provider,
+                rate,
+                version,
+            )
+            downloaded = download_urls(urls, cache_dir)
+            normalised = [
+                normalise_rinex_file(path, crx2rnx=args.crx2rnx, cleanup=args.cleanup)
+                for path in downloaded
+            ]
+            if normalised:
+                if index > 0:
+                    logging.warning(
+                        "using fallback EUREF base observations: provider=%s rate=%s rinex=%s",
+                        provider,
+                        rate,
+                        version,
+                    )
+                return normalised
+            last_error = RuntimeError("downloaded EUREF base observation list was empty")
+        except Exception as exc:
+            last_error = exc
+            if index + 1 < len(planned_by_attempt):
+                _, next_version, next_provider, next_rate, _ = planned_by_attempt[index + 1]
+                logging.warning(
+                    "EUREF base observations unavailable for provider=%s rate=%s rinex=%s: %s; "
+                    "trying provider=%s rate=%s rinex=%s",
+                    provider,
+                    rate,
+                    version,
+                    exc,
+                    next_provider,
+                    next_rate,
+                    next_version,
+                )
+            elif resolution == "high":
+                logging.warning("high-rate EUREF base observations unavailable and fallback is disabled: %s", exc)
+    if last_error:
+        raise RuntimeError(f"no usable EUREF base observation files were available: {last_error}") from last_error
+    raise RuntimeError("no usable EUREF base observation files were available")
+
+
+def _resolve_station_for_base_download(args: argparse.Namespace) -> str:
+    try:
+        return resolve_station(args.station, args.station_long)
+    except ValueError:
+        if (
+            args.base_rinex_version == "2"
+            and args.station_long is None
+            and len(args.station) == 4
+            and args.station.isalnum()
+        ):
+            return args.station.upper()
+        raise
+
+
+def _log_base_position(position: BasePosition) -> None:
+    x, y, z = position.ecef_xyz_m
+    logging.info(
+        "using base position for %s from %s: X=%.4f Y=%.4f Z=%.4f",
+        position.station,
+        position.source,
+        x,
+        y,
+        z,
+    )
 
 
 def _profile_from_args(args: argparse.Namespace) -> InitProfile:
@@ -245,26 +458,9 @@ def _time_window_from_solutions(args: argparse.Namespace, margin_s: int):
 
 def cmd_download_base(args: argparse.Namespace) -> int:
     configure_logging(args.verbose, args.log_file)
-    station_long = resolve_station(args.station, args.station_long)
-    start, end = _time_window_from_solutions(args, args.time_margin)
-    urls = planned_urls(
-        station=args.station,
-        station_long=station_long,
-        start=start,
-        end=end,
-        provider_name=args.base_provider,
-        base_rate=args.base_rate,
-        whole_day=args.whole_day,
-    )
-    if args.offline or args.dry_run:
-        print("\n".join(urls))
-        return 0
-    cache_dir = Path(args.cache_dir or args.base_dir or "euref-cache")
-    downloaded = download_urls(urls, cache_dir)
-    normalised = [
-        normalise_rinex_file(path, crx2rnx=args.crx2rnx, cleanup=args.cleanup) for path in downloaded
-    ]
-    print("\n".join(str(path) for path in normalised))
+    normalised = _download_base_files(args)
+    if normalised:
+        print("\n".join(str(path) for path in normalised))
     return 0
 
 
@@ -275,7 +471,8 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     nav_resolution = resolve_nav_sources(explicit=args.nav_file, observed_systems=set(), merge_policy=args.nav_merge)
     if not nav_resolution.selected:
         raise ValueError(nav_resolution.warnings[0])
-    rnx2rtkp = _tool_from_rtklib_dir(args.rnx2rtkp, args.rtklib_dir)
+    rnx2rtkp = resolve_rtklib_tool(args.rnx2rtkp, rtklib_dir=args.rtklib_dir)
+    base_ecef, base_llh = _resolve_base_position(args)
     command = run_rnx2rtkp(
         rnx2rtkp=rnx2rtkp,
         rtkconf=Path(args.rtkconf),
@@ -283,6 +480,8 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         rover_obs=Path(args.rover_obs),
         base_obs=[Path(item) for item in args.base_obs],
         nav_files=[candidate.path for candidate in nav_resolution.selected],
+        base_ecef_xyz_m=base_ecef,
+        base_llh=base_llh,
         path_style=args.rtklib_path_style,
         dry_run=args.dry_run,
     )
@@ -290,30 +489,51 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     return 0
 
 
-def _tool_from_rtklib_dir(tool: str, rtklib_dir: str | None) -> str:
-    """Resolve a RTKLIB tool from `--rtklib-dir` when the tool has no directory."""
-
-    if not rtklib_dir:
-        return tool
-    tool_path = Path(tool)
-    if tool_path.parent != Path("."):
-        return tool
-    return str(Path(rtklib_dir) / tool)
-
-
 def cmd_pipeline(args: argparse.Namespace) -> int:
     configure_logging(args.verbose, args.log_file)
-    # Local extraction and RINEX generation first. Download/RTKLIB remain explicit
-    # through supplied base and NAV inputs unless the user enables downloads.
     cmd_extract(args)
     cmd_rinex(args)
+    out_dir = ensure_out_dir(args.out_dir)
+    base = basename_for(args.rover_log, args.basename)
+    rover_obs = out_dir / f"{base}.direct.obs"
+    base_obs = [Path(item) for item in args.base_obs or []]
     if args.station and args.download_base:
-        cmd_download_base(args)
-    logging.warning(
-        "pipeline currently stops after extraction/RINEX generation%s; RTKLIB post-processing "
-        "requires an explicit postprocess command with rover OBS, base OBS, NAV, and rtkconf inputs.",
-        " and base-download planning" if args.station and args.download_base else "",
+        base_obs.extend(_download_base_files(args))
+    should_run_rtklib = bool(args.run_rtklib or args.rtkconf or args.nav_file or base_obs)
+    if not should_run_rtklib:
+        logging.warning(
+            "pipeline generated extraction/RINEX products but did not run RTKLIB. "
+            "Provide --run-rtklib with --rtkconf, --nav-file, and --base-obs or --download-base."
+        )
+        return 0
+    if not args.rtkconf:
+        raise ValueError("--rtkconf is required when pipeline runs RTKLIB")
+    if not base_obs:
+        raise ValueError("--base-obs or --download-base is required when pipeline runs RTKLIB")
+    nav_resolution = resolve_nav_sources(
+        explicit=args.nav_file,
+        observed_systems=set(),
+        merge_policy=args.nav_merge,
     )
+    for warning in nav_resolution.warnings:
+        logging.warning("%s", warning)
+    if not nav_resolution.selected:
+        raise ValueError(nav_resolution.warnings[0])
+    rnx2rtkp = resolve_rtklib_tool(args.rnx2rtkp, rtklib_dir=args.rtklib_dir)
+    base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
+    command = run_rnx2rtkp(
+        rnx2rtkp=rnx2rtkp,
+        rtkconf=Path(args.rtkconf),
+        output_file=out_dir / f"{base}-rtk.{args.output_format}",
+        rover_obs=rover_obs,
+        base_obs=base_obs,
+        nav_files=[candidate.path for candidate in nav_resolution.selected],
+        base_ecef_xyz_m=base_ecef,
+        base_llh=base_llh,
+        path_style=args.rtklib_path_style,
+        dry_run=args.dry_run,
+    )
+    print(" ".join(command.args))
     return 0
 
 
@@ -368,18 +588,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dl = sub.add_parser("download-base")
     dl.add_argument("rover_log")
-    dl.add_argument("--station", required=True)
-    dl.add_argument("--station-long")
-    dl.add_argument("--base-provider", choices=sorted(PROVIDERS := {"bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate"}), default="bev-nrt")
-    dl.add_argument("--base-rate", choices=["30s", "1s"], default="30s")
-    dl.add_argument("--base-template")
-    dl.add_argument("--base-dir")
-    dl.add_argument("--cache-dir")
-    dl.add_argument("--time-margin", type=int, default=300)
-    dl.add_argument("--whole-day", action="store_true")
-    dl.add_argument("--offline", action="store_true")
-    dl.add_argument("--crx2rnx")
-    dl.add_argument("--cleanup", action="store_true")
+    _add_base_download_args(dl, require_station=True)
     _add_common(dl)
     dl.set_defaults(func=cmd_download_base)
 
@@ -403,27 +612,28 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
     post.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
     post.add_argument("--navsys", choices=["gps", "gps-glo", "gps-glo-gal-bds", "all"], default="all")
+    _add_base_position_args(post)
     _add_common(post)
     post.set_defaults(func=cmd_postprocess)
 
     pipe = sub.add_parser("pipeline")
     pipe.add_argument("rover_log")
-    pipe.add_argument("--station")
     pipe.add_argument("--download-base", action="store_true")
+    pipe.add_argument("--base-obs", action="append")
+    pipe.add_argument("--nav-file", action="append")
+    pipe.add_argument("--nav-merge", choices=["best-per-system", "all"], default="best-per-system")
+    pipe.add_argument("--run-rtklib", action="store_true")
+    pipe.add_argument("--rtklib-dir")
+    pipe.add_argument("--rnx2rtkp", default="rnx2rtkp")
+    pipe.add_argument("--rtkconf")
+    pipe.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
+    pipe.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
     pipe.add_argument("--obs-csv", action="store_true", default=True)
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
-    pipe.add_argument("--station-long")
-    pipe.add_argument("--base-provider", choices=["bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate"], default="bev-nrt")
-    pipe.add_argument("--base-rate", choices=["30s", "1s"], default="30s")
-    pipe.add_argument("--time-margin", type=int, default=300)
-    pipe.add_argument("--whole-day", action="store_true")
-    pipe.add_argument("--offline", action="store_true")
-    pipe.add_argument("--cache-dir")
-    pipe.add_argument("--base-dir")
-    pipe.add_argument("--crx2rnx")
-    pipe.add_argument("--cleanup", action="store_true")
+    _add_base_download_args(pipe, require_station=False)
+    _add_base_position_args(pipe)
     _add_common(pipe)
     pipe.set_defaults(func=cmd_pipeline)
     return parser

@@ -8,6 +8,12 @@ dist/
 build/
 *.egg-info/
 
+# Local RTKLIB builds and install trees
+build-tools/
+convbin.trace
+rtklib-configs.zip
+test-euref.zip
+
 # Local/private data and editor backups
 examples-private/
 *.unc
@@ -30,4 +36,3 @@ examples-private/
 *-rtk.nmea
 *-rtk.pos
 *-rtk.stat
-

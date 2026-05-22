@@ -54,6 +54,16 @@ UM980_SYSTEM_IDS = {
     9: "BDS",
 }
 
+TRACKING_STATUS_SYSTEM_IDS = {
+    0: "GPS",
+    1: "GLONASS",
+    2: "SBAS",
+    3: "Galileo",
+    4: "BDS",
+    5: "QZSS",
+    6: "IRNSS",
+}
+
 DEFAULT_SIGNAL_CODES = {
     ("GPS", "L1"): "1C",
     ("GPS", "L1CA"): "1C",
@@ -72,6 +82,60 @@ DEFAULT_SIGNAL_CODES = {
     ("BDS", "B2A"): "5P",
     ("BDS", "B3I"): "6I",
     ("SBAS", "L1"): "1C",
+}
+
+TRACKING_SIGNAL_CODES = {
+    "GPS": {
+        0: ("L1 C/A", "1C"),
+        3: ("L1C pilot", "1L"),
+        6: ("L5 data", "5I"),
+        9: ("L2 P(Y)", "2W"),
+        11: ("L1C data", "1S"),
+        14: ("L5 pilot", "5Q"),
+        17: ("L2C L", "2L"),
+    },
+    "GLONASS": {
+        0: ("G1 C/A", "1C"),
+        5: ("G2 C/A", "2C"),
+        6: ("G3 I", "3I"),
+        7: ("G3 Q", "3Q"),
+    },
+    "Galileo": {
+        1: ("E1 B", "1B"),
+        2: ("E1 C", "1C"),
+        12: ("E5a pilot", "5Q"),
+        17: ("E5b pilot", "7Q"),
+        18: ("E6 B", "6B"),
+        22: ("E6 C", "6C"),
+    },
+    "BDS": {
+        0: ("B1I", "2I"),
+        4: ("B1Q", "2Q"),
+        5: ("B2Q", "7Q"),
+        6: ("B3Q", "6Q"),
+        8: ("B1C pilot", "1P"),
+        12: ("B2a pilot", "5P"),
+        13: ("B2b I", "7D"),
+        17: ("B2I", "7I"),
+        21: ("B3I", "6I"),
+        23: ("B1C data", "1D"),
+        28: ("B2a data", "5D"),
+    },
+    "QZSS": {
+        0: ("L1 C/A", "1C"),
+        3: ("L1C pilot", "1L"),
+        6: ("L5 data", "5I"),
+        9: ("L2 P(Y)", "2X"),
+        11: ("L1C data", "1S"),
+        14: ("L5 pilot", "5Q"),
+    },
+    "SBAS": {
+        0: ("L1 C/A", "1C"),
+    },
+    "IRNSS": {
+        6: ("L5 data", "5A"),
+        14: ("L5 pilot", "5B"),
+    },
 }
 
 
@@ -137,6 +201,32 @@ def _system_from_id(value: int | None) -> SystemName:
     return UM980_SYSTEM_IDS.get(value, "Unknown")  # type: ignore[return-value]
 
 
+def _tracking_system(tracking: int) -> SystemName:
+    return TRACKING_STATUS_SYSTEM_IDS.get((tracking >> 16) & 0x7, "Unknown")  # type: ignore[return-value]
+
+
+def _tracking_signal(system: SystemName, tracking: int) -> tuple[str, str, bool]:
+    signal_type = (tracking >> 21) & 0x1F
+    l2c = bool(tracking & 0x04000000)
+    if system in {"GPS", "QZSS"} and signal_type == 9 and l2c:
+        return "L2C", "2L", True
+    mapping = TRACKING_SIGNAL_CODES.get(system, {})
+    if signal_type in mapping:
+        name, code = mapping[signal_type]
+        return name, code, True
+    return f"TRACK_{tracking:08x}", _rinex_code(system, "L1"), False
+
+
+def _rinex_sv(system: SystemName, prn: int) -> int:
+    if system == "GLONASS" and 38 <= prn <= 61:
+        return prn - 37
+    if system == "SBAS" and prn >= 100:
+        return prn - 100
+    if system == "QZSS" and prn >= 193:
+        return prn - 192
+    return prn
+
+
 def _rinex_code(system: SystemName, signal: str) -> str:
     signal_key = signal.upper().replace("/", "").replace("-", "")
     return DEFAULT_SIGNAL_CODES.get((system, signal_key), "1C")
@@ -197,37 +287,35 @@ def _obsvma_payload_observations(header_tokens: list[str], payload_tokens: list[
     group_size = 11
     for offset in range(0, len(tokens) - group_size + 1, group_size):
         group = tokens[offset : offset + group_size]
-        system_id = _int(group[0])
         sv = _int(group[1])
         if sv is None:
             continue
-        system = _system_from_id(system_id)
         tracking = _int_auto(group[10]) or 0
-        # Full UM980 tracking-status signal decoding is intentionally deferred.
-        # Use a conservative default code by constellation and keep the raw
-        # tracking word for later validation.
-        signal = f"TRACK_{tracking:08x}" if tracking else "L1"
-        code = _rinex_code(system, "L1")
+        system = _tracking_system(tracking) if tracking else "Unknown"
+        signal, code, signal_known = _tracking_signal(system, tracking) if tracking else ("TRACK_00000000", "1C", False)
         prefix = RINEX_SYSTEM_PREFIX[system]
         cn0_raw = _float(group[7])
+        rinex_sv = _rinex_sv(system, sv)
+        phase_valid = bool(tracking & 0x00000400)
+        pseudorange_valid = bool(tracking & 0x00001000)
         observations.append(
             Observation(
                 gps_week=week,
                 tow=tow,
                 sat_system=system,
-                sv=sv,
-                rinex_sat=f"{prefix}{sv:02d}" if prefix != "U" else f"U{sv:02d}",
+                sv=rinex_sv,
+                rinex_sat=f"{prefix}{rinex_sv:02d}" if prefix != "U" else f"U{rinex_sv:02d}",
                 signal_name=signal,
                 rinex_code=code,
                 band=code[0],
-                pseudorange_m=_float(group[2]),
-                carrier_phase_cycles=_float(group[3]),
+                pseudorange_m=_float(group[2]) if pseudorange_valid else None,
+                carrier_phase_cycles=_float(group[3]) if phase_valid else None,
                 doppler_hz=_float(group[6]),
                 cn0_dbhz=cn0_raw / 100.0 if cn0_raw is not None and cn0_raw > 100 else cn0_raw,
                 lock_time_s=_float(group[9]),
                 half_cycle=None,
                 lli=0,
-                raw_tracking_status=tracking,
+                raw_tracking_status=tracking if signal_known else tracking,
             )
         )
     if declared_count is not None and observations and abs(declared_count - len(observations)) > 5:
@@ -274,9 +362,9 @@ def decode_observations(records: list[StreamRecord]) -> ObservationExtraction:
         )
     if observations and any(obs.signal_name.startswith("TRACK_") for obs in observations):
         warnings.append(
-            "UM980 tracking-status to RINEX signal mapping is incomplete; affected observations "
-            "use conservative placeholder RINEX code 1C. Do not use this RINEX for production "
-            "multi-band RTK until the mapping is validated."
+            "some UM980 tracking-status signal types are not mapped to RINEX yet; affected "
+            "observations use a conservative fallback RINEX code. Check analysis JSON signal "
+            "counts before production multi-band RTK."
         )
     if observations and any(obs.sat_system == "Unknown" for obs in observations):
         warnings.append("some observations have unknown constellation IDs and may be ignored by RTKLIB")

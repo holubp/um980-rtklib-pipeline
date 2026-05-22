@@ -32,3 +32,10 @@ passed to RTKLIB tools. Cygwin with Windows `.exe` tools usually requires
 Windows-style input paths, while native Linux/Cygwin builds require Unix paths.
 Keep `--rtklib-path-style` behavior covered by tests.
 
+## EUREF Fixtures
+
+Keep `test-euref.zip`, downloaded station observations, and RTKLIB-ex source/bin
+trees out of git. Use the archived helper scripts only to verify URL naming
+conventions; live servers may not publish every legacy RINEX 2 or high-rate
+product for a given station/time. Missing products must warn with the attempted
+URLs before fallback or failure.

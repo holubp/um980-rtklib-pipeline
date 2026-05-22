@@ -34,4 +34,43 @@ def test_real_shape_obsvma_warns_when_signal_mapping_is_placeholder():
     records, _ = parse_stream(data)
     decoded = decode_observations(records)
     assert len(decoded.observations) == 1
-    assert any("tracking-status to RINEX signal mapping is incomplete" in warning for warning in decoded.warnings)
+    assert decoded.observations[0].rinex_sat == "G01"
+    assert decoded.observations[0].rinex_code == "1C"
+    assert decoded.observations[0].pseudorange_m == 17661005.670
+    assert not any("tracking-status to RINEX signal mapping is incomplete" in warning for warning in decoded.warnings)
+
+
+def test_obsvma_tracking_status_keeps_multiple_signals_for_same_satellite(tmp_path: Path):
+    data = (
+        b"#OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
+        b"2,"
+        b"0,16,20814342.474,-109380108.947785,28,50,2648.551,4929,0,11.710,20181c23,"
+        b"0,16,20814337.133,-85231236.201565,227,534,2063.807,3272,0,6.760,21301c22"
+        b"*00000000\r\n"
+    )
+    records, _ = parse_stream(data)
+    decoded = decode_observations(records)
+    assert [(obs.rinex_sat, obs.rinex_code) for obs in decoded.observations] == [
+        ("G16", "1C"),
+        ("G16", "2W"),
+    ]
+    rinex_path = tmp_path / "rover.obs"
+    write_rinex_obs(rinex_path, decoded.observations)
+    rinex = rinex_path.read_text()
+    assert "G    8 C1C L1C D1C S1C C2W L2W D2W S2W" in rinex
+    assert "  20814342.474" in rinex
+    assert "  20814337.133" in rinex
+
+
+def test_obsvma_tracking_status_decodes_glonass_offset_prn():
+    data = (
+        b"#OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
+        b"1,7,52,18851471.802,-100736546.989518,18,52,626.918,4760,0,9.200,00191c43"
+        b"*00000000\r\n"
+    )
+    records, _ = parse_stream(data)
+    decoded = decode_observations(records)
+    assert len(decoded.observations) == 1
+    assert decoded.observations[0].sat_system == "GLONASS"
+    assert decoded.observations[0].rinex_sat == "R15"
+    assert decoded.observations[0].rinex_code == "1C"

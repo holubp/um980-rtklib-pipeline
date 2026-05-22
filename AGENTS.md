@@ -10,4 +10,6 @@
   mappings, warn that the file is not production-ready for multi-band RTK.
 - Cygwin support must preserve the distinction between local Unix paths and
   Windows paths passed to Windows RTKLIB executables.
-
+- EUREF base-data selection must log unavailable high-rate or legacy RINEX 2
+  products before falling back. Keep legacy test archives and downloaded base
+  files local-only.
