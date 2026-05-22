@@ -11,6 +11,39 @@ This project intentionally does not depend on RTKLIB `convbin` for rover UM980
 `.unc` conversion. Many RTKLIB builds do not include Unicore support, and raw
 observations must not be treated as navigation data.
 
+## Why This Tool Exists
+
+UM980 field logs are usually mixed serial captures: NMEA solution sentences,
+Unicore ASCII/binary records, raw observations, and sometimes ephemeris records
+are interleaved in one `.unc` stream. RTKLIB needs clean RINEX observation files,
+valid navigation data, base-station observations, and platform-correct paths.
+This tool performs that glue work explicitly so failed assumptions are visible:
+unsupported UM980 records are reported, empty NAV placeholders are rejected, and
+missing EUREF base products warn before fallback.
+
+```mermaid
+flowchart LR
+    A[UM980 .unc rover log] --> B[Parse mixed stream]
+    B --> C[Clean NMEA and diagnostics]
+    B --> D[Rover RINEX OBS]
+    E[EUREF base station] --> F[Base RINEX OBS]
+    G[External BRDC/NAV/SP3/CLK] --> H[Validated NAV inputs]
+    D --> I[RTKLIB rnx2rtkp]
+    F --> I
+    H --> I
+    I --> J[RTK/PPK position output]
+```
+
+Typical workflow:
+
+1. Generate a receiver init script for the UM980 logging mode you want.
+2. Capture the rover `.unc` stream in the field.
+3. Run `um980-ppk pipeline` to extract diagnostics and write rover RINEX OBS.
+4. Provide external NAV data and either download EUREF base data or pass local
+   base OBS files.
+5. Let the pipeline run `rnx2rtkp`, or use `postprocess` when the RINEX inputs
+   are prepared separately.
+
 ## Examples
 
 Generate a receiver command script:

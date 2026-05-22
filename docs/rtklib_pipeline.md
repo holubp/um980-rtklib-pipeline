@@ -1,5 +1,27 @@
 # RTKLIB Pipeline
 
+This project bridges the gap between UM980 mixed receiver logs and RTKLIB's
+file-based post-processing model. A rover `.unc` capture is not a RTKLIB input
+by itself: it must be parsed, decoded into RINEX observations, paired with
+external navigation data, matched with base-station observations, and passed to
+RTKLIB with paths that make sense on the current platform.
+
+```text
+UM980 .unc
+   |
+   v
+parse mixed NMEA + Unicore records
+   |--------> diagnostics / warnings
+   v
+rover RINEX OBS  +  EUREF/base RINEX OBS  +  NAV/SP3/CLK
+   |
+   v
+validated rnx2rtkp command
+   |
+   v
+RTK/PPK solution
+```
+
 The pipeline writes direct rover observation products and validates all RTKLIB
 input paths before invoking `rnx2rtkp`. It never passes unresolved shell
 wildcards to RTKLIB and does not use `shell=True`.
