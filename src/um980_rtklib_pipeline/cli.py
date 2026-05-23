@@ -17,12 +17,15 @@ from .euref import (
     normalise_rinex_file,
     parse_rinex_approx_position,
     planned_urls,
+    requires_crx2rnx,
     resolve_station,
 )
-from .files import basename_for, ensure_out_dir
+from .files import basename_for, ensure_out_dir, filter_rinex_obs_by_overlap, read_rinex_obs_time_span
 from .initgen import (
     InitProfile,
+    ION_MESSAGES,
     NMEA_PRESETS,
+    debug_ascii_ephemeris_policy,
     ephemeris_policy,
     parse_nmea_overrides,
     render_init_script,
@@ -32,9 +35,9 @@ from .logging_config import configure_logging
 from .nav_resolver import resolve_nav_sources
 from .obs_decode import decode_observations, write_observations_csv
 from .quality import build_analysis, write_analysis_json
-from .rinex_nav import extract_rover_nav
-from .rinex_obs import write_rinex_obs
-from .rtklib import resolve_rtklib_tool, run_rnx2rtkp
+from .rinex_nav import extract_rover_nav, rover_nav_files
+from .rinex_obs import observations_for_rinex, write_rinex_obs
+from .rtklib import executable_exists, executable_for_subprocess, resolve_rtklib_tool, run_rnx2rtkp
 from .solution import (
     extract_solutions,
     write_all_records_csv,
@@ -48,6 +51,56 @@ from .stream import parse_stream
 BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate")
 
 
+def _csv_items(value: object) -> list[str]:
+    """Return lowercase comma-separated items from CLI/config values."""
+
+    if value is None or value is False:
+        return []
+    if value is True:
+        return ["all"]
+    if isinstance(value, str):
+        return [item.strip().lower() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        items: list[str] = []
+        for item in value:
+            items.extend(_csv_items(item))
+        return items
+    return [str(value).strip().lower()]
+
+
+def _apply_solution_hz(nmea: dict[str, float], hz: object | None) -> None:
+    """Set the primary NMEA solution sentence rate when requested."""
+
+    if hz is None:
+        return
+    value = float(hz)
+    if value <= 0:
+        raise ValueError("NMEA solution frequency must be greater than zero")
+    nmea["GNGGA"] = value
+    nmea["GNRMC"] = value
+
+
+def _resolve_ion_messages(args: argparse.Namespace, diag_cfg: dict[str, object]) -> tuple[str, ...]:
+    """Resolve requested ionosphere command families from CLI and config."""
+
+    requested: list[str] = []
+    requested.extend(_csv_items(diag_cfg.get("ion")))
+    if diag_cfg.get("gpsion", False):
+        requested.append("gps")
+    if args.include_gpsion:
+        requested.append("gps")
+    if args.include_ion:
+        requested.append("all")
+    requested.extend(_csv_items(args.ion))
+    if "all" in requested:
+        requested.extend(ION_MESSAGES)
+    unique = tuple(item for item in dict.fromkeys(requested) if item != "all")
+    invalid = sorted(set(unique) - set(ION_MESSAGES))
+    if invalid:
+        raise ValueError(f"unsupported --ion values: {', '.join(invalid)}")
+    return unique
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--out-dir")
@@ -58,17 +111,59 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-file")
 
 
+def _human_bytes(size: int) -> str:
+    """Return a compact human-readable byte count."""
+
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{size} B"
+        value /= 1024
+    return f"{size} B"
+
+
 def _load_records(path: Path):
+    size = path.stat().st_size
+    logging.info("reading rover log: %s (%s)", path, _human_bytes(size))
     data = path.read_bytes()
-    return parse_stream(data)
+    logging.info("parsing rover byte stream")
+    records, diagnostics = parse_stream(data, progress=logging.getLogger().isEnabledFor(logging.INFO))
+    logging.info(
+        "parsed rover log: records=%d nmea=%d unicore_ascii=%d unicore_binary=%d noise=%s",
+        len(records),
+        diagnostics.valid_nmea_records,
+        diagnostics.unicore_ascii_records,
+        diagnostics.unicore_binary_records,
+        _human_bytes(diagnostics.noise_bytes),
+    )
+    return records, diagnostics
 
 
 def _extract_bundle(args: argparse.Namespace):
     rover = Path(args.rover_log)
+    progress = logging.getLogger().isEnabledFor(logging.INFO)
     records, stream_diag = _load_records(rover)
-    solutions = extract_solutions(records)
-    observations = decode_observations(records)
+    logging.info("extracting solution records")
+    solutions = extract_solutions(records, progress=progress)
+    logging.info(
+        "extracted solutions: points=%d nmea_records=%d all_nmea=%d",
+        len(solutions.solution_points),
+        len(solutions.solution_records),
+        len(solutions.all_nmea),
+    )
+    logging.info("decoding raw observations")
+    observations = decode_observations(records, progress=progress)
+    logging.info(
+        "decoded raw observations: observations=%d epochs=%s unsupported=%d",
+        len(observations.observations),
+        observations.metrics.get("epochs", 0),
+        sum(observations.unsupported_records.values()),
+    )
+    logging.info("scanning rover navigation records")
     rover_nav = extract_rover_nav(records)
+    converted_nav = sum(rover_nav.converted.values())
+    logging.info("scanned rover navigation: converted=%d warnings=%d", converted_nav, len(rover_nav.warnings))
+    logging.info("building analysis report")
     analysis = build_analysis(
         stream=stream_diag,
         solutions=solutions,
@@ -171,7 +266,16 @@ def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station:
     parser.add_argument("--base-template")
     parser.add_argument("--base-dir")
     parser.add_argument("--cache-dir")
-    parser.add_argument("--time-margin", type=int, default=300)
+    parser.add_argument(
+        "--time-margin",
+        type=int,
+        default=0,
+        help=(
+            "Extra seconds added before and after the rover recorded time span "
+            "when planning base downloads. Defaults to 0 so only products that "
+            "overlap or touch the recorded interval are requested."
+        ),
+    )
     parser.add_argument("--whole-day", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--crx2rnx")
@@ -215,8 +319,16 @@ def _base_download_attempt(
 def _download_base_files(args: argparse.Namespace) -> list[Path]:
     if not args.station:
         raise ValueError("--station is required to download base observations")
-    station_long = _resolve_station_for_base_download(args)
     start, end = _time_window_from_solutions(args, args.time_margin)
+    return _download_base_files_for_window(args, start, end)
+
+
+def _download_base_files_for_window(args: argparse.Namespace, start, end) -> list[Path]:
+    """Download base observations covering the requested inclusive time window."""
+
+    if not args.station:
+        raise ValueError("--station is required to download base observations")
+    station_long = _resolve_station_for_base_download(args)
     attempts = _base_download_attempts(args)
     planned_by_attempt: list[tuple[str, str, str, str, list[str]]] = []
     for resolution, version, provider, rate in attempts:
@@ -233,11 +345,19 @@ def _download_base_files(args: argparse.Namespace) -> list[Path]:
         planned_by_attempt.append((resolution, version, provider, rate, urls))
 
     if args.offline or args.dry_run:
+        target_dir = Path(args.cache_dir or args.base_dir or "euref-cache")
+        mode = "offline" if args.offline else "dry-run"
+        logging.info(
+            "%s mode: no EUREF base files will be downloaded; planned local cache directory is %s",
+            mode,
+            target_dir,
+        )
         for _, _, _, _, urls in planned_by_attempt:
             print("\n".join(urls))
         return []
 
     cache_dir = Path(args.cache_dir or args.base_dir or "euref-cache")
+    logging.info("EUREF base files will be stored in %s", cache_dir)
     last_error: Exception | None = None
     for index, (resolution, version, provider, rate, urls) in enumerate(planned_by_attempt):
         try:
@@ -249,10 +369,18 @@ def _download_base_files(args: argparse.Namespace) -> list[Path]:
                 version,
             )
             downloaded = download_urls(urls, cache_dir)
+            for path in downloaded:
+                logging.info("downloaded EUREF base candidate: %s", path)
+            crx2rnx = _resolve_crx2rnx_for_download(args, downloaded)
             normalised = [
-                normalise_rinex_file(path, crx2rnx=args.crx2rnx, cleanup=args.cleanup)
+                normalise_rinex_file(path, crx2rnx=crx2rnx, cleanup=args.cleanup)
                 for path in downloaded
             ]
+            for source, normalised_path in zip(downloaded, normalised, strict=True):
+                if normalised_path == source:
+                    logging.info("using EUREF base observation file: %s", normalised_path)
+                else:
+                    logging.info("normalised EUREF base observation file: %s -> %s", source, normalised_path)
             if normalised:
                 if index > 0:
                     logging.warning(
@@ -283,6 +411,37 @@ def _download_base_files(args: argparse.Namespace) -> list[Path]:
     if last_error:
         raise RuntimeError(f"no usable EUREF base observation files were available: {last_error}") from last_error
     raise RuntimeError("no usable EUREF base observation files were available")
+
+
+def _resolve_crx2rnx_for_download(args: argparse.Namespace, downloaded: list[Path]) -> str | None:
+    """Resolve a Hatanaka converter before mutating downloaded base files.
+
+    Args:
+        args: CLI arguments with optional `crx2rnx` and `rtklib_dir` values.
+        downloaded: Downloaded base observation candidates.
+
+    Returns:
+        A subprocess-ready converter path when conversion is required, otherwise
+        the user-provided converter value or None.
+
+    Raises:
+        RuntimeError: If Hatanaka files are present and no converter can be
+            found.
+    """
+
+    if not any(requires_crx2rnx(path) for path in downloaded):
+        return args.crx2rnx
+
+    requested = args.crx2rnx or "crx2rnx"
+    candidate = resolve_rtklib_tool(requested, rtklib_dir=getattr(args, "rtklib_dir", None))
+    if not executable_exists(candidate):
+        raise RuntimeError(
+            "crx2rnx is required to convert downloaded Hatanaka base observations before extraction; "
+            f"looked for {candidate}. Provide --crx2rnx or install RTKLIB-ex under ~/RTKLIB-ex-bin/bin."
+        )
+    resolved = executable_for_subprocess(candidate)
+    logging.info("using crx2rnx for Hatanaka conversion: %s", resolved)
+    return resolved
 
 
 def _resolve_station_for_base_download(args: argparse.Namespace) -> str:
@@ -320,10 +479,12 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
 
     preset = args.nmea_preset or config.get("nmea_preset") or deep_get(config, "nmea", "preset", default="minimal")
     nmea = dict(NMEA_PRESETS[preset])
-    nmea.update(parse_nmea_overrides(args.nmea))
+    _apply_solution_hz(nmea, deep_get(config, "nmea", "solution_hz"))
     overrides = deep_get(config, "nmea", "overrides", default={})
     if isinstance(overrides, dict):
         nmea.update({str(k).upper(): float(v) for k, v in overrides.items()})
+    _apply_solution_hz(nmea, args.solution_hz)
+    nmea.update(parse_nmea_overrides(args.nmea))
 
     raw_hz = args.raw_hz
     if raw_hz is None and args.raw_period:
@@ -331,7 +492,22 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
     if raw_hz is None:
         raw_hz = float(raw_cfg.get("hz", 0.0))
 
+    eph_format = (
+        args.ephemeris_format
+        or str(eph_cfg.get("format", "ascii") if eph_cfg else "ascii")
+    ).lower()
     eph_policy = args.ephemeris
+    debug_ascii_ephemeris = bool(
+        args.debug_ascii_ephemeris or eph_cfg.get("debug_ascii_ephemeris", False)
+    )
+    if debug_ascii_ephemeris and eph_format != "ascii":
+        raise ValueError("--debug-ascii-ephemeris cannot be combined with binary ephemeris format")
+    if debug_ascii_ephemeris and (args.ephemeris or args.ephemeris_systems):
+        raise ValueError(
+            "--debug-ascii-ephemeris already enables GPSEPHA/GLOEPHA/GALEPHA/"
+            "BDSEPHA/BD3EPHA/QZSSEPHA every 300 seconds; do not combine it with "
+            "--ephemeris or --ephemeris-systems"
+        )
     if eph_policy is None and eph_cfg:
         if eph_cfg.get("policy") == "every":
             eph_policy = f"every={eph_cfg.get('period', 300)}"
@@ -346,6 +522,15 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         converge = (int(left), int(right))
     elif isinstance(converge_text, list) and len(converge_text) == 2:
         converge = (int(converge_text[0]), int(converge_text[1]))
+    ion_period = (
+        args.ion_period
+        if args.ion_period is not None
+        else diag_cfg.get("ion_period_s", diag_cfg.get("ion_period"))
+    )
+    diagnostic_format = (
+        args.diagnostic_format
+        or str(diag_cfg.get("format", diag_cfg.get("diagnostic_format", "ascii")))
+    ).lower()
 
     return InitProfile(
         port=args.port or config.get("port") or deep_get(config, "receiver", "port", default="COM1"),
@@ -360,20 +545,43 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         expected_obs_per_epoch=int(
             args.expected_obs_per_epoch or raw_cfg.get("expected_obs_per_epoch", 100)
         ),
-        ephemeris=ephemeris_policy(eph_policy or "off", [system.strip() for system in systems]),
+        ephemeris=(
+            debug_ascii_ephemeris_policy()
+            if debug_ascii_ephemeris
+            else ephemeris_policy(
+                eph_policy or "off",
+                [system.strip() for system in systems],
+                message_format=eph_format,
+            )
+        ),
+        ephemeris_format=eph_format,
+        debug_ascii_ephemeris=debug_ascii_ephemeris,
         ppp=(args.ppp or ppp_cfg.get("mode", "none")).lower(),
         ppp_datum=args.ppp_datum or ppp_cfg.get("datum", "WGS84"),
         ppp_timeout=args.ppp_timeout or ppp_cfg.get("timeout"),
         ppp_converge=converge,
         include_tropinfo=bool(args.include_tropinfo or diag_cfg.get("tropinfo", False)),
-        include_gpsion=bool(args.include_gpsion or diag_cfg.get("gpsion", False)),
+        diagnostic_format=diagnostic_format,
+        ion_messages=_resolve_ion_messages(args, diag_cfg),
+        ion_period_s=float(ion_period) if ion_period is not None else None,
+        include_gpsion=False,
         save_config=bool(args.save_config or config.get("save_config", False)),
     )
 
 
 def cmd_init_generate(args: argparse.Namespace) -> int:
+    """Handle `init generate`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
     profile = _profile_from_args(args)
+    logging.info("rendering receiver init script")
     script, estimate = render_init_script(
         profile,
         strict_bitrate=args.strict_bitrate,
@@ -381,28 +589,50 @@ def cmd_init_generate(args: argparse.Namespace) -> int:
     )
     if args.out:
         Path(args.out).write_text(script, encoding="ascii")
+        logging.info("wrote receiver init script: %s", args.out)
     else:
         print(script, end="")
     if args.json:
         write_json_report(Path(args.json), profile, estimate)
+        logging.info("wrote init estimate JSON: %s", args.json)
     if args.verbose:
         print(json.dumps(estimate.as_dict(), indent=2, sort_keys=True))
     return 0
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
+    """Handle `analyze`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
     rover, _, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
     if args.analysis_json:
         out_dir = ensure_out_dir(args.out_dir)
         base = basename_for(rover, args.basename)
-        write_analysis_json(out_dir / f"{base}.analysis.json", analysis)
+        analysis_path = out_dir / f"{base}.analysis.json"
+        write_analysis_json(analysis_path, analysis)
+        logging.info("wrote analysis JSON: %s", analysis_path)
     _log_analysis_warnings(analysis)
     _print_analysis_summary(analysis)
     return 0
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
+    """Handle `extract`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
     rover, _, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
@@ -410,17 +640,29 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
     solution = args.solution
     if solution in {"all", "nmea"}:
-        write_lines(out_dir / f"{base}.clean.nmea", solutions.clean_nmea)
-        write_solution_nmea(out_dir / f"{base}.solution.nmea", solutions.solution_points)
+        all_nmea = out_dir / f"{base}.all.nmea"
+        solution_nmea = out_dir / f"{base}.solution.nmea"
+        write_lines(all_nmea, solutions.all_nmea)
+        write_solution_nmea(solution_nmea, solutions.solution_points)
+        logging.info("wrote NMEA outputs: %s, %s", all_nmea, solution_nmea)
     if solution in {"all", "csv"}:
-        write_solution_csv(out_dir / f"{base}.solution.csv", solutions.solution_points)
-        write_all_records_csv(out_dir / f"{base}.solution_all_records.csv", solutions.all_rows)
+        solution_csv = out_dir / f"{base}.solution.csv"
+        all_records_csv = out_dir / f"{base}.solution_all_records.csv"
+        write_solution_csv(solution_csv, solutions.solution_points)
+        write_all_records_csv(all_records_csv, solutions.all_rows)
+        logging.info("wrote solution CSV outputs: %s, %s", solution_csv, all_records_csv)
     if solution in {"all", "gpx"}:
-        write_gpx(out_dir / f"{base}.solution.gpx", solutions.solution_points)
+        gpx = out_dir / f"{base}.solution.gpx"
+        write_gpx(gpx, solutions.solution_points)
+        logging.info("wrote GPX output: %s", gpx)
     if args.obs_csv:
-        write_observations_csv(out_dir / f"{base}.observations.csv", observations.observations)
+        obs_csv = out_dir / f"{base}.observations.csv"
+        write_observations_csv(obs_csv, observations.observations)
+        logging.info("wrote observation CSV: %s", obs_csv)
     if args.analysis_json:
-        write_analysis_json(out_dir / f"{base}.analysis.json", analysis)
+        analysis_path = out_dir / f"{base}.analysis.json"
+        write_analysis_json(analysis_path, analysis)
+        logging.info("wrote analysis JSON: %s", analysis_path)
     _log_analysis_warnings(analysis)
     if args.verbose:
         _print_analysis_summary(analysis)
@@ -428,19 +670,66 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_rinex(args: argparse.Namespace) -> int:
+    """Handle `rinex`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
     rover, records, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(rover, args.basename)
     if args.obs_csv:
-        write_observations_csv(out_dir / f"{base}.observations.csv", observations.observations)
-    write_rinex_obs(out_dir / f"{base}.direct.obs", observations.observations, rinex_version=args.rinex_version)
+        obs_csv = out_dir / f"{base}.observations.csv"
+        write_observations_csv(obs_csv, observations.observations)
+        logging.info("wrote observation CSV: %s", obs_csv)
     nav_path = out_dir / f"{base}.rover-gps.nav"
+    logging.info("extracting rover navigation files: base=%s", nav_path)
     nav_report = extract_rover_nav(records, nav_path)
+    for kind, path in sorted(nav_report.written.items()):
+        logging.info("wrote rover %s file: %s", kind, path)
+    analysis["ephemeris"] = nav_report.as_dict()
+    analysis["warnings"] = list(dict.fromkeys([*analysis.get("warnings", []), *nav_report.warnings]))
+    rinex_observations = observations_for_rinex(
+        observations.observations,
+        compatibility=args.rinex_compat,
+    )
+    dropped = len(observations.observations) - len(rinex_observations)
+    if dropped:
+        logging.warning(
+            "RINEX %s compatibility dropped %d observations that are not safe for that profile",
+            args.rinex_compat,
+            dropped,
+        )
+    try:
+        obs_path = out_dir / f"{base}.direct.obs"
+        logging.info("writing rover RINEX OBS: %s", obs_path)
+        write_rinex_obs(
+            obs_path,
+            rinex_observations,
+            rinex_version=args.rinex_version,
+            compatibility=args.rinex_compat,
+            progress=logging.getLogger().isEnabledFor(logging.INFO),
+        )
+        logging.info("wrote rover RINEX OBS: %s", obs_path)
+    except ValueError as exc:
+        analysis["warnings"] = list(
+            dict.fromkeys([*analysis.get("warnings", []), f"RINEX OBS was not written: {exc}"])
+        )
+        if args.analysis_json:
+            analysis_path = out_dir / f"{base}.analysis.json"
+            write_analysis_json(analysis_path, analysis)
+            logging.info("wrote analysis JSON: %s", analysis_path)
+        _log_analysis_warnings(analysis)
+        raise
     if args.analysis_json:
-        analysis["ephemeris"] = nav_report.as_dict()
-        analysis["warnings"] = list(dict.fromkeys([*analysis.get("warnings", []), *nav_report.warnings]))
-        write_analysis_json(out_dir / f"{base}.analysis.json", analysis)
+        analysis_path = out_dir / f"{base}.analysis.json"
+        write_analysis_json(analysis_path, analysis)
+        logging.info("wrote analysis JSON: %s", analysis_path)
     _log_analysis_warnings(analysis)
     if args.verbose:
         _print_analysis_summary(analysis)
@@ -457,7 +746,17 @@ def _time_window_from_solutions(args: argparse.Namespace, margin_s: int):
 
 
 def cmd_download_base(args: argparse.Namespace) -> int:
+    """Handle `download-base`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
+    logging.info("starting EUREF base download")
     normalised = _download_base_files(args)
     if normalised:
         print("\n".join(str(path) for path in normalised))
@@ -465,40 +764,104 @@ def cmd_download_base(args: argparse.Namespace) -> int:
 
 
 def cmd_postprocess(args: argparse.Namespace) -> int:
+    """Handle `postprocess`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
     out_dir = ensure_out_dir(args.out_dir)
     base = args.basename or Path(args.rover_log).stem
-    nav_resolution = resolve_nav_sources(explicit=args.nav_file, observed_systems=set(), merge_policy=args.nav_merge)
+    rover_nav = []
+    if args.use_rover_nav:
+        logging.info("extracting rover navigation for RTKLIB input")
+        records, _ = _load_records(Path(args.rover_log))
+        rover_nav_path = out_dir / f"{base}.rover-gps.nav"
+        nav_report = extract_rover_nav(records, rover_nav_path)
+        for warning in nav_report.warnings:
+            logging.warning("%s", warning)
+        rover_nav = rover_nav_files(rover_nav_path)
+        logging.info("using %d rover navigation sidecar files", len(rover_nav))
+    logging.info("resolving navigation inputs for RTKLIB")
+    nav_resolution = resolve_nav_sources(
+        explicit=args.nav_file,
+        rover=rover_nav,
+        observed_systems=set(),
+        merge_policy=args.nav_merge,
+    )
     if not nav_resolution.selected:
         raise ValueError(nav_resolution.warnings[0])
     rnx2rtkp = resolve_rtklib_tool(args.rnx2rtkp, rtklib_dir=args.rtklib_dir)
-    base_ecef, base_llh = _resolve_base_position(args)
+    logging.info("resolved rnx2rtkp executable: %s", rnx2rtkp)
+    rover_obs = Path(args.rover_obs)
+    base_obs = [Path(item) for item in args.base_obs]
+    logging.info("checking rover/base observation time overlap: rover=%s base_files=%d", rover_obs, len(base_obs))
+    base_obs, overlap_warnings = filter_rinex_obs_by_overlap(rover_obs, base_obs)
+    for warning in overlap_warnings:
+        logging.warning("%s", warning)
+    logging.info("retained %d base observation files after overlap filtering", len(base_obs))
+    logging.info("resolving base position")
+    base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
+    logging.info("running RTKLIB postprocessing")
     command = run_rnx2rtkp(
         rnx2rtkp=rnx2rtkp,
         rtkconf=Path(args.rtkconf),
         output_file=out_dir / f"{base}-rtk.{args.output_format}",
-        rover_obs=Path(args.rover_obs),
-        base_obs=[Path(item) for item in args.base_obs],
-        nav_files=[candidate.path for candidate in nav_resolution.selected],
+        rover_obs=rover_obs,
+        base_obs=base_obs,
+        nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav),
         base_ecef_xyz_m=base_ecef,
         base_llh=base_llh,
         path_style=args.rtklib_path_style,
         dry_run=args.dry_run,
     )
+    logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
     print(" ".join(command.args))
     return 0
 
 
 def cmd_pipeline(args: argparse.Namespace) -> int:
+    """Handle the integrated `pipeline` command.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+
     configure_logging(args.verbose, args.log_file)
+    logging.info("pipeline step 1/3: extract receiver products")
     cmd_extract(args)
+    logging.info("pipeline step 2/3: generate rover RINEX and navigation files")
     cmd_rinex(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(args.rover_log, args.basename)
     rover_obs = out_dir / f"{base}.direct.obs"
     base_obs = [Path(item) for item in args.base_obs or []]
     if args.station and args.download_base:
-        base_obs.extend(_download_base_files(args))
+        logging.info("pipeline base download: deriving time span from %s", rover_obs)
+        rover_span = read_rinex_obs_time_span(rover_obs)
+        if rover_span.start is None or rover_span.end is None:
+            logging.warning(
+                "could not determine generated rover RINEX time span from %s; "
+                "falling back to solution-record time span for base downloads",
+                rover_obs,
+            )
+            base_obs.extend(_download_base_files(args))
+        else:
+            margin = timedelta(seconds=args.time_margin)
+            logging.info(
+                "pipeline base download window: %s to %s (margin=%ds)",
+                rover_span.start - margin,
+                rover_span.end + margin,
+                args.time_margin,
+            )
+            base_obs.extend(_download_base_files_for_window(args, rover_span.start - margin, rover_span.end + margin))
     should_run_rtklib = bool(args.run_rtklib or args.rtkconf or args.nav_file or base_obs)
     if not should_run_rtklib:
         logging.warning(
@@ -510,8 +873,17 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         raise ValueError("--rtkconf is required when pipeline runs RTKLIB")
     if not base_obs:
         raise ValueError("--base-obs or --download-base is required when pipeline runs RTKLIB")
+    logging.info("pipeline step 3/3: run RTKLIB postprocessing")
+    logging.info("checking rover/base observation time overlap: rover=%s base_files=%d", rover_obs, len(base_obs))
+    base_obs, overlap_warnings = filter_rinex_obs_by_overlap(rover_obs, base_obs)
+    for warning in overlap_warnings:
+        logging.warning("%s", warning)
+    logging.info("retained %d base observation files after overlap filtering", len(base_obs))
+    generated_rover_nav = rover_nav_files(out_dir / f"{base}.rover-gps.nav")
+    logging.info("found %d generated rover navigation sidecar files", len(generated_rover_nav))
     nav_resolution = resolve_nav_sources(
         explicit=args.nav_file,
+        rover=generated_rover_nav,
         observed_systems=set(),
         merge_policy=args.nav_merge,
     )
@@ -520,24 +892,41 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     if not nav_resolution.selected:
         raise ValueError(nav_resolution.warnings[0])
     rnx2rtkp = resolve_rtklib_tool(args.rnx2rtkp, rtklib_dir=args.rtklib_dir)
+    logging.info("resolved rnx2rtkp executable: %s", rnx2rtkp)
+    logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
+    logging.info("running RTKLIB postprocessing")
     command = run_rnx2rtkp(
         rnx2rtkp=rnx2rtkp,
         rtkconf=Path(args.rtkconf),
         output_file=out_dir / f"{base}-rtk.{args.output_format}",
         rover_obs=rover_obs,
         base_obs=base_obs,
-        nav_files=[candidate.path for candidate in nav_resolution.selected],
+        nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + generated_rover_nav),
         base_ecef_xyz_m=base_ecef,
         base_llh=base_llh,
         path_style=args.rtklib_path_style,
         dry_run=args.dry_run,
     )
+    logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
     print(" ".join(command.args))
     return 0
 
 
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
+
     parser = argparse.ArgumentParser(prog="um980-ppk")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -552,6 +941,11 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--base-height", type=float)
     gen.add_argument("--nmea", action="append")
     gen.add_argument("--nmea-preset", choices=sorted(NMEA_PRESETS))
+    gen.add_argument(
+        "--solution-hz",
+        type=float,
+        help="Set GNGGA and GNRMC solution output frequency in Hz, e.g. 1, 2, 4, 5, 10, or 20.",
+    )
     gen.add_argument("--raw-format", choices=["none", "obsvma", "obsvmb", "obsvmcmpb"])
     gen.add_argument("--raw-hz", type=float)
     gen.add_argument("--raw-period", type=float)
@@ -559,12 +953,43 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--expected-obs-per-epoch", type=int)
     gen.add_argument("--ephemeris")
     gen.add_argument("--ephemeris-systems")
+    gen.add_argument("--ephemeris-format", choices=["ascii", "binary"])
+    gen.add_argument(
+        "--debug-ascii-ephemeris",
+        action="store_true",
+        help=(
+            "Enable all ASCII ephemeris messages every 300 s for short debugging "
+            "captures; this can create large .unc files."
+        ),
+    )
     gen.add_argument("--ppp", choices=["none", "e6-has", "b2b-ppp", "ssr-rx"])
     gen.add_argument("--ppp-datum", choices=["WGS84", "PPPORIGINAL"])
-    gen.add_argument("--ppp-timeout", type=int)
-    gen.add_argument("--ppp-converge")
-    gen.add_argument("--include-tropinfo", action="store_true")
-    gen.add_argument("--include-gpsion", action="store_true")
+    gen.add_argument("--ppp-timeout", type=int, help="PPP timeout in seconds; defaults to 120 when PPP is enabled.")
+    gen.add_argument(
+        "--ppp-converge",
+        help="PPP convergence thresholds as 'horizontal,vertical'; defaults to 15,30 when PPP is enabled.",
+    )
+    gen.add_argument(
+        "--include-tropinfo",
+        action="store_true",
+        help="Emit selected-format TROPINFO ONCE and ONCHANGED; requires --ppp.",
+    )
+    gen.add_argument(
+        "--diagnostic-format",
+        choices=["ascii", "binary"],
+        help="Use A or B suffixed TROPINFO/ION diagnostics; default is ascii.",
+    )
+    gen.add_argument(
+        "--ion",
+        help="Comma-separated ionosphere families to emit as ONCHANGED: gps,bds,bd3,gal.",
+    )
+    gen.add_argument(
+        "--ion-period",
+        type=float,
+        help="Also repeat selected ionosphere messages every N seconds, e.g. 300.",
+    )
+    gen.add_argument("--include-ion", action="store_true", help="Enable all ionosphere families.")
+    gen.add_argument("--include-gpsion", action="store_true", help="Compatibility shortcut for --ion gps.")
     gen.add_argument("--save-config", action="store_true")
     gen.add_argument("--no-save-config", action="store_true")
     gen.add_argument("--strict-bitrate", action="store_true")
@@ -584,6 +1009,7 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--obs-csv", action="store_true")
             p.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="none")
             p.add_argument("--rinex-version", default="3.04")
+            p.add_argument("--rinex-compat", choices=["native", "convbin"], default="native")
         p.set_defaults(func=func)
 
     dl = sub.add_parser("download-base")
@@ -632,6 +1058,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
+    pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="native")
     _add_base_download_args(pipe, require_station=False)
     _add_base_position_args(pipe)
     _add_common(pipe)
@@ -640,6 +1067,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the CLI entrypoint.
+
+    Args:
+        argv: Optional argument vector. Uses `sys.argv` when omitted.
+
+    Returns:
+        Process exit code.
+    """
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

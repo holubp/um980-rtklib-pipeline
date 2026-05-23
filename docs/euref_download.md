@@ -1,7 +1,9 @@
 # EUREF/EPN Download
 
-`download-base` derives the rover time window from NMEA solution timestamps and
-then builds provider URLs for overlapping hourly or high-rate station files.
+`download-base` derives the rover time window from NMEA solution timestamps.
+The integrated `pipeline` command uses the generated rover RINEX observation
+span. Both paths build provider URLs for every hourly or high-rate station file
+that overlaps or touches the recorded rover interval.
 
 Configured station aliases include CPAR, KUNZ, TUBO, GOPE, GOP7, and GRAZ. A
 four-character station code outside this alias map requires `--station-long`.
@@ -35,11 +37,22 @@ When high-rate data is requested, the CLI logs the failed provider/URLs and
 falls back to low-rate data by default. Use `--no-base-fallback` when a missing
 high-rate file should be a hard failure.
 
+By default, `--time-margin` is `0`: only base products overlapping or touching
+the recorded interval are requested. Set `--time-margin SECONDS` only when you
+intentionally want neighboring products included for troubleshooting or
+receiver-clock uncertainty.
+
 RINEX 3 is the default source format. `--base-rinex-version 2` switches URL
 planning to compact RINEX 2/Hatanaka names. Low-rate BEV v2 names follow the
 archived helper script pattern, for example `tubo138h.26d.gz`; high-rate BKG v2
 names follow `tubo138h15.26d.Z`. `.Z` compression is decompressed with `gzip`,
-and Hatanaka `.d`/`.YYd` files still require `--crx2rnx`.
+and Hatanaka `.crx`, `.d`, and `.YYd` files require `crx2rnx`. The CLI
+preflights this before extracting any downloaded Hatanaka files, so a missing
+converter fails without leaving a partially extracted cache. `crx2rnx` is
+resolved from `--crx2rnx`, `--rtklib-dir` where that command supports it,
+`~/RTKLIB-ex-bin/bin`, `build-tools/RTKLIB-ex-bin/bin`, or PATH. Conversion is
+run non-interactively with force-overwrite and timeout safeguards, so an
+existing `.rnx` file cannot hide an overwrite prompt inside the pipeline.
 `--base-rinex-version auto` tries RINEX 3 before RINEX 2.
 
 The legacy `pfa2` short code appears in the archived v2 helper script and can be

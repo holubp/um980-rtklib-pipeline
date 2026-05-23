@@ -29,10 +29,21 @@ def load_config(path: str | Path | None) -> dict[str, Any]:
 
 
 def deep_get(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Read a nested dictionary value.
+
+    Args:
+        mapping: Root mapping to traverse.
+        *keys: Nested keys to follow.
+        default: Value returned when any key is missing or an intermediate value
+            is not a dictionary.
+
+    Returns:
+        Nested value or `default`.
+    """
+
     current: Any = mapping
     for key in keys:
         if not isinstance(current, dict) or key not in current:
             return default
         current = current[key]
     return current
-

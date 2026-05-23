@@ -26,7 +26,15 @@ DEFAULT_NMEA_BYTES: dict[str, int] = {
     "PPPNAVA": 180,
     "ADRNAVA": 180,
     "TROPINFOA": 160,
+    "TROPINFOB": 160,
+    "GPSIONA": 120,
     "GPSIONB": 120,
+    "BDSIONA": 120,
+    "BDSIONB": 120,
+    "BD3IONA": 120,
+    "BD3IONB": 120,
+    "GALIONA": 120,
+    "GALIONB": 120,
 }
 
 GSV_LINES_PER_EPOCH: dict[str, int] = {
@@ -38,18 +46,53 @@ GSV_LINES_PER_EPOCH: dict[str, int] = {
 }
 
 DEFAULT_EPH_BYTES: dict[str, int] = {
-    "GPSEPHA": 350,
-    "GLOEPHA": 250,
-    "GALEPHA": 400,
-    "BDSEPHA": 400,
-    "BD3EPHA": 400,
-    "QZSSEPHA": 350,
+    # ASCII line lengths include receiver header, payload, checksum, and CRLF.
+    # GPS/GLO values are measured from private UM980 captures. The remaining
+    # values are conservative estimates from RTKLIB-ex binary payload sizes with
+    # ASCII float expansion.
+    "GPSEPHA": 455,
+    "GLOEPHA": 380,
+    "GALEPHA": 460,
+    "BDSEPHA": 500,
+    "BD3EPHA": 500,
+    "QZSSEPHA": 455,
+    # Binary ephemeris frame sizes use RTKLIB-ex Unicore payload structures plus
+    # the fixed UM980 binary header and CRC.
+    "GPSEPHB": 256,
+    "GLOEPHB": 184,
+    "GALEPHB": 260,
+    "BDSEPHB": 268,
+    "BD3EPHB": 268,
+    "QZSSEPHB": 256,
+}
+DEFAULT_EPH_RECORDS_PER_PERIOD: dict[str, int] = {
+    "GPSEPHA": 32,
+    "GLOEPHA": 14,
+    "GALEPHA": 32,
+    "BDSEPHA": 40,
+    "BD3EPHA": 40,
+    "QZSSEPHA": 4,
+    "GPSEPHB": 32,
+    "GLOEPHB": 14,
+    "GALEPHB": 32,
+    "BDSEPHB": 40,
+    "BD3EPHB": 40,
+    "QZSSEPHB": 4,
 }
 
 
 @dataclass(frozen=True)
 class BitrateEstimate:
-    """Estimated UM980 serial payload and 8N1 line utilisation."""
+    """Estimated UM980 serial payload and 8N1 line utilisation.
+
+    Attributes:
+        baud: Configured serial baud rate in bits per second.
+        nmea_bytes_per_s: Estimated average NMEA payload bytes per second.
+        raw_bytes_per_s: Estimated average raw-observation payload bytes per
+            second.
+        ephemeris_bytes_per_s: Estimated average ephemeris payload bytes per
+            second.
+    """
 
     baud: int
     nmea_bytes_per_s: float
@@ -100,7 +143,19 @@ class BitrateEstimate:
 
 
 def raw_epoch_bytes(raw_format: str, nobs: int) -> int:
-    """Return a conservative byte estimate for one raw observation epoch."""
+    """Return a conservative byte estimate for one raw observation epoch.
+
+    Args:
+        raw_format: UM980 raw observation message family, such as `obsvma`,
+            `obsvmb`, `obsvmcmpb`, or `none`.
+        nobs: Expected observations in one epoch.
+
+    Returns:
+        Estimated bytes emitted for one raw observation epoch.
+
+    Raises:
+        ValueError: If `raw_format` is not supported.
+    """
 
     fmt = raw_format.lower()
     if fmt == "none":
@@ -115,7 +170,15 @@ def raw_epoch_bytes(raw_format: str, nobs: int) -> int:
 
 
 def nmea_payload_rate(nmea_rates_hz: Mapping[str, float]) -> float:
-    """Estimate NMEA bytes per second for a message-rate mapping."""
+    """Estimate NMEA bytes per second for a message-rate mapping.
+
+    Args:
+        nmea_rates_hz: Mapping from NMEA/diagnostic message name to output rate
+            in hertz.
+
+    Returns:
+        Estimated average bytes per second for all enabled messages.
+    """
 
     total = 0.0
     for message, hz in nmea_rates_hz.items():
@@ -128,7 +191,17 @@ def nmea_payload_rate(nmea_rates_hz: Mapping[str, float]) -> float:
 
 
 def ephemeris_payload_rate(ephemeris_periods_s: Mapping[str, float | str]) -> float:
-    """Estimate average ephemeris bytes per second from period settings."""
+    """Estimate average ephemeris bytes per second from period settings.
+
+    Args:
+        ephemeris_periods_s: Mapping from UM980 ephemeris message name to
+            either a numeric period in seconds or `ONCHANGED`.
+
+    Returns:
+        Estimated average bytes per second contributed by ephemeris logging.
+        Each enabled message is multiplied by the expected number of satellite
+        ephemeris records emitted during one period.
+    """
 
     total = 0.0
     for message, period in ephemeris_periods_s.items():
@@ -141,7 +214,11 @@ def ephemeris_payload_rate(ephemeris_periods_s: Mapping[str, float | str]) -> fl
         else:
             seconds = float(period)
         if seconds > 0:
-            total += DEFAULT_EPH_BYTES.get(msg, 350) / seconds
+            total += (
+                DEFAULT_EPH_BYTES.get(msg, 450)
+                * DEFAULT_EPH_RECORDS_PER_PERIOD.get(msg, 1)
+                / seconds
+            )
     return total
 
 
@@ -154,7 +231,20 @@ def estimate_bitrate(
     expected_obs_per_epoch: int = 100,
     ephemeris_periods_s: Mapping[str, float | str] | None = None,
 ) -> BitrateEstimate:
-    """Estimate payload and line utilisation for one logging profile."""
+    """Estimate payload and line utilisation for one logging profile.
+
+    Args:
+        baud: Serial baud rate in bits per second.
+        nmea_rates_hz: Mapping from NMEA message name to output rate in hertz.
+        raw_format: Raw observation format (`none`, `obsvma`, `obsvmb`, or
+            `obsvmcmpb`).
+        raw_hz: Raw observation output rate in hertz.
+        expected_obs_per_epoch: Expected observation count in each raw epoch.
+        ephemeris_periods_s: Optional mapping of ephemeris message periods.
+
+    Returns:
+        A bitrate estimate with payload and serial-line utilisation fields.
+    """
 
     nmea = nmea_payload_rate(nmea_rates_hz)
     raw = raw_epoch_bytes(raw_format, expected_obs_per_epoch) * max(raw_hz, 0.0)
@@ -165,4 +255,3 @@ def estimate_bitrate(
         raw_bytes_per_s=raw,
         ephemeris_bytes_per_s=eph,
     )
-

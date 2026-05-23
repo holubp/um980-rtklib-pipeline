@@ -1,5 +1,6 @@
 import argparse
 import logging
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -7,13 +8,16 @@ import pytest
 
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline.euref import (
+    _run_crx2rnx,
     download_urls,
     normalise_rinex_file,
     parse_epn_station_position,
     parse_rinex_approx_position,
     planned_urls,
+    requires_crx2rnx,
     resolve_station,
 )
+from um980_rtklib_pipeline.files import filter_rinex_obs_by_overlap, read_rinex_obs_time_span
 from um980_rtklib_pipeline.nav_resolver import resolve_nav_sources
 from um980_rtklib_pipeline import rtklib
 from um980_rtklib_pipeline.rtklib import (
@@ -59,6 +63,37 @@ def test_rinex_v2_url_planning():
         rinex_version="2",
     )
     assert high[0].endswith("/tubo138h15.26d.Z")
+
+
+def test_highrate_url_planning_includes_only_touching_chunks():
+    urls = planned_urls(
+        station="TUBO",
+        start=datetime(2026, 5, 22, 21, 15, tzinfo=UTC),
+        end=datetime(2026, 5, 22, 21, 15, tzinfo=UTC),
+        provider_name="bkg-euref-highrate",
+        base_rate="1s",
+        rinex_version="3",
+    )
+    assert [
+        url.rsplit("/", 1)[-1]
+        for url in urls
+    ] == [
+        "TUBO00CZE_S_20261422100_15M_01S_MO.crx.gz",
+        "TUBO00CZE_S_20261422115_15M_01S_MO.crx.gz",
+    ]
+
+
+def test_hourly_url_planning_uses_recorded_span_without_margin():
+    urls = planned_urls(
+        station="TUBO",
+        start=datetime(2026, 5, 22, 21, 1, 33, tzinfo=UTC),
+        end=datetime(2026, 5, 22, 21, 18, 24, tzinfo=UTC),
+        provider_name="bev-nrt",
+        rinex_version="3",
+    )
+    names = [url.rsplit("/", 1)[-1] for url in urls]
+    assert all(name.startswith("TUBO00CZE_R_20261422100_01H_30S_MO.") for name in names)
+    assert not any("20261422000" in name for name in names)
 
 
 def test_script_mentioned_station_aliases_and_v2_short_codes():
@@ -108,6 +143,25 @@ def test_nav_resolver_rejects_header_only_nav(tmp_path: Path):
     resolution = resolve_nav_sources(explicit=[nav], observed_systems={"GPS"})
     assert not resolution.selected
     assert "NAV file has no data records" in resolution.candidates[0].notes[-1]
+
+
+def test_nav_resolver_rejects_empty_sbs(tmp_path: Path):
+    sbs = tmp_path / "empty.sbs"
+    sbs.write_text("", encoding="ascii")
+    resolution = resolve_nav_sources(explicit=[sbs], observed_systems={"SBAS"})
+    assert not resolution.selected
+    assert "SBAS message file is empty" in resolution.candidates[0].notes[-1]
+
+
+def test_rtklib_validation_rejects_empty_sbs(tmp_path: Path):
+    obs = tmp_path / "rover.obs"
+    base = tmp_path / "base.obs"
+    sbs = tmp_path / "empty.sbs"
+    obs.write_text("     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n")
+    base.write_text("     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n")
+    sbs.write_text("", encoding="ascii")
+    with pytest.raises(ValueError, match="SBAS message file is empty"):
+        validate_rtklib_inputs(rnx2rtkp="/bin/sh", rover_obs=obs, base_obs=[base], nav_files=[sbs])
 
 
 def test_rtklib_validation_rejects_wildcard(tmp_path: Path):
@@ -187,21 +241,136 @@ def test_parse_rinex_approx_position(tmp_path: Path):
     assert position.ecef_xyz_m == (3949919.0831, 1116467.0453, 4865832.5410)
 
 
+def _write_obs_with_span(path: Path, start: str, end: str) -> None:
+    path.write_text(
+        "     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n"
+        f"  {start}     GPS         TIME OF FIRST OBS\n"
+        f"  {end}     GPS         TIME OF LAST OBS\n"
+        "                                                            END OF HEADER\n",
+        encoding="ascii",
+    )
+
+
+def test_rinex_obs_time_span_parses_header(tmp_path: Path):
+    obs = tmp_path / "rover.obs"
+    _write_obs_with_span(obs, "2026 05 22 21 01 33.2000000", "2026 05 22 21 18 24.2000000")
+    span = read_rinex_obs_time_span(obs)
+    assert span.start == datetime(2026, 5, 22, 21, 1, 33, 200000)
+    assert span.end == datetime(2026, 5, 22, 21, 18, 24, 200000)
+
+
+def test_base_obs_without_rover_overlap_is_filtered(tmp_path: Path):
+    rover = tmp_path / "rover.obs"
+    stale = tmp_path / "TUBO00CZE_R_20261422000_01H_30S_MO.rnx"
+    current = tmp_path / "TUBO00CZE_R_20261422100_01H_30S_MO.rnx"
+    _write_obs_with_span(rover, "2026 05 22 21 01 33.2000000", "2026 05 22 21 18 24.2000000")
+    _write_obs_with_span(stale, "2026 05 22 20 00 00.0000000", "2026 05 22 20 59 30.0000000")
+    _write_obs_with_span(current, "2026 05 22 21 00 00.0000000", "2026 05 22 21 59 30.0000000")
+
+    retained, warnings = filter_rinex_obs_by_overlap(rover, [stale, current])
+
+    assert retained == [current]
+    assert any(str(stale) in warning and "no rover overlap" in warning for warning in warnings)
+
+
+def test_base_obs_overlap_filter_rejects_all_stale_files(tmp_path: Path):
+    rover = tmp_path / "rover.obs"
+    stale = tmp_path / "TUBO00CZE_R_20261422000_01H_30S_MO.rnx"
+    _write_obs_with_span(rover, "2026 05 22 21 01 33.2000000", "2026 05 22 21 18 24.2000000")
+    _write_obs_with_span(stale, "2026 05 22 20 00 00.0000000", "2026 05 22 20 59 30.0000000")
+
+    with pytest.raises(ValueError, match="no base observation files overlap"):
+        filter_rinex_obs_by_overlap(rover, [stale])
+
+
 def test_normalise_rinex_v2_hatanaka_suffix(tmp_path: Path, monkeypatch):
     compressed = tmp_path / "cpar138h.26d"
     produced = tmp_path / "cpar138h.26o"
     compressed.write_text("hatanaka", encoding="ascii")
 
-    def fake_run(args: list[str], check: bool, capture_output: bool, text: bool):
+    def fake_run(crx2rnx: str, current: Path, output: Path, *, timeout_s: float):
+        assert crx2rnx == "crx2rnx"
+        assert current == compressed
+        assert output == produced
         produced.write_text(
             "     2.11           OBSERVATION DATA    G                   RINEX VERSION / TYPE\n"
             "                                                            END OF HEADER\n",
             encoding="ascii",
         )
-        return argparse.Namespace(returncode=0, stderr="")
+        return argparse.Namespace(returncode=0, stderr="", stdout="")
 
-    monkeypatch.setattr("um980_rtklib_pipeline.euref.subprocess.run", fake_run)
+    monkeypatch.setattr("um980_rtklib_pipeline.euref._run_crx2rnx", fake_run)
     assert normalise_rinex_file(compressed, crx2rnx="crx2rnx") == produced
+
+
+def test_crx2rnx_runner_forces_overwrite_and_closes_stdin(tmp_path: Path, monkeypatch):
+    compressed = tmp_path / "base.crx"
+    produced = tmp_path / "base.rnx"
+    calls: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self, timeout: float | None = None):
+            return "ok", ""
+
+    def fake_popen(command, **kwargs):
+        calls["command"] = command
+        calls.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("um980_rtklib_pipeline.euref.subprocess.Popen", fake_popen)
+
+    result = _run_crx2rnx("crx2rnx", compressed, produced, timeout_s=30.0)
+
+    assert result.returncode == 0
+    assert calls["command"] == ["crx2rnx", str(compressed), "-f"]
+    assert calls["stdin"] == subprocess.DEVNULL
+    assert calls["stdout"] == subprocess.PIPE
+    assert calls["stderr"] == subprocess.PIPE
+
+
+def test_hatanaka_detection_includes_compressed_rinex2_and_rinex3():
+    assert requires_crx2rnx(Path("TUBO00CZE_R_20261430500_01H_30S_MO.crx.gz"))
+    assert requires_crx2rnx(Path("tubo143f.26d.gz"))
+    assert requires_crx2rnx(Path("tubo143f.26d.Z"))
+    assert not requires_crx2rnx(Path("TUBO00CZE_R_20261430500_01H_30S_MO.rnx.gz"))
+    assert not requires_crx2rnx(Path("tubo143f.26o.gz"))
+
+
+def test_normalise_rinex_preflights_crx2rnx_before_decompression(tmp_path: Path):
+    compressed = tmp_path / "TUBO00CZE_R_20261430500_01H_30S_MO.crx.gz"
+    compressed.write_bytes(b"not actually gzip")
+
+    with pytest.raises(RuntimeError, match="before decompression"):
+        normalise_rinex_file(compressed, crx2rnx=None)
+
+    assert not compressed.with_suffix("").exists()
+
+
+def test_download_base_auto_resolves_crx2rnx_for_hatanaka_downloads(tmp_path: Path, monkeypatch):
+    tool = tmp_path / "crx2rnx"
+    args = argparse.Namespace(crx2rnx=None, rtklib_dir=None)
+
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool_name, rtklib_dir=None: str(tool))
+    monkeypatch.setattr(cli, "executable_exists", lambda executable: executable == str(tool))
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: f"{executable}.run")
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == f"{tool}.run"
+
+
+def test_download_base_rejects_hatanaka_without_crx2rnx_before_extraction(tmp_path: Path, monkeypatch):
+    downloaded = tmp_path / "base.crx.gz"
+    downloaded.write_bytes(b"not actually gzip")
+    args = argparse.Namespace(crx2rnx=None, rtklib_dir=None)
+
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool_name, rtklib_dir=None: str(tmp_path / "missing"))
+    monkeypatch.setattr(cli, "executable_exists", lambda executable: False)
+
+    with pytest.raises(RuntimeError, match="crx2rnx is required"):
+        cli._resolve_crx2rnx_for_download(args, [downloaded])
+
+    assert not downloaded.with_suffix("").exists()
 
 
 def test_cygdrive_paths_convert_to_windows_arguments():
@@ -275,6 +444,17 @@ def test_rtklib_header_only_output_is_logged(tmp_path: Path, caplog):
     assert any("invalid configuration option" in message for message in messages)
     assert any("no solution rows" in message for message in messages)
     assert any("only Q=0 epochs" in message for message in messages)
+
+
+def test_rtklib_single_quality_is_not_logged_as_q0_failure(tmp_path: Path, caplog):
+    output = tmp_path / "out.pos"
+    output.write_text("$GPGGA,120000.00,5000.0,N,01400.0,E,1,08,1.0,250.0,M,0.0,M,0.0,0000*00\n", encoding="ascii")
+    _warn_about_rtklib_result(
+        output,
+        "processing : 2026/05/18 07:00:00 Q=0\nprocessing : 2026/05/18 07:00:01 Q=5\n",
+    )
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("only Q=0 epochs" in message for message in messages)
 
 
 def test_download_urls_continues_after_failed_alternative(tmp_path: Path, monkeypatch):
@@ -372,6 +552,15 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     nav = tmp_path / "brdc.rnx"
     base_obs = tmp_path / "base.obs"
     out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    rover_nav = [
+        out_dir / "rover.rover-gps.nav",
+        out_dir / "rover.rover-glo.gnav",
+        out_dir / "rover.rover-gal.lnav",
+        out_dir / "rover.rover-sbas.sbs",
+    ]
+    for path in rover_nav:
+        path.write_text("data\n", encoding="ascii")
 
     args = argparse.Namespace(
         rover_log="rover.unc",
@@ -409,7 +598,11 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
         warnings: list[str] = []
         selected = [Candidate()]
 
-    monkeypatch.setattr(cli, "resolve_nav_sources", lambda **_kwargs: Resolution())
+    def fake_resolve_nav_sources(**kwargs):
+        assert kwargs["rover"] == rover_nav
+        return Resolution()
+
+    monkeypatch.setattr(cli, "resolve_nav_sources", fake_resolve_nav_sources)
 
     def fake_run_rnx2rtkp(**kwargs):
         calls.update(kwargs)
@@ -419,5 +612,5 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     assert cli.cmd_pipeline(args) == 0
     assert calls["rover_obs"] == out_dir / "rover.direct.obs"
     assert calls["base_obs"] == [base_obs]
-    assert calls["nav_files"] == [nav]
+    assert calls["nav_files"] == [nav, *rover_nav]
     assert calls["output_file"] == out_dir / "rover-rtk.pos"

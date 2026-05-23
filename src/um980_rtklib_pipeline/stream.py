@@ -3,16 +3,40 @@
 from __future__ import annotations
 
 import binascii
+import logging
 from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
 
 RecordKind = Literal["nmea", "unicore_ascii", "unicore_binary", "noise"]
+BINARY_MESSAGE_TYPES = {
+    12: "OBSVMB",
+    106: "GPSEPHB",
+    107: "GLOEPHB",
+    108: "BDSEPHB",
+    109: "GALEPHB",
+    110: "QZSSEPHB",
+    112: "IRNSSEPHB",
+    138: "OBSVMCMPB",
+    2999: "BD3EPHB",
+}
 
 
 @dataclass(frozen=True)
 class StreamRecord:
+    """One demultiplexed record from a mixed UM980 serial stream.
+
+    Attributes:
+        kind: Record family (`nmea`, `unicore_ascii`, `unicore_binary`, or
+            `noise`).
+        offset: Byte offset in the input stream.
+        raw: Original bytes for the record.
+        text: Decoded text for ASCII records.
+        msg_type: Message type when one can be inferred.
+        checksum_ok: Checksum result, or `None` when not applicable.
+    """
+
     kind: RecordKind
     offset: int
     raw: bytes
@@ -23,6 +47,20 @@ class StreamRecord:
 
 @dataclass
 class StreamDiagnostics:
+    """Counters describing mixed-stream parsing results.
+
+    Attributes:
+        input_bytes: Total input byte count.
+        valid_nmea_records: NMEA records with valid or absent checksums.
+        invalid_nmea_records: NMEA records with invalid checksums.
+        unicore_ascii_records: Unicore ASCII records found.
+        unicore_binary_records: Unicore binary frames found.
+        invalid_unicore_binary_records: Binary sync candidates rejected.
+        noise_bytes: Bytes not assigned to a known record.
+        nmea_types: Counts by NMEA sentence type.
+        unicore_types: Counts by Unicore message type.
+    """
+
     input_bytes: int = 0
     valid_nmea_records: int = 0
     invalid_nmea_records: int = 0
@@ -34,12 +72,16 @@ class StreamDiagnostics:
     unicore_types: Counter[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        """Initialise mutable counters omitted by the caller."""
+
         if self.nmea_types is None:
             self.nmea_types = Counter()
         if self.unicore_types is None:
             self.unicore_types = Counter()
 
     def as_dict(self) -> dict[str, object]:
+        """Return a JSON-serialisable diagnostics dictionary."""
+
         return {
             "input_bytes": self.input_bytes,
             "valid_nmea_records": self.valid_nmea_records,
@@ -54,6 +96,16 @@ class StreamDiagnostics:
 
 
 def nmea_checksum_ok(line: bytes) -> bool | None:
+    """Validate a NMEA checksum.
+
+    Args:
+        line: Raw NMEA sentence bytes.
+
+    Returns:
+        True for a valid checksum, False for an invalid checksum, or `None`
+        when the line is not checksum-bearing NMEA.
+    """
+
     if not line.startswith(b"$") or b"*" not in line:
         return None
     body, checksum = line[1:].split(b"*", 1)
@@ -69,6 +121,16 @@ def nmea_checksum_ok(line: bytes) -> bool | None:
 
 
 def unicore_ascii_checksum_ok(line: bytes) -> bool | None:
+    """Validate a Unicore ASCII CRC32 checksum.
+
+    Args:
+        line: Raw Unicore ASCII record bytes.
+
+    Returns:
+        True for a valid CRC, False for an invalid CRC, or `None` when the line
+        is not a checksum-bearing Unicore ASCII record.
+    """
+
     if not line.startswith(b"#") or b"*" not in line:
         return None
     body, checksum = line[1:].split(b"*", 1)
@@ -81,6 +143,16 @@ def unicore_ascii_checksum_ok(line: bytes) -> bool | None:
 
 
 def record_message_type(text: str, prefix: str) -> str | None:
+    """Extract a message type from NMEA or Unicore ASCII text.
+
+    Args:
+        text: Decoded record text.
+        prefix: Expected record prefix, usually `$` or `#`.
+
+    Returns:
+        Message type or `None` when the text does not match the prefix.
+    """
+
     if not text.startswith(prefix):
         return None
     body = text[1:].split("*", 1)[0]
@@ -89,29 +161,36 @@ def record_message_type(text: str, prefix: str) -> str | None:
 
 
 def _binary_frame_length(data: bytes, pos: int) -> int | None:
-    # Unicore/OEM-style frames commonly encode header length at byte 3 and
-    # payload length as little-endian uint16 at bytes 8..9. Validate cheaply.
-    if pos + 12 > len(data):
+    # Unicore UM980 frames use a fixed 24-byte header and encode payload length
+    # as little-endian uint16 at bytes 6..7. RTKLIB-ex uses the same layout in
+    # src/rcv/unicore.c (HLEN=24, len=U2(buff+6)+HLEN).
+    header_length = 24
+    if pos + header_length + 4 > len(data):
         return None
-    header_length = data[pos + 3]
-    if header_length < 12 or header_length > 128:
-        return None
-    if pos + header_length > len(data):
-        return None
-    payload_length = int.from_bytes(data[pos + 8 : pos + 10], "little", signed=False)
+    payload_length = int.from_bytes(data[pos + 6 : pos + 8], "little", signed=False)
     total = header_length + payload_length + 4
-    if total <= 0 or pos + total > len(data):
+    if total <= header_length + 4 or pos + total > len(data):
         return None
     return total
 
 
-def parse_stream(data: bytes) -> tuple[list[StreamRecord], StreamDiagnostics]:
-    """Parse a mixed UM980 serial stream into record objects."""
+def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRecord], StreamDiagnostics]:
+    """Parse a mixed UM980 serial stream into record objects.
+
+    Args:
+        data: Raw bytes from a receiver capture.
+        progress: Emit coarse byte-progress messages through logging.
+
+    Returns:
+        Parsed records and aggregate diagnostics.
+    """
 
     diagnostics = StreamDiagnostics(input_bytes=len(data))
     records: list[StreamRecord] = []
     pos = 0
     noise_start: int | None = None
+    progress_step = 10 * 1024 * 1024
+    next_progress = progress_step
 
     def flush_noise(end: int) -> None:
         nonlocal noise_start
@@ -122,6 +201,9 @@ def parse_stream(data: bytes) -> tuple[list[StreamRecord], StreamDiagnostics]:
         noise_start = None
 
     while pos < len(data):
+        if progress and len(data) >= progress_step and pos >= next_progress:
+            logging.info("parsed %.1f%% of rover byte stream (%d/%d bytes)", pos * 100.0 / len(data), pos, len(data))
+            next_progress += progress_step
         byte = data[pos : pos + 1]
         if byte == b"$":
             end = data.find(b"\n", pos)
@@ -168,7 +250,7 @@ def parse_stream(data: bytes) -> tuple[list[StreamRecord], StreamDiagnostics]:
                 flush_noise(pos)
                 raw = data[pos : pos + frame_len]
                 msg_id = int.from_bytes(raw[4:6], "little", signed=False) if len(raw) >= 6 else 0
-                msg_type = f"binary:{msg_id}"
+                msg_type = BINARY_MESSAGE_TYPES.get(msg_id, f"binary:{msg_id}")
                 diagnostics.unicore_binary_records += 1
                 diagnostics.unicore_types[msg_type] += 1
                 records.append(StreamRecord("unicore_binary", pos, raw, None, msg_type, None))
@@ -182,4 +264,3 @@ def parse_stream(data: bytes) -> tuple[list[StreamRecord], StreamDiagnostics]:
 
     flush_noise(len(data))
     return records, diagnostics
-

@@ -16,3 +16,15 @@ def test_stream_detects_unicore_ascii():
     assert diag.unicore_ascii_records == 1
     assert records[0].msg_type == "OBSVMA"
 
+
+def test_stream_detects_fixed_header_unicore_binary_with_named_message_type():
+    payload = b"$not,nmea,because,binary\r\n"
+    header = bytearray(24)
+    header[:3] = b"\xaa\x44\xb5"
+    header[4:6] = (138).to_bytes(2, "little")
+    header[6:8] = len(payload).to_bytes(2, "little")
+    records, diag = parse_stream(bytes(header) + payload + b"\x00\x00\x00\x00")
+    assert diag.unicore_binary_records == 1
+    assert diag.valid_nmea_records == 0
+    assert records[0].kind == "unicore_binary"
+    assert records[0].msg_type == "OBSVMCMPB"

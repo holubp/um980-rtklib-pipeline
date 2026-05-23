@@ -22,6 +22,16 @@ LOCAL_RTKLIB_BIN = Path("build-tools/RTKLIB-ex-bin/bin")
 
 @dataclass(frozen=True)
 class RtklibCommand:
+    """Executed or prepared RTKLIB command metadata.
+
+    Attributes:
+        args: Argument vector passed to `subprocess.run`.
+        output_file: Expected RTKLIB solution output path.
+        stdout_log: Captured RTKLIB stdout log path.
+        stderr_log: Captured RTKLIB stderr log path.
+        wrapper_file: Reproducible shell wrapper containing the same command.
+    """
+
     args: list[str]
     output_file: Path
     stdout_log: Path
@@ -245,6 +255,8 @@ def validate_rtklib_inputs(
         kind = classify_rinex_file(path)
         if kind == "nav" and not _has_rinex_body_records(path):
             raise ValueError(f"NAV file has no data records after END OF HEADER: {path}")
+        if kind == "sbs" and path.stat().st_size == 0:
+            raise ValueError(f"SBAS message file is empty: {path}")
         if kind not in {"nav", "sp3", "clk", "sbs"}:
             raise ValueError(f"NAV/SP3/CLK/SBS file could not be classified: {path}")
 
@@ -284,6 +296,13 @@ def build_rnx2rtkp_command(
 
 
 def write_wrapper(path: Path, args: list[str]) -> None:
+    """Write a shell wrapper for a prepared RTKLIB command.
+
+    Args:
+        path: Destination wrapper path.
+        args: Command argument vector to quote into the wrapper.
+    """
+
     quoted = " ".join("'" + arg.replace("'", "'\"'\"'") + "'" for arg in args)
     path.write_text("#!/bin/sh\nset -eu\n" + quoted + "\n", encoding="utf-8")
     path.chmod(0o755)
@@ -318,8 +337,9 @@ def _warn_about_rtklib_result(output_file: Path, stderr: str) -> None:
             "NAV coverage, RINEX signal mappings, and RTKLIB configuration.",
             output_file,
         )
-    if "Q=0" in stderr and "Q=1" not in stderr and "Q=2" not in stderr:
-        logging.warning("RTKLIB progress reported only Q=0 epochs; no usable fixed/float solution was produced.")
+    usable_quality_seen = any(f"Q={quality}" in stderr for quality in (1, 2, 4, 5))
+    if "Q=0" in stderr and not usable_quality_seen:
+        logging.warning("RTKLIB progress reported only Q=0 epochs; no usable solution was produced.")
 
 
 def run_rnx2rtkp(
@@ -335,6 +355,29 @@ def run_rnx2rtkp(
     path_style: RtklibPathStyle = "auto",
     dry_run: bool = False,
 ) -> RtklibCommand:
+    """Validate, prepare, and optionally run `rnx2rtkp`.
+
+    Args:
+        rnx2rtkp: RTKLIB executable path or command name.
+        rtkconf: RTKLIB configuration file.
+        output_file: Destination solution path.
+        rover_obs: Rover RINEX observation file.
+        base_obs: Base RINEX observation files.
+        nav_files: NAV/SP3/CLK/SBS files passed to RTKLIB.
+        base_ecef_xyz_m: Optional fixed base position in ECEF meters.
+        base_llh: Optional fixed base position as latitude, longitude, height.
+        path_style: Path conversion style for RTKLIB arguments.
+        dry_run: When true, only validate and write the wrapper.
+
+    Returns:
+        Prepared command metadata.
+
+    Raises:
+        FileNotFoundError: If required inputs or executable are missing.
+        ValueError: If inputs are invalid or ambiguous.
+        RuntimeError: If RTKLIB exits with a non-zero status.
+    """
+
     validate_rtklib_inputs(rnx2rtkp=rnx2rtkp, rover_obs=rover_obs, base_obs=base_obs, nav_files=nav_files)
     args = build_rnx2rtkp_command(
         rnx2rtkp=rnx2rtkp,

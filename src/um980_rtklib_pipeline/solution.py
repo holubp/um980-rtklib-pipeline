@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -27,6 +28,31 @@ from .stream import StreamRecord
 
 @dataclass
 class SolutionPoint:
+    """One decoded rover solution point.
+
+    Attributes:
+        time_utc: UTC timestamp.
+        source: Source NMEA/diagnostic message family.
+        lat: Latitude in decimal degrees.
+        lon: Longitude in decimal degrees.
+        h_ell: Ellipsoidal height in meters when known.
+        h_msl: Mean-sea-level height in meters when known.
+        fix_quality: Numeric NMEA fix quality.
+        fix_quality_text: Human-readable fix quality.
+        pos_type: Receiver position type text.
+        sol_status: Receiver solution status text.
+        num_sats: Number of satellites used/reported.
+        hdop: Horizontal dilution of precision.
+        vdop: Vertical dilution of precision.
+        pdop: Position dilution of precision.
+        sigma_e: East standard deviation in meters.
+        sigma_n: North standard deviation in meters.
+        sigma_u: Up standard deviation in meters.
+        speed_mps: Ground speed in meters per second.
+        course_deg: Course over ground in degrees.
+        age_diff: Differential correction age in seconds.
+    """
+
     time_utc: datetime
     source: Literal["GGA", "GNS", "RMC", "PPPNAVA", "ADRNAVA"]
     lat: float
@@ -51,7 +77,18 @@ class SolutionPoint:
 
 @dataclass
 class SolutionExtraction:
-    clean_nmea: list[str]
+    """Outputs produced by solution extraction.
+
+    Attributes:
+        all_nmea: Checksum-valid NMEA records.
+        solution_records: NMEA records that produced solution points.
+        solution_points: Decoded solution points.
+        all_rows: CSV-friendly rows for all NMEA records.
+        nmea_cadence: Per-sentence cadence metrics.
+        warnings: User-facing extraction warnings.
+    """
+
+    all_nmea: list[str]
     solution_records: list[str]
     solution_points: list[SolutionPoint]
     all_rows: list[dict[str, object]]
@@ -182,23 +219,36 @@ def _cadence(timestamps: list[datetime]) -> dict[str, float | int]:
     }
 
 
-def extract_solutions(records: list[StreamRecord]) -> SolutionExtraction:
-    clean: list[str] = []
+def extract_solutions(records: list[StreamRecord], *, progress: bool = False) -> SolutionExtraction:
+    """Extract solution tracks and clean NMEA from stream records.
+
+    Args:
+        records: Parsed mixed-stream records.
+        progress: Emit coarse record-progress messages through logging.
+
+    Returns:
+        Solution extraction products and warnings.
+    """
+
+    all_nmea: list[str] = []
     solution_records: list[str] = []
     points: list[SolutionPoint] = []
     all_rows: list[dict[str, object]] = []
     warnings: list[str] = []
     context_date: datetime | None = None
     timestamps_by_type: dict[str, list[datetime]] = {}
+    progress_step = 100_000
 
-    for stream_record in records:
+    for index, stream_record in enumerate(records, start=1):
+        if progress and index % progress_step == 0:
+            logging.info("scanned %d/%d records for solution data", index, len(records))
         if stream_record.kind != "nmea" or stream_record.text is None:
             continue
         parsed = parse_sentence(stream_record.text, stream_record.checksum_ok)
         if parsed is None:
             continue
         if stream_record.checksum_ok is not False:
-            clean.append(stream_record.text)
+            all_nmea.append(stream_record.text)
         typ = sentence_type(parsed.talker_type)
         point: SolutionPoint | None = None
         if typ == "RMC":
@@ -245,10 +295,17 @@ def extract_solutions(records: list[StreamRecord]) -> SolutionExtraction:
         all_rows.append(row)
 
     cadence = {name: _cadence(values) for name, values in timestamps_by_type.items()}
-    return SolutionExtraction(clean, solution_records, points, all_rows, cadence, warnings)
+    return SolutionExtraction(all_nmea, solution_records, points, all_rows, cadence, warnings)
 
 
 def write_solution_csv(path: Path, points: list[SolutionPoint]) -> None:
+    """Write decoded solution points as CSV.
+
+    Args:
+        path: Destination CSV path.
+        points: Solution points to write.
+    """
+
     fields = list(asdict(points[0]).keys()) if points else list(SolutionPoint.__dataclass_fields__)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -260,6 +317,13 @@ def write_solution_csv(path: Path, points: list[SolutionPoint]) -> None:
 
 
 def write_all_records_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    """Write all parsed NMEA records as CSV.
+
+    Args:
+        path: Destination CSV path.
+        rows: Record rows produced by `extract_solutions`.
+    """
+
     fields = ["offset", "type", "checksum_ok", "time_utc", "lat", "lon", "height", "text"]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -268,10 +332,24 @@ def write_all_records_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def write_lines(path: Path, lines: list[str]) -> None:
+    """Write text lines with CRLF endings.
+
+    Args:
+        path: Destination text path.
+        lines: Lines to write.
+    """
+
     path.write_text("".join(line.rstrip("\r\n") + "\r\n" for line in lines), encoding="ascii", errors="ignore")
 
 
 def write_solution_nmea(path: Path, points: list[SolutionPoint]) -> None:
+    """Write compact proprietary NMEA solution summary records.
+
+    Args:
+        path: Destination NMEA path.
+        points: Solution points to summarise.
+    """
+
     lines = []
     for point in points:
         body = (
@@ -284,6 +362,13 @@ def write_solution_nmea(path: Path, points: list[SolutionPoint]) -> None:
 
 
 def write_gpx(path: Path, points: list[SolutionPoint]) -> None:
+    """Write solution points as a GPX track.
+
+    Args:
+        path: Destination GPX path.
+        points: Solution points to write.
+    """
+
     ET.register_namespace("", "http://www.topografix.com/GPX/1/1")
     ET.register_namespace("um980", "https://github.com/holubp/um980-rtklib-pipeline")
     root = ET.Element(

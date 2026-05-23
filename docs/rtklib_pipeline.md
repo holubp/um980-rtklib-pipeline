@@ -3,7 +3,7 @@
 This project bridges the gap between UM980 mixed receiver logs and RTKLIB's
 file-based post-processing model. A rover `.unc` capture is not a RTKLIB input
 by itself: it must be parsed, decoded into RINEX observations, paired with
-external navigation data, matched with base-station observations, and passed to
+navigation data, matched with base-station observations, and passed to
 RTKLIB with paths that make sense on the current platform.
 
 ```text
@@ -13,7 +13,8 @@ UM980 .unc
 parse mixed NMEA + Unicore records
    |--------> diagnostics / warnings
    v
-rover RINEX OBS  +  EUREF/base RINEX OBS  +  NAV/SP3/CLK
+rover RINEX OBS + generated rover NAV/GNAV/LNAV/SBS
+        + EUREF/base RINEX OBS + external NAV/SP3/CLK
    |
    v
 validated rnx2rtkp command
@@ -22,21 +23,72 @@ validated rnx2rtkp command
 RTK/PPK solution
 ```
 
-The pipeline writes direct rover observation products and validates all RTKLIB
-input paths before invoking `rnx2rtkp`. It never passes unresolved shell
+The pipeline writes direct rover observation products from `OBSVMA`, documented
+binary `OBSVMB`, and compressed binary `OBSVMCMPB` records, then validates all
+RTKLIB input paths before invoking `rnx2rtkp`. It never passes unresolved shell
 wildcards to RTKLIB and does not use `shell=True`.
 
 Navigation data must come from explicit NAV/SP3/CLK files, downloaded or
 base-derived data, or receiver ephemeris logs. Raw observations alone are not
-navigation data.
+navigation data. When ASCII rover ephemeris records are present, the RINEX step
+writes RTKLIB-readable sidecar files:
+
+- `*.rover-gps.nav` from `GPSEPHA`;
+- `*.rover-glo.gnav` from `GLOEPHA`;
+- `*.rover-gal.lnav` from `GALEPHA`;
+- `*.rover-bds.cnav` from `BDSEPHA`;
+- `*.rover-sbas.sbs` from unambiguous RTKLIB-shaped SBAS message records.
 
 The tool deliberately refuses ambiguous or empty navigation inputs:
 
-- `GPSEPHA` records are counted and reported, but no header-only NAV file is
-  written until field mapping is implemented;
+- missing, malformed, or unsupported rover ephemeris records are warnings, not
+  silent drops;
+- no header-only NAV/GNAV/LNAV/SBS files are written;
 - header-only NAV files are not selected for RTKLIB;
 - unsupported observation formats and incomplete RINEX signal mapping are written
   as warnings in analysis JSON and logged by the CLI.
+
+## Python Tool Installation
+
+Install the CLI into the system Python 3.11+ environment when you want
+`um980-ppk` available as a normal machine-wide command. On Linux this is
+typically:
+
+```bash
+sudo -H python3 -m pip install .
+```
+
+On platforms without `sudo`, use the equivalent administrator/root shell, or the
+active Python environment if it is already the system environment:
+
+```bash
+python3 -m pip install .
+```
+
+Use optional extras when needed:
+
+```bash
+python3 -m pip install '.[config]'
+python3 -m pip install '.[config,test]'
+```
+
+For testing without touching the system Python installation, use either an
+editable virtual environment:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[config,test]'
+pytest -q
+```
+
+or run directly from the repository checkout:
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli --help
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli pipeline rover.unc --out-dir out
+PYTHONPATH=src pytest -q
+```
 
 ## Integrated Pipeline
 
@@ -51,7 +103,6 @@ um980-ppk pipeline rover.unc \
   --base-resolution high \
   --base-rinex-version 3 \
   --crx2rnx ~/RTKLIB-ex-bin/bin/crx2rnx \
-  --nav-file BRDC00WRD_R_20261380000_01D_MN.rnx \
   --rtkconf examples/rtkpost-normal.conf.example \
   --run-rtklib
 ```
@@ -60,9 +111,43 @@ um980-ppk pipeline rover.unc \
 high-rate chunks and falls back to low-rate data with a warning when the
 high-rate files are unavailable. `--base-rinex-version 2` enables compact RINEX
 2/Hatanaka EUREF names, and `auto` tries v3 before v2.
+Base downloads are planned from the generated rover RINEX observation span and
+include every base product that overlaps or touches that span. The default
+`--time-margin 0` avoids fetching adjacent non-overlapping products; set a
+positive margin only when that extra coverage is intentional.
 
-The pipeline still requires explicit NAV input. It does not silently use
-header-only rover NAV placeholders.
+The pipeline automatically includes generated rover `.nav`, `.gnav`, `.lnav`,
+and `.sbs` files in the `rnx2rtkp` command when those files are non-empty. Add
+`--nav-file` for external BRDC, precise orbit/clock, or other navigation inputs
+when the receiver log does not contain complete coverage for the observed
+systems. This is common for Galileo/BDS/QZSS/SBAS if the receiver was not
+configured to log the matching ephemeris messages.
+
+Generate a receiver init script with all ASCII ephemeris messages enabled for
+debugging:
+
+```bash
+um980-ppk init generate \
+  --raw-format obsvmcmpb \
+  --raw-hz 2 \
+  --nmea-preset solution-20hz \
+  --debug-ascii-ephemeris \
+  --out um980-debug-ephem.cmd
+```
+
+The generated script warns that this profile can create large `.unc` files and
+shows the ASCII ephemeris contribution to the estimated 8N1 line utilisation.
+Use `--ephemeris every=300 --ephemeris-format binary` when collecting binary
+ephemeris fixtures. Valid binary ephemeris records are converted into rover NAV
+sidecars for RTKLIB; malformed or unsupported records are logged and kept out of
+the RTKLIB invocation.
+
+`--rinex-compat convbin` makes the direct RINEX observation output stricter for
+RTKLIB compatibility. It orders observation types like RTKLIB `convbin` and
+uses the same extended single-line observation records that RTKLIB-ex reads
+from `convbin` output. It excludes records that convbin would not safely emit,
+including unknown-system satellites and OBSVMA epochs captured before the
+receiver reports `FINE` time.
 
 ## Cygwin and Windows RTKLIB Tools
 

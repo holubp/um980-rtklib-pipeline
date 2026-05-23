@@ -8,10 +8,13 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.request import urlopen, urlretrieve
+
+from .rtklib import detect_rtklib_path_style, path_for_rtklib_argument
 
 
 STATION_ALIASES = {
@@ -31,6 +34,14 @@ STATION_ALIASES = {
 
 @dataclass(frozen=True)
 class Provider:
+    """EUREF download provider definition.
+
+    Attributes:
+        name: Internal provider name.
+        kind: Product kind, currently observation data.
+        templates: URL templates used for planning downloads.
+    """
+
     name: str
     kind: str
     templates: tuple[str, ...]
@@ -38,6 +49,17 @@ class Provider:
 
 @dataclass(frozen=True)
 class BasePosition:
+    """Resolved base station position.
+
+    Attributes:
+        station: Station marker name.
+        ecef_xyz_m: ECEF XYZ coordinates in meters.
+        source: Source URL or file path.
+        frame: Coordinate frame when known.
+        epoch: Coordinate epoch when known.
+        valid_from_to: Validity interval text when known.
+    """
+
     station: str
     ecef_xyz_m: tuple[float, float, float]
     source: str
@@ -103,6 +125,19 @@ PROVIDERS = {
 
 
 def resolve_station(station: str, station_long: str | None = None) -> str:
+    """Resolve a station alias to a RINEX 3 marker.
+
+    Args:
+        station: Short alias or marker supplied by the user.
+        station_long: Optional explicit marker override.
+
+    Returns:
+        Normalised station marker.
+
+    Raises:
+        ValueError: If the station cannot be resolved.
+    """
+
     if station_long:
         return _normalise_station_marker(station_long)
     code = station.upper()
@@ -146,6 +181,17 @@ def _format_vars(dt: datetime, station_long: str, minute: int = 0) -> dict[str, 
 
 
 def overlapping_hours(start: datetime, end: datetime, whole_day: bool = False) -> list[datetime]:
+    """Return hourly boundaries overlapping a time interval.
+
+    Args:
+        start: Interval start.
+        end: Interval end.
+        whole_day: Expand to the whole UTC day containing `start`.
+
+    Returns:
+        Hour timestamps used for EUREF hourly URL planning.
+    """
+
     if whole_day:
         start = start.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1) - timedelta(microseconds=1)
@@ -168,6 +214,22 @@ def planned_urls(
     whole_day: bool = False,
     rinex_version: str = "3",
 ) -> list[str]:
+    """Plan EUREF/EPN observation download URLs.
+
+    Args:
+        station: Station alias or marker.
+        start: Rover time-window start.
+        end: Rover time-window end.
+        provider_name: Base provider selector.
+        station_long: Optional explicit RINEX 3 station marker.
+        base_rate: Desired base data rate, such as `30s` or `1s`.
+        whole_day: Plan the whole day instead of only overlapping hours.
+        rinex_version: Source RINEX version (`2` or `3`).
+
+    Returns:
+        Ordered candidate URLs.
+    """
+
     resolved = _resolve_station_for_url_planning(station, station_long, rinex_version)
     provider_name = _provider_for_version(provider_name, base_rate, rinex_version)
     provider = PROVIDERS[provider_name]
@@ -214,6 +276,20 @@ def _provider_for_version(provider_name: str, base_rate: str, rinex_version: str
 
 
 def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1) -> list[Path]:
+    """Download URL candidates into a cache directory.
+
+    Args:
+        urls: Candidate URLs to download.
+        cache_dir: Local cache directory.
+        retries: Attempts per URL.
+
+    Returns:
+        Downloaded or already cached file paths.
+
+    Raises:
+        RuntimeError: If every URL fails.
+    """
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     failures: list[str] = []
@@ -248,8 +324,31 @@ def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1) -> list
     return paths
 
 
-def normalise_rinex_file(path: Path, *, crx2rnx: str | None = None, cleanup: bool = False) -> Path:
-    """Convert compressed/Hatanaka files to ordinary RINEX where possible."""
+def normalise_rinex_file(
+    path: Path,
+    *,
+    crx2rnx: str | None = None,
+    cleanup: bool = False,
+    crx2rnx_timeout_s: float = 300.0,
+) -> Path:
+    """Convert compressed/Hatanaka files to ordinary RINEX where possible.
+
+    Args:
+        path: Input observation file.
+        crx2rnx: Optional Hatanaka converter executable.
+        cleanup: Remove intermediate Hatanaka file after conversion.
+        crx2rnx_timeout_s: Maximum seconds allowed for one Hatanaka
+            conversion.
+
+    Returns:
+        Normalised RINEX path.
+
+    Raises:
+        RuntimeError: If decompression or Hatanaka conversion fails.
+    """
+
+    if requires_crx2rnx(path) and not crx2rnx:
+        raise RuntimeError(f"crx2rnx required for Hatanaka file {path} before decompression")
 
     current = path
     if current.suffix.lower() == ".z":
@@ -258,6 +357,7 @@ def normalise_rinex_file(path: Path, *, crx2rnx: str | None = None, cleanup: boo
             raise RuntimeError(f"gzip is required to decompress Unix-compress file {current}")
         target = current.with_suffix("")
         if not target.exists():
+            logging.info("decompressing Unix-compress RINEX file: %s -> %s", current, target)
             with target.open("wb") as dst:
                 result = subprocess.run(
                     [gzip_exe, "-cd", str(current)],
@@ -270,25 +370,90 @@ def normalise_rinex_file(path: Path, *, crx2rnx: str | None = None, cleanup: boo
                 target.unlink(missing_ok=True)
                 stderr = result.stderr.decode("utf-8", errors="ignore").strip()
                 raise RuntimeError(f"gzip failed for {current}: {stderr}")
+        else:
+            logging.info("using existing decompressed RINEX candidate: %s", target)
         current = target
     if current.suffix.lower() == ".gz":
         target = current.with_suffix("")
         if not target.exists():
+            logging.info("decompressing gzip RINEX file: %s -> %s", current, target)
             with gzip.open(current, "rb") as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
+        else:
+            logging.info("using existing decompressed RINEX candidate: %s", target)
         current = target
     if _is_hatanaka_observation_file(current):
         if not crx2rnx:
             raise RuntimeError(f"crx2rnx required for Hatanaka file {current}")
-        result = subprocess.run([crx2rnx, str(current)], check=False, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"crx2rnx failed for {current}: {result.stderr.strip()}")
         produced = _hatanaka_output_path(current)
+        result = _run_crx2rnx(crx2rnx, current, produced, timeout_s=crx2rnx_timeout_s)
+        if result.returncode not in {0, 2}:
+            raise RuntimeError(f"crx2rnx failed for {current}: {result.stderr.strip() or result.stdout.strip()}")
         if produced.exists():
+            if produced.stat().st_size <= 0:
+                raise RuntimeError(f"crx2rnx produced an empty RINEX file: {produced}")
+            if result.returncode == 2:
+                logging.warning("crx2rnx converted %s with warnings: %s", current, result.stderr.strip() or result.stdout.strip())
             if cleanup:
                 current.unlink()
             return produced
+        raise RuntimeError(f"crx2rnx completed for {current} but did not create {produced}")
     return current
+
+
+def _run_crx2rnx(crx2rnx: str, current: Path, produced: Path, *, timeout_s: float) -> subprocess.CompletedProcess[str]:
+    """Run `crx2rnx` with overwrite and progress-safe subprocess handling."""
+
+    path_style = detect_rtklib_path_style(crx2rnx)
+    command = [crx2rnx, path_for_rtklib_argument(current, path_style), "-f"]
+    logging.info("converting Hatanaka RINEX: %s -> %s", current, produced)
+    try:
+        process = subprocess.Popen(  # noqa: S603 - executable is user/local RTKLIB tool.
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"could not start crx2rnx for {current}: {exc}") from exc
+
+    deadline = time.monotonic() + timeout_s
+    stdout = ""
+    stderr = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise RuntimeError(
+                f"crx2rnx timed out after {timeout_s:.0f}s for {current}. "
+                f"stdout={stdout.strip()} stderr={stderr.strip()}"
+            )
+        try:
+            stdout, stderr = process.communicate(timeout=min(10.0, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            logging.info("still converting Hatanaka RINEX: %s", current)
+
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def requires_crx2rnx(path: Path) -> bool:
+    """Return true when a RINEX observation file needs Hatanaka conversion.
+
+    Args:
+        path: RINEX observation file path, optionally with `.gz` or `.Z`
+            compression still present.
+
+    Returns:
+        True for compressed or uncompressed Hatanaka observation names.
+    """
+
+    candidate = path
+    if candidate.suffix.lower() in {".gz", ".z"}:
+        candidate = candidate.with_suffix("")
+    return _is_hatanaka_observation_file(candidate)
 
 
 def _is_hatanaka_observation_file(path: Path) -> bool:
@@ -304,7 +469,14 @@ def _hatanaka_output_path(path: Path) -> Path:
 
 
 def epn_station_coordinate_url(station: str) -> str:
-    """Return the official EPN station coordinate page URL."""
+    """Return the official EPN station coordinate page URL.
+
+    Args:
+        station: Station alias or marker.
+
+    Returns:
+        EPN station coordinate page URL.
+    """
 
     return "https://www.epncb.oma.be/_productsservices/coordinates/crd4station.php?station=" + resolve_station(station)
 
@@ -323,7 +495,19 @@ def _first_float(value: str) -> float:
 
 
 def parse_epn_station_position(page: str, station: str, *, frame: str = "ETRF2000") -> BasePosition:
-    """Parse an EPN station coordinate page and return the latest ECEF XYZ row."""
+    """Parse an EPN station coordinate page.
+
+    Args:
+        page: HTML page content.
+        station: Station alias or marker.
+        frame: Coordinate frame table to parse.
+
+    Returns:
+        Latest parseable ECEF XYZ row.
+
+    Raises:
+        ValueError: If the requested frame or coordinate row is missing.
+    """
 
     marker = f"expressed in {frame}"
     if marker not in page:
@@ -357,7 +541,17 @@ def fetch_epn_station_position(
     timeout_s: float = 20.0,
     frame: str = "ETRF2000",
 ) -> BasePosition:
-    """Fetch and parse the official EPN ECEF position for a station."""
+    """Fetch and parse the official EPN ECEF position for a station.
+
+    Args:
+        station: Station alias or marker.
+        cache_dir: Optional HTML cache directory.
+        timeout_s: Network timeout in seconds.
+        frame: Coordinate frame table to parse.
+
+    Returns:
+        Parsed base station position.
+    """
 
     resolved = resolve_station(station)
     cache_path = cache_dir / f"{resolved}.epn-coordinates.html" if cache_dir else None
@@ -374,7 +568,17 @@ def fetch_epn_station_position(
 
 
 def parse_rinex_approx_position(path: Path) -> BasePosition:
-    """Read `APPROX POSITION XYZ` from a RINEX OBS header."""
+    """Read `APPROX POSITION XYZ` from a RINEX OBS header.
+
+    Args:
+        path: RINEX observation file.
+
+    Returns:
+        Base position from the header.
+
+    Raises:
+        ValueError: If the header cannot be read or has no approximate position.
+    """
 
     try:
         lines = path.read_text(encoding="ascii", errors="ignore").splitlines()

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import logging
+import struct
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -115,7 +117,7 @@ TRACKING_SIGNAL_CODES = {
         6: ("B3Q", "6Q"),
         8: ("B1C pilot", "1P"),
         12: ("B2a pilot", "5P"),
-        13: ("B2b I", "7D"),
+        13: ("B2b I", "7P"),
         17: ("B2I", "7I"),
         21: ("B3I", "6I"),
         23: ("B1C data", "1D"),
@@ -138,9 +140,48 @@ TRACKING_SIGNAL_CODES = {
     },
 }
 
+BINARY_EPHEMERIS_TYPES = {
+    "GPSEPHB",
+    "GLOEPHB",
+    "GALEPHB",
+    "BDSEPHB",
+    "BD3EPHB",
+    "QZSSEPHB",
+    "IRNSSEPHB",
+}
+OBSVMB_RECORD_BYTES = 40
+OBSVMB_HEADER_BYTES = 24
+OBSVMB_TIME_UNKNOWN = 201
+OBSVMCMPB_RECORD_BYTES = 24
+OBSVMCMPB_DOPPLER_SCALE = 256.0
+OBSVMCMPB_PSEUDORANGE_SCALE = 128.0
+OBSVMCMPB_ADR_SCALE = 256.0
+OBSVMCMPB_LOCK_TIME_SCALE = 32.0
+
 
 @dataclass
 class Observation:
+    """One decoded raw GNSS observation.
+
+    Attributes:
+        gps_week: GPS week number.
+        tow: GPS seconds of week.
+        sat_system: GNSS constellation name.
+        sv: Satellite vehicle number in RINEX numbering.
+        rinex_sat: RINEX satellite identifier.
+        signal_name: Receiver or decoded signal name.
+        rinex_code: RINEX observation code suffix.
+        band: RINEX frequency band digit.
+        pseudorange_m: Code pseudorange in meters.
+        carrier_phase_cycles: Carrier phase in cycles.
+        doppler_hz: Doppler in hertz.
+        cn0_dbhz: Carrier-to-noise density in dB-Hz.
+        lock_time_s: Lock time in seconds.
+        half_cycle: Half-cycle ambiguity flag when known.
+        lli: RINEX loss-of-lock indicator.
+        raw_tracking_status: Original UM980 tracking status word.
+    """
+
     gps_week: int
     tow: float
     sat_system: SystemName
@@ -161,6 +202,15 @@ class Observation:
 
 @dataclass
 class ObservationExtraction:
+    """Decoded observation extraction result.
+
+    Attributes:
+        observations: Decoded observations.
+        unsupported_records: Counts of records that could not be decoded.
+        metrics: Aggregate observation metrics.
+        warnings: User-facing extraction warnings.
+    """
+
     observations: list[Observation]
     unsupported_records: dict[str, int]
     metrics: dict[str, object]
@@ -217,6 +267,218 @@ def _tracking_signal(system: SystemName, tracking: int) -> tuple[str, str, bool]
     return f"TRACK_{tracking:08x}", _rinex_code(system, "L1"), False
 
 
+def _obsvmb_payload(raw: bytes) -> bytes:
+    """Return the declared OBSVMB payload from a Unicore binary frame."""
+
+    if len(raw) < OBSVMB_HEADER_BYTES + 4 + 4:
+        raise ValueError("OBSVMB frame is shorter than the binary header, count, and CRC")
+    payload_length = int.from_bytes(raw[6:8], "little", signed=False)
+    if len(raw) < OBSVMB_HEADER_BYTES + payload_length + 4:
+        raise ValueError(
+            f"OBSVMB frame has {len(raw) - OBSVMB_HEADER_BYTES - 4} payload bytes, "
+            f"declares {payload_length}"
+        )
+    return raw[OBSVMB_HEADER_BYTES : OBSVMB_HEADER_BYTES + payload_length]
+
+
+def _signed_bits(value: int, bits: int) -> int:
+    """Interpret a fixed-width two's-complement integer.
+
+    Args:
+        value: Unsigned integer value.
+        bits: Number of significant bits.
+
+    Returns:
+        Signed integer represented by `value`.
+
+    Raises:
+        ValueError: If `bits` is not positive.
+    """
+
+    if bits <= 0:
+        raise ValueError(f"bit width must be positive, got {bits}")
+    sign = 1 << (bits - 1)
+    mask = (1 << bits) - 1
+    value &= mask
+    return value - (1 << bits) if value & sign else value
+
+
+def _binary_payload(raw: bytes, msg_type: str) -> bytes:
+    """Return the declared payload from a fixed-header Unicore binary frame.
+
+    Args:
+        raw: Raw frame bytes including header and CRC.
+        msg_type: Message type for actionable errors.
+
+    Returns:
+        Declared payload bytes.
+
+    Raises:
+        ValueError: If the frame is too short or declares unavailable bytes.
+    """
+
+    if len(raw) < OBSVMB_HEADER_BYTES + 4 + 4:
+        raise ValueError(f"{msg_type} frame is shorter than the binary header, count, and CRC")
+    payload_length = int.from_bytes(raw[6:8], "little", signed=False)
+    if len(raw) < OBSVMB_HEADER_BYTES + payload_length + 4:
+        raise ValueError(
+            f"{msg_type} frame has {len(raw) - OBSVMB_HEADER_BYTES - 4} payload bytes, "
+            f"declares {payload_length}"
+        )
+    return raw[OBSVMB_HEADER_BYTES : OBSVMB_HEADER_BYTES + payload_length]
+
+
+def _binary_time(record: StreamRecord) -> tuple[int, float] | None:
+    """Return GPS week and seconds-of-week from a Unicore binary header.
+
+    Args:
+        record: Parsed binary stream record.
+
+    Returns:
+        `(gps_week, tow_seconds)` when the receiver time is usable, otherwise
+        `None`.
+    """
+
+    if not record.raw:
+        return None
+    time_status = record.raw[9] if len(record.raw) > 9 else OBSVMB_TIME_UNKNOWN
+    week = int.from_bytes(record.raw[10:12], "little", signed=False) if len(record.raw) >= 12 else 0
+    tow_ms = int.from_bytes(record.raw[12:16], "little", signed=False) if len(record.raw) >= 16 else 0
+    if time_status == OBSVMB_TIME_UNKNOWN or week == 0:
+        return None
+    return week, tow_ms / 1000.0
+
+
+def _obsvmb_observations(record: StreamRecord) -> list[Observation]:
+    """Decode a documented UM980 OBSVMB binary observation frame.
+
+    Args:
+        record: Parsed binary `OBSVMB` stream record.
+
+    Returns:
+        Decoded observations for one receiver epoch.
+
+    Raises:
+        ValueError: If the payload length is inconsistent with the observation
+            count.
+    """
+
+    binary_time = _binary_time(record)
+    if binary_time is None:
+        return []
+    week, tow = binary_time
+    payload = _obsvmb_payload(record.raw)
+    nobs = struct.unpack_from("<I", payload, 0)[0]
+    expected = 4 + nobs * OBSVMB_RECORD_BYTES
+    if len(payload) < expected:
+        raise ValueError(f"OBSVMB payload has {len(payload)} bytes, expected {expected} for {nobs} observations")
+    observations: list[Observation] = []
+    for index in range(nobs):
+        offset = 4 + index * OBSVMB_RECORD_BYTES
+        glo_frequency = struct.unpack_from("<H", payload, offset)[0]
+        raw_prn = struct.unpack_from("<H", payload, offset + 2)[0]
+        pseudorange = struct.unpack_from("<d", payload, offset + 4)[0]
+        adr = struct.unpack_from("<d", payload, offset + 12)[0]
+        doppler = struct.unpack_from("<f", payload, offset + 24)[0]
+        cn0_raw = struct.unpack_from("<H", payload, offset + 28)[0]
+        lock_time = struct.unpack_from("<f", payload, offset + 32)[0]
+        tracking = struct.unpack_from("<I", payload, offset + 36)[0]
+
+        system = _tracking_system(tracking)
+        signal, code, signal_known = _tracking_signal(system, tracking)
+        phase_valid = bool(tracking & 0x00000400)
+        pseudorange_valid = bool(tracking & 0x00001000)
+        rinex_sv = _rinex_sv(system, raw_prn)
+        prefix = RINEX_SYSTEM_PREFIX[system]
+        observations.append(
+            Observation(
+                gps_week=week,
+                tow=tow,
+                sat_system=system,
+                sv=rinex_sv,
+                rinex_sat=f"{prefix}{rinex_sv:02d}" if prefix != "U" else f"U{rinex_sv:02d}",
+                signal_name=signal if system != "GLONASS" else f"{signal} FCN={glo_frequency}",
+                rinex_code=code,
+                band=code[0],
+                pseudorange_m=pseudorange if pseudorange_valid else None,
+                carrier_phase_cycles=-adr if phase_valid else None,
+                doppler_hz=doppler if phase_valid else None,
+                cn0_dbhz=cn0_raw / 100.0,
+                lock_time_s=lock_time,
+                half_cycle=None,
+                lli=0,
+                raw_tracking_status=tracking if signal_known else tracking,
+            )
+        )
+    return observations
+
+
+def _obsvmcmpb_observations(record: StreamRecord) -> list[Observation]:
+    """Decode a documented UM980 OBSVMCMPB compressed observation frame.
+
+    Args:
+        record: Parsed binary `OBSVMCMPB` stream record.
+
+    Returns:
+        Decoded observations for one receiver epoch.
+
+    Raises:
+        ValueError: If the payload length is inconsistent with the compressed
+            observation count.
+    """
+
+    binary_time = _binary_time(record)
+    if binary_time is None:
+        return []
+    week, tow = binary_time
+    payload = _binary_payload(record.raw, "OBSVMCMPB")
+    nobs = struct.unpack_from("<I", payload, 0)[0]
+    expected = 4 + nobs * OBSVMCMPB_RECORD_BYTES
+    if len(payload) < expected:
+        raise ValueError(f"OBSVMCMPB payload has {len(payload)} bytes, expected {expected} for {nobs} observations")
+
+    observations: list[Observation] = []
+    for index in range(nobs):
+        offset = 4 + index * OBSVMCMPB_RECORD_BYTES
+        packed = int.from_bytes(payload[offset : offset + OBSVMCMPB_RECORD_BYTES], "little", signed=False)
+        tracking = packed & 0xFFFFFFFF
+        doppler_raw = _signed_bits((packed >> 32) & ((1 << 28) - 1), 28)
+        pseudorange_raw = (packed >> 60) & ((1 << 36) - 1)
+        adr_raw = _signed_bits((packed >> 96) & 0xFFFFFFFF, 32)
+        raw_prn = (packed >> 136) & 0xFF
+        lock_time_raw = (packed >> 144) & ((1 << 21) - 1)
+        cn0_raw = (packed >> 165) & 0x1F
+        glo_frequency = (packed >> 170) & 0x3F
+
+        system = _tracking_system(tracking)
+        signal, code, signal_known = _tracking_signal(system, tracking)
+        phase_valid = bool(tracking & 0x00000400)
+        pseudorange_valid = bool(tracking & 0x00001000)
+        rinex_sv = _rinex_sv(system, raw_prn)
+        prefix = RINEX_SYSTEM_PREFIX[system]
+        observations.append(
+            Observation(
+                gps_week=week,
+                tow=tow,
+                sat_system=system,
+                sv=rinex_sv,
+                rinex_sat=f"{prefix}{rinex_sv:02d}" if prefix != "U" else f"U{rinex_sv:02d}",
+                signal_name=signal if system != "GLONASS" else f"{signal} FCN={glo_frequency}",
+                rinex_code=code,
+                band=code[0],
+                pseudorange_m=pseudorange_raw / OBSVMCMPB_PSEUDORANGE_SCALE if pseudorange_valid else None,
+                carrier_phase_cycles=adr_raw / OBSVMCMPB_ADR_SCALE if phase_valid else None,
+                doppler_hz=doppler_raw / OBSVMCMPB_DOPPLER_SCALE if phase_valid else None,
+                cn0_dbhz=20.0 + cn0_raw,
+                lock_time_s=lock_time_raw / OBSVMCMPB_LOCK_TIME_SCALE,
+                half_cycle=None,
+                lli=0,
+                raw_tracking_status=tracking if signal_known else tracking,
+            )
+        )
+    return observations
+
+
 def _rinex_sv(system: SystemName, prn: int) -> int:
     if system == "GLONASS" and 38 <= prn <= 61:
         return prn - 37
@@ -268,8 +530,17 @@ def _observation_from_tokens(tokens: list[str]) -> Observation | None:
     )
 
 
+def _is_real_obsvma_payload(header_tokens: list[str], payload_tokens: list[str]) -> bool:
+    """Return true when an OBSVMA record has the UM980 grouped payload shape."""
+
+    return len(header_tokens) >= 10 and bool(payload_tokens) and _int(payload_tokens[0]) is not None
+
+
 def _obsvma_payload_observations(header_tokens: list[str], payload_tokens: list[str]) -> list[Observation]:
     if len(header_tokens) < 6:
+        return []
+    time_status = header_tokens[3].strip().upper() if len(header_tokens) > 3 else ""
+    if time_status != "FINE":
         return []
     week = _int(header_tokens[4])
     tow_ms = _float(header_tokens[5])
@@ -325,11 +596,24 @@ def _obsvma_payload_observations(header_tokens: list[str], payload_tokens: list[
     return observations
 
 
-def decode_observations(records: list[StreamRecord]) -> ObservationExtraction:
+def decode_observations(records: list[StreamRecord], *, progress: bool = False) -> ObservationExtraction:
+    """Decode supported UM980 raw observation records.
+
+    Args:
+        records: Parsed mixed-stream records.
+        progress: Emit coarse record-progress messages through logging.
+
+    Returns:
+        Decoded observations, metrics, unsupported record counts, and warnings.
+    """
+
     observations: list[Observation] = []
     unsupported: dict[str, int] = defaultdict(int)
     warnings: list[str] = []
-    for record in records:
+    progress_step = 100_000
+    for index, record in enumerate(records, start=1):
+        if progress and index % progress_step == 0:
+            logging.info("scanned %d/%d records for raw observations", index, len(records))
         msg_type = (record.msg_type or "").upper()
         if record.kind == "unicore_ascii" and msg_type == "OBSVMA" and record.text:
             body = record.text[1:].split("*", 1)[0]
@@ -339,6 +623,9 @@ def decode_observations(records: list[StreamRecord]) -> ObservationExtraction:
             parsed_payload = _obsvma_payload_observations(header_tokens, payload_tokens)
             if parsed_payload:
                 observations.extend(parsed_payload)
+                continue
+            if _is_real_obsvma_payload(header_tokens, payload_tokens):
+                unsupported[f"OBSVMA_TIME_{(header_tokens[3] or 'UNKNOWN').upper()}"] += 1
                 continue
             payload_text = payload or header
             for chunk in payload_text.replace("\r", "").split("|"):
@@ -350,9 +637,27 @@ def decode_observations(records: list[StreamRecord]) -> ObservationExtraction:
                     observations.append(obs)
                 else:
                     unsupported["OBSVMA"] += 1
-        elif record.kind == "unicore_ascii" and msg_type in {"OBSVMB", "OBSVMCMPB"}:
-            unsupported[msg_type] += 1
-        elif record.kind == "unicore_binary":
+        elif record.kind == "unicore_binary" and msg_type == "OBSVMB":
+            try:
+                parsed_obsvmb = _obsvmb_observations(record)
+            except ValueError:
+                unsupported["OBSVMB_MALFORMED"] += 1
+            else:
+                if parsed_obsvmb:
+                    observations.extend(parsed_obsvmb)
+                else:
+                    unsupported["OBSVMB_TIME_UNKNOWN"] += 1
+        elif record.kind == "unicore_binary" and msg_type == "OBSVMCMPB":
+            try:
+                parsed_obsvmcmpb = _obsvmcmpb_observations(record)
+            except ValueError:
+                unsupported["OBSVMCMPB_MALFORMED"] += 1
+            else:
+                if parsed_obsvmcmpb:
+                    observations.extend(parsed_obsvmcmpb)
+                else:
+                    unsupported["OBSVMCMPB_TIME_UNKNOWN"] += 1
+        elif record.kind == "unicore_binary" and msg_type not in BINARY_EPHEMERIS_TYPES:
             unsupported[record.msg_type or "unicore_binary"] += 1
 
     if unsupported:
@@ -375,6 +680,15 @@ def decode_observations(records: list[StreamRecord]) -> ObservationExtraction:
 
 
 def observation_metrics(observations: list[Observation]) -> dict[str, object]:
+    """Compute aggregate metrics for decoded observations.
+
+    Args:
+        observations: Decoded observation list.
+
+    Returns:
+        JSON-friendly metrics for epochs, rates, constellations, and signals.
+    """
+
     by_epoch: dict[tuple[int, float], list[Observation]] = defaultdict(list)
     constellations: dict[str, int] = defaultdict(int)
     bands: dict[str, int] = defaultdict(int)
@@ -425,6 +739,13 @@ def observation_metrics(observations: list[Observation]) -> dict[str, object]:
 
 
 def write_observations_csv(path: Path, observations: list[Observation]) -> None:
+    """Write decoded observations as CSV.
+
+    Args:
+        path: Destination CSV path.
+        observations: Decoded observations to write.
+    """
+
     fields = [
         "epoch_index",
         "gps_week",

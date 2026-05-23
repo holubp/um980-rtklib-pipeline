@@ -10,6 +10,7 @@ def test_solution_extracts_rmc_and_gga(tmp_path: Path):
     gga = make_sentence("GNGGA,120000.00,5000.0000,N,01400.0000,E,4,20,0.7,250.0,M,45.0,M,0.5,0001")
     records, _ = parse_stream((rmc + "\r\n" + gga + "\r\n").encode())
     extracted = extract_solutions(records)
+    assert extracted.all_nmea == [rmc, gga]
     assert len(extracted.solution_points) == 2
     assert extracted.solution_points[1].fix_quality_text == "rtk-fixed"
     csv_path = tmp_path / "solution.csv"

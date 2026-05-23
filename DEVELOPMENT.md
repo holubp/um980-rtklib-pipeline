@@ -21,9 +21,11 @@ message is detected but not fully validated, report it as unsupported or warn
 clearly in analysis output. A plausible but wrong RINEX file is worse than a
 clear failure.
 
-Header-only RINEX NAV files are rejected. `GPSEPHA` records may be counted and
-reported, but no rover NAV file should be written until the ephemeris fields are
-mapped into valid RINEX records.
+Header-only RINEX NAV files are rejected. Rover ASCII `GPSEPHA`, `GLOEPHA`, and
+validated `GALEPHA` records may be written as non-empty RTKLIB-readable sidecar
+files. Missing, malformed, or unsupported ephemeris records must stay visible as
+warnings in logs and analysis JSON; never create placeholder NAV/GNAV/LNAV/SBS
+files.
 
 ## RTKLIB Paths
 

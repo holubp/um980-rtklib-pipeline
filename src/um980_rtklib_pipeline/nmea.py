@@ -11,6 +11,15 @@ from .timeutil import parse_ddmmyy, parse_hhmmss
 
 @dataclass(frozen=True)
 class NmeaRecord:
+    """Parsed NMEA sentence.
+
+    Attributes:
+        talker_type: Combined talker and sentence type, for example `GNGGA`.
+        fields: Comma-separated sentence fields after the type.
+        text: Original sentence text.
+        checksum_ok: Optional checksum validation result.
+    """
+
     talker_type: str
     fields: list[str]
     text: str
@@ -18,6 +27,16 @@ class NmeaRecord:
 
 
 def parse_sentence(text: str, checksum_ok: bool | None = None) -> NmeaRecord | None:
+    """Parse a NMEA sentence into fields.
+
+    Args:
+        text: Sentence text beginning with `$`.
+        checksum_ok: Optional checksum validation result from stream parsing.
+
+    Returns:
+        Parsed record, or `None` when the text is not a valid NMEA sentence.
+    """
+
     if not text.startswith("$"):
         return None
     body = text.strip()[1:].split("*", 1)[0]
@@ -28,10 +47,28 @@ def parse_sentence(text: str, checksum_ok: bool | None = None) -> NmeaRecord | N
 
 
 def sentence_type(talker_type: str) -> str:
+    """Return the three-letter NMEA sentence type.
+
+    Args:
+        talker_type: Combined talker/type string such as `GNGGA`.
+
+    Returns:
+        Last three characters of the talker/type string.
+    """
+
     return talker_type[-3:]
 
 
 def checksum(body: str) -> str:
+    """Compute a NMEA checksum.
+
+    Args:
+        body: Sentence body without `$` or `*hh`.
+
+    Returns:
+        Two-digit uppercase hexadecimal checksum.
+    """
+
     value = 0
     for char in body.encode("ascii"):
         value ^= char
@@ -39,10 +76,29 @@ def checksum(body: str) -> str:
 
 
 def make_sentence(body: str) -> str:
+    """Build a NMEA sentence with checksum.
+
+    Args:
+        body: Sentence body without `$` or checksum.
+
+    Returns:
+        Full NMEA sentence text.
+    """
+
     return f"${body}*{checksum(body)}"
 
 
 def dm_to_decimal(value: str, hemisphere: str) -> float | None:
+    """Convert NMEA degrees/minutes coordinates to decimal degrees.
+
+    Args:
+        value: NMEA coordinate field.
+        hemisphere: Hemisphere field (`N`, `S`, `E`, or `W`).
+
+    Returns:
+        Decimal degrees, or `None` when parsing fails.
+    """
+
     if not value or not hemisphere:
         return None
     try:
@@ -62,6 +118,15 @@ def dm_to_decimal(value: str, hemisphere: str) -> float | None:
 
 
 def float_or_none(value: str) -> float | None:
+    """Parse a float field.
+
+    Args:
+        value: Text field.
+
+    Returns:
+        Float value, or `None` for blank, invalid, or NaN input.
+    """
+
     if value == "":
         return None
     try:
@@ -72,6 +137,15 @@ def float_or_none(value: str) -> float | None:
 
 
 def int_or_none(value: str) -> int | None:
+    """Parse an integer field.
+
+    Args:
+        value: Text field.
+
+    Returns:
+        Integer value, or `None` for blank or invalid input.
+    """
+
     if value == "":
         return None
     try:
@@ -81,6 +155,16 @@ def int_or_none(value: str) -> int | None:
 
 
 def datetime_from_time_date(time_text: str, date_text: str | None) -> datetime | None:
+    """Build a UTC datetime from NMEA time and date fields.
+
+    Args:
+        time_text: NMEA `hhmmss.sss` time.
+        date_text: NMEA `ddmmyy` date.
+
+    Returns:
+        UTC datetime, or `None` when parsing fails.
+    """
+
     parsed_time = parse_hhmmss(time_text)
     if parsed_time is None or not date_text:
         return None
@@ -95,6 +179,16 @@ def datetime_from_time_date(time_text: str, date_text: str | None) -> datetime |
 
 
 def datetime_from_time_with_context(time_text: str, context_date: datetime | None) -> datetime | None:
+    """Build a UTC datetime from NMEA time and an existing date.
+
+    Args:
+        time_text: NMEA `hhmmss.sss` time.
+        context_date: Date source for year/month/day.
+
+    Returns:
+        UTC datetime, or `None` when parsing fails.
+    """
+
     parsed_time = parse_hhmmss(time_text)
     if parsed_time is None or context_date is None:
         return None
@@ -121,4 +215,3 @@ FIX_QUALITY = {
     5: "rtk-float",
     6: "estimated",
 }
-

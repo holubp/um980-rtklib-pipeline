@@ -24,6 +24,21 @@ PRIORITY = {
 
 @dataclass
 class NavCandidate:
+    """Candidate navigation-like input considered for RTKLIB.
+
+    Attributes:
+        path: Local path to the candidate file.
+        source: How the candidate was supplied.
+        priority: Selection priority; larger values win.
+        systems: GNSS systems inferred from filename/type.
+        time_start: Optional start of validity window.
+        time_end: Optional end of validity window.
+        rinex_version: Optional RINEX version if known.
+        file_type: Classified file type.
+        usable: True when the file is safe to pass to RTKLIB.
+        notes: Human-readable validation notes.
+    """
+
     path: Path
     source: NavSource
     priority: int
@@ -38,12 +53,23 @@ class NavCandidate:
 
 @dataclass
 class NavResolution:
+    """Result of navigation source selection.
+
+    Attributes:
+        candidates: All candidates considered.
+        selected: Candidates selected according to priority and merge policy.
+        missing_systems: Observed systems not covered by selected candidates.
+        warnings: User-facing warnings explaining missing or fallback data.
+    """
+
     candidates: list[NavCandidate]
     selected: list[NavCandidate]
     missing_systems: set[str]
     warnings: list[str]
 
     def as_dict(self) -> dict[str, object]:
+        """Return a JSON-serialisable representation of the resolution."""
+
         def cand(candidate: NavCandidate) -> dict[str, object]:
             return {
                 "path": str(candidate.path),
@@ -64,6 +90,15 @@ class NavResolution:
 
 
 def infer_nav_systems(path: Path) -> set[str]:
+    """Infer GNSS systems covered by a navigation-like file.
+
+    Args:
+        path: Candidate file path.
+
+    Returns:
+        Set of GNSS system labels inferred from extension and filename.
+    """
+
     name = path.name.upper()
     systems: set[str] = set()
     if "BRDC" in name or "MN" in name:
@@ -77,13 +112,22 @@ def infer_nav_systems(path: Path) -> set[str]:
         systems.add("Galileo")
     elif suffix in {".qnav"}:
         systems.add("QZSS")
+    elif suffix in {".sbs"}:
+        systems.add("SBAS")
     elif suffix in {".nav", ".rnx"}:
         systems.add("GPS")
     return systems or {"Unknown"}
 
 
 def has_rinex_body_records(path: Path) -> bool:
-    """Return true when a RINEX-like file has non-header data records."""
+    """Return true when a RINEX-like file has non-header data records.
+
+    Args:
+        path: RINEX-like file path.
+
+    Returns:
+        True when at least one non-empty body line follows `END OF HEADER`.
+    """
 
     try:
         lines = path.read_text(encoding="ascii", errors="ignore").splitlines()
@@ -99,6 +143,16 @@ def has_rinex_body_records(path: Path) -> bool:
 
 
 def build_candidate(path: str | Path, source: NavSource) -> NavCandidate:
+    """Build and validate one navigation candidate.
+
+    Args:
+        path: Candidate file path.
+        source: Source category used for priority selection.
+
+    Returns:
+        Candidate metadata including usability and validation notes.
+    """
+
     p = Path(path)
     ftype = classify_rinex_file(p)
     systems = infer_nav_systems(p) if ftype in {"nav", "sp3", "clk", "sbs"} else set()
@@ -109,13 +163,20 @@ def build_candidate(path: str | Path, source: NavSource) -> NavCandidate:
         notes.append("file type could not be classified")
     if ftype == "nav" and p.exists() and not has_rinex_body_records(p):
         notes.append("NAV file has no data records after END OF HEADER")
+    if ftype == "sbs" and p.exists() and p.stat().st_size == 0:
+        notes.append("SBAS message file is empty")
+    usable = p.exists() and (
+        ftype in {"sp3", "clk"}
+        or (ftype == "sbs" and p.stat().st_size > 0)
+        or (ftype == "nav" and has_rinex_body_records(p))
+    )
     return NavCandidate(
         path=p,
         source=source,
         priority=PRIORITY[source],
         systems=systems,
         file_type=ftype,  # type: ignore[arg-type]
-        usable=p.exists() and ftype in {"sp3", "clk", "sbs"} or (p.exists() and ftype == "nav" and has_rinex_body_records(p)),
+        usable=usable,
         notes=notes,
     )
 
@@ -127,6 +188,20 @@ def resolve_nav_sources(
     observed_systems: set[str] | None = None,
     merge_policy: str = "best-per-system",
 ) -> NavResolution:
+    """Select navigation inputs for RTKLIB.
+
+    Args:
+        explicit: User-provided NAV/SP3/CLK/SBS files.
+        downloaded: Downloaded broadcast or station navigation files.
+        rover: Navigation files extracted from the rover receiver log.
+        observed_systems: Systems present in rover observations.
+        merge_policy: `all` to pass every usable candidate, or
+            `best-per-system` to select the highest priority file per system.
+
+    Returns:
+        Navigation resolution with selected files and warnings.
+    """
+
     candidates: list[NavCandidate] = []
     candidates.extend(build_candidate(path, "explicit") for path in explicit or [])
     candidates.extend(build_candidate(path, "downloaded_brdc") for path in downloaded or [])

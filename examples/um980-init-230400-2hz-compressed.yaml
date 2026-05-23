@@ -7,8 +7,8 @@ raw:
   expected_obs_per_epoch: 100
 nmea_preset: solution-20hz
 ephemeris:
+  debug_ascii_ephemeris: true
   policy: every
   period: 300
   systems: [gps, glo, gal, bds, bd3, qzss]
 save_config: true
-

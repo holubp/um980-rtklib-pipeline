@@ -13,3 +13,6 @@
 - EUREF base-data selection must log unavailable high-rate or legacy RINEX 2
   products before falling back. Keep legacy test archives and downloaded base
   files local-only.
+- Hatanaka conversion must run non-interactively. Use overwrite/timeout
+  safeguards for `crx2rnx` so existing `.rnx` files cannot trigger hidden
+  prompts or stalled downloads.

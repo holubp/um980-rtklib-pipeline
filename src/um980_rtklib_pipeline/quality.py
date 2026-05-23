@@ -19,6 +19,19 @@ def build_analysis(
     rover_nav: NavExtractionReport | None = None,
     extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    """Assemble analysis JSON data.
+
+    Args:
+        stream: Stream parser diagnostics.
+        solutions: Solution extraction result.
+        observations: Observation extraction result.
+        rover_nav: Optional rover navigation extraction report.
+        extra: Optional extra top-level fields.
+
+    Returns:
+        JSON-friendly analysis dictionary.
+    """
+
     analysis: dict[str, object] = {
         "stream": stream.as_dict(),
         "solution_points": len(solutions.solution_points),
@@ -36,4 +49,11 @@ def build_analysis(
 
 
 def write_analysis_json(path: Path, analysis: dict[str, object]) -> None:
+    """Write analysis JSON to disk.
+
+    Args:
+        path: Destination JSON path.
+        analysis: Analysis dictionary to serialise.
+    """
+
     path.write_text(json.dumps(analysis, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
