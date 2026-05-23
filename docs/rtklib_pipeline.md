@@ -116,12 +116,22 @@ include every base product that overlaps or touches that span. The default
 `--time-margin 0` avoids fetching adjacent non-overlapping products; set a
 positive margin only when that extra coverage is intentional.
 
+The integrated pipeline defaults to `--rinex-compat convbin` for the rover OBS
+file passed to RTKLIB. Standalone `rinex` keeps the broader native ordering by
+default, but both modes suppress non-standard unknown-system `U` satellites so
+RTKLIB does not reject the RINEX 3 header with an invalid system code.
+
 The pipeline automatically includes generated rover `.nav`, `.gnav`, `.lnav`,
 and `.sbs` files in the `rnx2rtkp` command when those files are non-empty. Add
 `--nav-file` for external BRDC, precise orbit/clock, or other navigation inputs
 when the receiver log does not contain complete coverage for the observed
 systems. This is common for Galileo/BDS/QZSS/SBAS if the receiver was not
 configured to log the matching ephemeris messages.
+
+Use `-d` or `--debug` when RTKLIB exits unexpectedly. Debug mode includes
+verbose progress and logs the exact shell-quoted `rnx2rtkp` command, the
+generated wrapper script, and stdout/stderr log paths before execution, so the
+same command can be rerun manually.
 
 Generate a receiver init script with all ASCII ephemeris messages enabled for
 debugging:

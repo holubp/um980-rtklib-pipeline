@@ -98,10 +98,13 @@ PYTHONPATH=src python -m um980_rtklib_pipeline.cli rinex rover.unc --obs-csv -v
 PYTHONPATH=src pytest -q
 ```
 
-Pass `-v` when processing real captures. Verbose mode reports long-running
-parsing, solution extraction, observation decoding, RINEX writing, base download,
-Hatanaka conversion, and RTKLIB execution stages so the CLI does not sit silently
-while large `.unc` files are being processed.
+Pass `-v`/`--verbose` when processing real captures. Verbose mode reports
+long-running parsing, solution extraction, observation decoding, RINEX writing,
+base download, Hatanaka conversion, and RTKLIB execution stages so the CLI does
+not sit silently while large `.unc` files are being processed. Pass `-d` or
+`--debug` when debugging external tools; it includes verbose progress and logs
+the exact shell-quoted `crx2rnx` and `rnx2rtkp` commands, wrapper path, and
+stdout/stderr log paths before execution.
 
 See [COLLECT-DATA.md](COLLECT-DATA.md) for the private capture plan needed to
 finish parser coverage and serial-capacity calibration.
@@ -169,10 +172,13 @@ Create rover RINEX observation output:
 um980-ppk rinex rover.unc --obs-csv -v
 ```
 
-Use `--rinex-compat convbin` when the output should follow RTKLIB `convbin`
-conventions more strictly. This profile uses convbin-style observation ordering
-and drops unsafe records such as unknown-system satellites or observations
-logged before the receiver reports a fine time solution.
+Use `--rinex-compat convbin` when standalone `rinex` output should follow
+RTKLIB `convbin` conventions more strictly. The integrated `pipeline` command
+uses this RTKLIB-compatible profile by default. Both profiles suppress
+non-standard unknown-system `U` satellites because RTKLIB rejects `U` in RINEX 3
+OBS headers. The convbin profile additionally uses convbin-style observation
+ordering and drops unsafe records such as observations logged before the
+receiver reports a fine time solution.
 
 Download base data URLs for a rover time window without fetching:
 

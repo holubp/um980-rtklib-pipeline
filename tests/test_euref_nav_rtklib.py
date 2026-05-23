@@ -26,8 +26,10 @@ from um980_rtklib_pipeline.rtklib import (
     cygdrive_to_windows,
     detect_rtklib_path_style,
     executable_for_subprocess,
+    format_command,
     path_for_rtklib_argument,
     resolve_rtklib_tool,
+    run_rnx2rtkp,
     validate_rtklib_inputs,
 )
 
@@ -43,6 +45,12 @@ def test_station_alias_and_bev_url():
         end=datetime(2026, 5, 20, 12, 20, tzinfo=UTC),
     )
     assert "CPAR00CZE_R_20261401200_01H_30S_MO.crx.gz" in urls[0]
+
+
+def test_pipeline_defaults_to_rtklib_compatible_rinex():
+    parser = cli.build_parser()
+    args = parser.parse_args(["pipeline", "rover.unc"])
+    assert args.rinex_compat == "convbin"
 
 
 def test_rinex_v2_url_planning():
@@ -202,6 +210,43 @@ def test_rnx2rtkp_command_includes_base_ecef(tmp_path: Path):
         base_ecef_xyz_m=(3949919.0811, 1116467.0408, 4865832.5323),
     )
     assert args[5:9] == ["-r", "3949919.0811", "1116467.0408", "4865832.5323"]
+
+
+def test_format_command_shell_quotes_arguments():
+    assert format_command(["rnx2rtkp", "-k", "config dir/rtk.conf"]) == "rnx2rtkp -k 'config dir/rtk.conf'"
+
+
+def test_run_rnx2rtkp_debug_logs_command_before_dry_run(tmp_path: Path, caplog):
+    rover = tmp_path / "rover.obs"
+    base = tmp_path / "base.obs"
+    nav = tmp_path / "base.nav"
+    conf = tmp_path / "rtk.conf"
+    output = tmp_path / "out.pos"
+    rover.write_text("     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n")
+    base.write_text("     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n")
+    nav.write_text(
+        "     3.04           NAVIGATION DATA     G                   RINEX VERSION / TYPE\n"
+        "                                                            END OF HEADER\n"
+        "G01 2026 05 20 00 00 00 0.0 0.0 0.0\n",
+        encoding="ascii",
+    )
+    conf.write_text("pos1-posmode =kinematic\n", encoding="ascii")
+
+    caplog.set_level(logging.INFO)
+    command = run_rnx2rtkp(
+        rnx2rtkp="/bin/sh",
+        rtkconf=conf,
+        output_file=output,
+        rover_obs=rover,
+        base_obs=[base],
+        nav_files=[nav],
+        dry_run=True,
+        debug=True,
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("RTKLIB command: /bin/sh -k" in message for message in messages)
+    assert any(str(command.wrapper_file) in message for message in messages)
 
 
 def test_parse_epn_station_position():
@@ -578,6 +623,7 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
         output_format="pos",
         rtklib_path_style="unix",
         dry_run=True,
+        debug=True,
         base_ecef=None,
         base_llh=None,
         base_position_source="none",
@@ -614,3 +660,4 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     assert calls["base_obs"] == [base_obs]
     assert calls["nav_files"] == [nav, *rover_nav]
     assert calls["output_file"] == out_dir / "rover-rtk.pos"
+    assert calls["debug"] is True

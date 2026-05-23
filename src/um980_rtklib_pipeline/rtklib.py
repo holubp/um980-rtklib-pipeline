@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from hashlib import sha256
 import logging
+import shlex
 from os import access, X_OK
 from pathlib import Path
 from typing import Literal
@@ -303,9 +304,14 @@ def write_wrapper(path: Path, args: list[str]) -> None:
         args: Command argument vector to quote into the wrapper.
     """
 
-    quoted = " ".join("'" + arg.replace("'", "'\"'\"'") + "'" for arg in args)
-    path.write_text("#!/bin/sh\nset -eu\n" + quoted + "\n", encoding="utf-8")
+    path.write_text("#!/bin/sh\nset -eu\n" + format_command(args) + "\n", encoding="utf-8")
     path.chmod(0o755)
+
+
+def format_command(args: list[str]) -> str:
+    """Return a shell-quoted representation of an argument vector."""
+
+    return shlex.join(args)
 
 
 def _has_rtklib_solution_rows(path: Path) -> bool:
@@ -354,6 +360,7 @@ def run_rnx2rtkp(
     base_llh: tuple[float, float, float] | None = None,
     path_style: RtklibPathStyle = "auto",
     dry_run: bool = False,
+    debug: bool = False,
 ) -> RtklibCommand:
     """Validate, prepare, and optionally run `rnx2rtkp`.
 
@@ -368,6 +375,7 @@ def run_rnx2rtkp(
         base_llh: Optional fixed base position as latitude, longitude, height.
         path_style: Path conversion style for RTKLIB arguments.
         dry_run: When true, only validate and write the wrapper.
+        debug: Log the exact command and output log paths before execution.
 
     Returns:
         Prepared command metadata.
@@ -394,11 +402,26 @@ def run_rnx2rtkp(
     stderr_log = output_file.with_suffix(".rtklib.stderr.log")
     wrapper_file = output_file.with_suffix(".rtkpost-wrapper.sh")
     write_wrapper(wrapper_file, args)
+    if debug:
+        logging.info("RTKLIB command: %s", format_command(args))
+        logging.info("RTKLIB wrapper: %s", wrapper_file)
+        logging.info("RTKLIB stdout log: %s", stdout_log)
+        logging.info("RTKLIB stderr log: %s", stderr_log)
     if not dry_run:
+        logging.debug("executing RTKLIB argv: %r", args)
         result = subprocess.run(args, check=False, capture_output=True, text=True)
         stdout_log.write_text(result.stdout, encoding="utf-8")
         stderr_log.write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:
-            raise RuntimeError(f"rnx2rtkp failed with exit code {result.returncode}: {result.stderr.strip()}")
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            detail = stderr or stdout or "no stdout/stderr output captured"
+            raise RuntimeError(
+                f"rnx2rtkp failed with exit code {result.returncode}: {detail}\n"
+                f"command: {format_command(args)}\n"
+                f"stdout log: {stdout_log}\n"
+                f"stderr log: {stderr_log}\n"
+                f"wrapper: {wrapper_file}"
+            )
         _warn_about_rtklib_result(output_file, result.stderr)
     return RtklibCommand(args, output_file, stdout_log, stderr_log, wrapper_file)

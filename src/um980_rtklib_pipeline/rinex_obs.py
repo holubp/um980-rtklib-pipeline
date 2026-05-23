@@ -12,7 +12,8 @@ from .obs_decode import Observation
 from .timeutil import gps_week_tow_to_datetime
 
 
-SYSTEM_ORDER = ["G", "R", "E", "C", "J", "S", "I", "U"]
+SYSTEM_ORDER = ["G", "R", "E", "C", "J", "S", "I"]
+SUPPORTED_RINEX_SYSTEMS = set(SYSTEM_ORDER)
 OBS_KIND_ORDER = ["C", "L", "D", "S"]
 CONVBIN_SIGNAL_ORDER = {
     "G": ["1C", "1L", "2W", "2L", "5Q"],
@@ -81,21 +82,33 @@ def observations_for_rinex(
     """
 
     if compatibility == "native":
-        return observations
+        return [obs for obs in observations if _is_supported_rinex_observation(obs)]
     if compatibility != "convbin":
         raise ValueError(f"unsupported RINEX compatibility mode: {compatibility}")
     return [
         obs
         for obs in observations
-        if obs.sat_system != "Unknown"
-        and obs.rinex_sat[0] != "U"
+        if _is_supported_rinex_observation(obs)
+        and obs.sat_system != "Unknown"
         and obs.gps_week >= 1024
         and obs.pseudorange_m is not None
     ]
 
 
+def _is_supported_rinex_observation(obs: Observation) -> bool:
+    return bool(obs.rinex_sat) and obs.rinex_sat[0] in SUPPORTED_RINEX_SYSTEMS
+
+
 def _format_header_line(value: str, label: str) -> str:
     return f"{value:<60}{label:>20}"
+
+
+def _format_time_of_obs_label(dt, label: str) -> str:
+    return _format_header_line(
+        f"  {dt.year:04d}    {dt.month:02d}    {dt.day:02d}    {dt.hour:02d}    {dt.minute:02d}"
+        f"   {dt.second + dt.microsecond / 1_000_000:10.7f}     GPS",
+        label,
+    )
 
 
 def _format_obs_value(value: float | None, lli: int | None = None) -> str:
@@ -171,6 +184,12 @@ def write_rinex_obs(
     obs_types = _obs_types(observations, compatibility=compatibility)
     if not obs_types:
         raise ValueError("RINEX writer emitted no observation types")
+    by_epoch: dict[tuple[int, float], list[Observation]] = defaultdict(list)
+    for index, obs in enumerate(observations, start=1):
+        if progress and index % 500_000 == 0:
+            logging.info("grouped %d/%d observations for RINEX OBS", index, len(observations))
+        by_epoch[(obs.gps_week, obs.tow)].append(obs)
+    epochs = sorted(by_epoch)
 
     lines = [
         _format_header_line(
@@ -190,6 +209,10 @@ def write_rinex_obs(
             "APPROX POSITION XYZ",
         )
     )
+    first_obs_time = gps_week_tow_to_datetime(*epochs[0]).astimezone(UTC)
+    last_obs_time = gps_week_tow_to_datetime(*epochs[-1]).astimezone(UTC)
+    lines.append(_format_time_of_obs_label(first_obs_time, "TIME OF FIRST OBS"))
+    lines.append(_format_time_of_obs_label(last_obs_time, "TIME OF LAST OBS"))
     for system in SYSTEM_ORDER:
         codes = obs_types.get(system)
         if not codes:
@@ -200,14 +223,6 @@ def write_rinex_obs(
             cont = " " * 7 + " ".join(f"{code:>3s}" for code in codes[offset : offset + 13])
             lines.append(_format_header_line(cont, "SYS / # / OBS TYPES"))
     lines.append(_format_header_line("", "END OF HEADER"))
-
-    by_epoch: dict[tuple[int, float], list[Observation]] = defaultdict(list)
-    for index, obs in enumerate(observations, start=1):
-        if progress and index % 500_000 == 0:
-            logging.info("grouped %d/%d observations for RINEX OBS", index, len(observations))
-        by_epoch[(obs.gps_week, obs.tow)].append(obs)
-
-    epochs = sorted(by_epoch)
     for index, key in enumerate(epochs, start=1):
         if progress and index % 5_000 == 0:
             logging.info("formatted %d/%d epochs for RINEX OBS", index, len(epochs))

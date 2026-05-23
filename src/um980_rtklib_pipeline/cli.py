@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -37,8 +38,9 @@ from .obs_decode import decode_observations, write_observations_csv
 from .quality import build_analysis, write_analysis_json
 from .rinex_nav import extract_rover_nav, rover_nav_files
 from .rinex_obs import observations_for_rinex, write_rinex_obs
-from .rtklib import executable_exists, executable_for_subprocess, resolve_rtklib_tool, run_rnx2rtkp
+from .rtklib import executable_exists, executable_for_subprocess, format_command, resolve_rtklib_tool, run_rnx2rtkp
 from .solution import (
+    SolutionPoint,
     extract_solutions,
     write_all_records_csv,
     write_gpx,
@@ -103,12 +105,36 @@ def _resolve_ion_messages(args: argparse.Namespace, diag_cfg: dict[str, object])
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable verbose progress plus exact external command diagnostics.",
+    )
     parser.add_argument("--out-dir")
     parser.add_argument("--basename")
     parser.add_argument("--analysis-json", action="store_true")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-file")
+
+
+def _debug_enabled(args: argparse.Namespace) -> bool:
+    """Return true when debug diagnostics were requested."""
+
+    return bool(getattr(args, "debug", False))
+
+
+def _verbose_enabled(args: argparse.Namespace) -> bool:
+    """Return true when progress logging should be enabled."""
+
+    return bool(getattr(args, "verbose", False) or _debug_enabled(args))
+
+
+def _configure_cli_logging(args: argparse.Namespace) -> None:
+    """Configure CLI logging from common arguments."""
+
+    configure_logging(_verbose_enabled(args), args.log_file, debug=_debug_enabled(args))
 
 
 def _human_bytes(size: int) -> str:
@@ -201,6 +227,33 @@ def _log_analysis_warnings(analysis: dict[str, object]) -> None:
         return
     for warning in warnings:
         logging.warning("%s", warning)
+
+
+def _ecef_from_llh(lat_deg: float, lon_deg: float, height_m: float) -> tuple[float, float, float]:
+    """Convert WGS84 geodetic coordinates to ECEF meters."""
+
+    semi_major = 6378137.0
+    flattening = 1.0 / 298.257223563
+    eccentricity_sq = flattening * (2.0 - flattening)
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    radius = semi_major / math.sqrt(1.0 - eccentricity_sq * sin_lat * sin_lat)
+    x = (radius + height_m) * cos_lat * math.cos(lon)
+    y = (radius + height_m) * cos_lat * math.sin(lon)
+    z = (radius * (1.0 - eccentricity_sq) + height_m) * sin_lat
+    return x, y, z
+
+
+def _approx_position_from_solutions(points: list[SolutionPoint]) -> tuple[float, float, float] | None:
+    """Return an approximate rover ECEF position from decoded solution points."""
+
+    for point in points:
+        height = point.h_ell if point.h_ell is not None else point.h_msl
+        if height is not None:
+            return _ecef_from_llh(point.lat, point.lon, height)
+    return None
 
 
 def _add_base_position_args(parser: argparse.ArgumentParser) -> None:
@@ -579,7 +632,7 @@ def cmd_init_generate(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     profile = _profile_from_args(args)
     logging.info("rendering receiver init script")
     script, estimate = render_init_script(
@@ -610,7 +663,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     rover, _, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
     if args.analysis_json:
         out_dir = ensure_out_dir(args.out_dir)
@@ -633,7 +686,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     rover, _, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(rover, args.basename)
@@ -679,7 +732,7 @@ def cmd_rinex(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     rover, records, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(rover, args.basename)
@@ -708,11 +761,15 @@ def cmd_rinex(args: argparse.Namespace) -> int:
     try:
         obs_path = out_dir / f"{base}.direct.obs"
         logging.info("writing rover RINEX OBS: %s", obs_path)
+        approx_position = _approx_position_from_solutions(solutions.solution_points)
+        if approx_position is None:
+            logging.warning("no decoded rover solution height available; RINEX APPROX POSITION XYZ will be 0 0 0")
         write_rinex_obs(
             obs_path,
             rinex_observations,
             rinex_version=args.rinex_version,
             compatibility=args.rinex_compat,
+            approx_position=approx_position,
             progress=logging.getLogger().isEnabledFor(logging.INFO),
         )
         logging.info("wrote rover RINEX OBS: %s", obs_path)
@@ -755,7 +812,7 @@ def cmd_download_base(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     logging.info("starting EUREF base download")
     normalised = _download_base_files(args)
     if normalised:
@@ -773,7 +830,7 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = args.basename or Path(args.rover_log).stem
     rover_nav = []
@@ -818,9 +875,10 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         base_llh=base_llh,
         path_style=args.rtklib_path_style,
         dry_run=args.dry_run,
+        debug=_debug_enabled(args),
     )
     logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
-    print(" ".join(command.args))
+    print(format_command(command.args))
     return 0
 
 
@@ -834,7 +892,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    configure_logging(args.verbose, args.log_file)
+    _configure_cli_logging(args)
     logging.info("pipeline step 1/3: extract receiver products")
     cmd_extract(args)
     logging.info("pipeline step 2/3: generate rover RINEX and navigation files")
@@ -907,9 +965,10 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         base_llh=base_llh,
         path_style=args.rtklib_path_style,
         dry_run=args.dry_run,
+        debug=_debug_enabled(args),
     )
     logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
-    print(" ".join(command.args))
+    print(format_command(command.args))
     return 0
 
 
@@ -1058,7 +1117,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
-    pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="native")
+    pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="convbin")
     _add_base_download_args(pipe, require_station=False)
     _add_base_position_args(pipe)
     _add_common(pipe)

@@ -8,6 +8,9 @@
   rejected before RTKLIB is invoked.
 - RINEX signal mappings must be explicit and tested. When using placeholder
   mappings, warn that the file is not production-ready for multi-band RTK.
+- RTKLIB-facing RINEX OBS must contain only standard RINEX 3 system codes. Do
+  not emit unknown-system `U` rows or satellites; keep those observations in
+  CSV/analysis instead.
 - Cygwin support must preserve the distinction between local Unix paths and
   Windows paths passed to Windows RTKLIB executables.
 - EUREF base-data selection must log unavailable high-rate or legacy RINEX 2

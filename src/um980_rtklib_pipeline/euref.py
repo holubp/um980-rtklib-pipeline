@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.request import urlopen, urlretrieve
 
-from .rtklib import detect_rtklib_path_style, path_for_rtklib_argument
+from .rtklib import detect_rtklib_path_style, format_command, path_for_rtklib_argument
 
 
 STATION_ALIASES = {
@@ -407,6 +407,7 @@ def _run_crx2rnx(crx2rnx: str, current: Path, produced: Path, *, timeout_s: floa
     path_style = detect_rtklib_path_style(crx2rnx)
     command = [crx2rnx, path_for_rtklib_argument(current, path_style), "-f"]
     logging.info("converting Hatanaka RINEX: %s -> %s", current, produced)
+    logging.debug("crx2rnx command: %s", format_command(command))
     try:
         process = subprocess.Popen(  # noqa: S603 - executable is user/local RTKLIB tool.
             command,
