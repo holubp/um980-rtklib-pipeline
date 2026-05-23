@@ -74,22 +74,20 @@ PROVIDERS = {
         "obs",
         (
             "ftp://gnss.bev.gv.at/pub/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.crx.gz",
-            "ftp://gnss.bev.gv.at/pub/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.rnx.gz",
         ),
     ),
     "bkg-euref-nrt": Provider(
         "bkg_euref_nrt_v3_hourly",
         "obs",
         (
-            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.crx.gz",
-            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.rnx.gz",
+            "ftp://igs.bkg.bund.de/EUREF/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.crx.gz",
         ),
     ),
     "bkg-euref-highrate": Provider(
         "bkg_euref_highrate_v3",
         "obs",
         (
-            "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "ftp://igs.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
             "{station_long}_S_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
         ),
     ),
@@ -104,21 +102,15 @@ PROVIDERS = {
         "bkg_euref_nrt_v2_hourly",
         "obs",
         (
-            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}d.Z",
-            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}d.gz",
-            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}o.gz",
+            "ftp://igs.bkg.bund.de/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}d.Z",
         ),
     ),
     "bkg-euref-highrate-v2": Provider(
         "bkg_euref_highrate_v2",
         "obs",
         (
-            "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "ftp://igs.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
             "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
-            "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
-            "{station4}{doy}{hour_letter}{minute}.{yy}d.gz",
-            "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
-            "{station4}{doy}{hour_letter}{minute}.{yy}o.gz",
         ),
     ),
 }
@@ -275,13 +267,14 @@ def _provider_for_version(provider_name: str, base_rate: str, rinex_version: str
     return "bkg-euref-nrt-v2"
 
 
-def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1) -> list[Path]:
+def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1, force: bool = False) -> list[Path]:
     """Download URL candidates into a cache directory.
 
     Args:
         urls: Candidate URLs to download.
         cache_dir: Local cache directory.
         retries: Attempts per URL.
+        force: Download URL targets even when cached products already exist.
 
     Returns:
         Downloaded or already cached file paths.
@@ -295,7 +288,13 @@ def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1) -> list
     failures: list[str] = []
     for url in urls:
         target = cache_dir / url.rsplit("/", 1)[-1]
-        if target.exists() and target.stat().st_size > 0:
+        cached = _cached_product_for_url_target(target)
+        if cached is not None and not force:
+            logging.info("using cached EUREF base candidate: %s", cached)
+            paths.append(cached)
+            continue
+        if target.exists() and target.stat().st_size > 0 and not force:
+            logging.info("using cached EUREF base candidate: %s", target)
             paths.append(target)
             continue
         last_error: Exception | None = None
@@ -322,6 +321,39 @@ def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1) -> list
             + "\n".join(f"- {url}" for url in urls)
         )
     return paths
+
+
+def _cached_product_for_url_target(target: Path) -> Path | None:
+    """Return an already usable cache product corresponding to a planned URL.
+
+    The downloader plans archive URLs, but previous runs may already have
+    decompressed or Hatanaka-converted those archives. Reusing those products
+    avoids network access and avoids re-running `crx2rnx` unless the user
+    explicitly requests `--force-download`.
+    """
+
+    for candidate in _cache_variants_for_target(target):
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
+def _cache_variants_for_target(target: Path) -> list[Path]:
+    variants: list[Path] = []
+    decompressed = target.with_suffix("") if target.suffix.lower() in {".gz", ".z"} else target
+    suffix = decompressed.suffix.lower()
+    if suffix == ".crx":
+        variants.append(decompressed.with_suffix(".rnx"))
+        variants.append(decompressed)
+    elif suffix == ".d":
+        variants.append(decompressed.with_suffix(".o"))
+        variants.append(decompressed)
+    elif re.fullmatch(r"\.\d{2}d", suffix):
+        variants.append(decompressed.with_suffix(suffix[:-1] + "o"))
+        variants.append(decompressed)
+    else:
+        variants.append(decompressed)
+    return list(dict.fromkeys(variants))
 
 
 def normalise_rinex_file(

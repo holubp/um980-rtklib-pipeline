@@ -265,33 +265,59 @@ def validate_rtklib_inputs(
 def build_rnx2rtkp_command(
     *,
     rnx2rtkp: str,
-    rtkconf: Path,
+    rtkconf: Path | None,
     output_file: Path,
     rover_obs: Path,
     base_obs: list[Path],
     nav_files: list[Path],
+    base_obs_arg: Path | None = None,
+    rtk_options: list[str] | None = None,
     base_ecef_xyz_m: tuple[float, float, float] | None = None,
     base_llh: tuple[float, float, float] | None = None,
     path_style: RtklibPathStyle = "auto",
 ) -> list[str]:
-    """Build an `rnx2rtkp` argv list with platform-appropriate path strings."""
+    """Build an `rnx2rtkp` argv list with platform-appropriate path strings.
+
+    Args:
+        rnx2rtkp: RTKLIB executable path or command name.
+        rtkconf: Optional RTKLIB configuration file.
+        output_file: Destination solution path.
+        rover_obs: Rover RINEX observation file.
+        base_obs: Concrete base RINEX OBS files validated before invocation.
+        nav_files: Concrete NAV/SP3/CLK/SBS files validated before invocation.
+        base_obs_arg: Optional single RTKLIB argument representing all base
+            observations, typically a tool-expanded wildcard. The concrete
+            `base_obs` list remains the validation source.
+        rtk_options: Command-line RTKLIB processing options.
+        base_ecef_xyz_m: Optional fixed base position in ECEF meters.
+        base_llh: Optional fixed base position as latitude, longitude, height.
+        path_style: Path conversion style for RTKLIB arguments.
+
+    Returns:
+        Argument vector ready for `subprocess.run`.
+    """
 
     if base_ecef_xyz_m is not None and base_llh is not None:
         raise ValueError("base_ecef_xyz_m and base_llh are mutually exclusive")
     resolved_style = detect_rtklib_path_style(rnx2rtkp, path_style)
     args = [
         executable_for_subprocess(rnx2rtkp),
-        "-k",
-        path_for_rtklib_argument(rtkconf, resolved_style),
         "-o",
         path_for_rtklib_argument(output_file, resolved_style),
     ]
+    if rtkconf is not None:
+        args[1:1] = ["-k", path_for_rtklib_argument(rtkconf, resolved_style)]
+    if rtk_options:
+        args[1:1] = list(rtk_options)
     if base_ecef_xyz_m is not None:
         args.extend(["-r", *(f"{value:.4f}" for value in base_ecef_xyz_m)])
     if base_llh is not None:
         args.extend(["-l", f"{base_llh[0]:.10f}", f"{base_llh[1]:.10f}", f"{base_llh[2]:.4f}"])
     args.append(path_for_rtklib_argument(rover_obs, resolved_style))
-    args.extend(path_for_rtklib_argument(path, resolved_style) for path in base_obs)
+    if base_obs_arg is not None:
+        args.append(path_for_rtklib_argument(base_obs_arg, resolved_style))
+    else:
+        args.extend(path_for_rtklib_argument(path, resolved_style) for path in base_obs)
     args.extend(path_for_rtklib_argument(path, resolved_style) for path in nav_files)
     return args
 
@@ -351,11 +377,13 @@ def _warn_about_rtklib_result(output_file: Path, stderr: str) -> None:
 def run_rnx2rtkp(
     *,
     rnx2rtkp: str,
-    rtkconf: Path,
+    rtkconf: Path | None,
     output_file: Path,
     rover_obs: Path,
     base_obs: list[Path],
     nav_files: list[Path],
+    base_obs_arg: Path | None = None,
+    rtk_options: list[str] | None = None,
     base_ecef_xyz_m: tuple[float, float, float] | None = None,
     base_llh: tuple[float, float, float] | None = None,
     path_style: RtklibPathStyle = "auto",
@@ -366,11 +394,15 @@ def run_rnx2rtkp(
 
     Args:
         rnx2rtkp: RTKLIB executable path or command name.
-        rtkconf: RTKLIB configuration file.
+        rtkconf: Optional RTKLIB configuration file.
         output_file: Destination solution path.
         rover_obs: Rover RINEX observation file.
         base_obs: Base RINEX observation files.
         nav_files: NAV/SP3/CLK/SBS files passed to RTKLIB.
+        base_obs_arg: Optional single RTKLIB argument representing all base
+            observations while `base_obs` supplies validation inputs.
+        rtk_options: Command-line RTKLIB processing options used when no
+            configuration file is supplied.
         base_ecef_xyz_m: Optional fixed base position in ECEF meters.
         base_llh: Optional fixed base position as latitude, longitude, height.
         path_style: Path conversion style for RTKLIB arguments.
@@ -387,6 +419,10 @@ def run_rnx2rtkp(
     """
 
     validate_rtklib_inputs(rnx2rtkp=rnx2rtkp, rover_obs=rover_obs, base_obs=base_obs, nav_files=nav_files)
+    if rtkconf is not None and not rtkconf.exists():
+        raise FileNotFoundError(f"RTKLIB configuration file does not exist: {rtkconf}")
+    if rtkconf is None and not rtk_options:
+        raise ValueError("RTKLIB requires either --rtkconf or generated command-line RTK options")
     args = build_rnx2rtkp_command(
         rnx2rtkp=rnx2rtkp,
         rtkconf=rtkconf,
@@ -394,6 +430,8 @@ def run_rnx2rtkp(
         rover_obs=rover_obs,
         base_obs=base_obs,
         nav_files=nav_files,
+        base_obs_arg=base_obs_arg,
+        rtk_options=rtk_options,
         base_ecef_xyz_m=base_ecef_xyz_m,
         base_llh=base_llh,
         path_style=path_style,

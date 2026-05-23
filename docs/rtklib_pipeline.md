@@ -103,9 +103,17 @@ um980-ppk pipeline rover.unc \
   --base-resolution high \
   --base-rinex-version 3 \
   --crx2rnx ~/RTKLIB-ex-bin/bin/crx2rnx \
-  --rtkconf examples/rtkpost-normal.conf.example \
   --run-rtklib
 ```
+
+The pipeline does not assume a non-existent RTKLIB config. If `--rtkconf` is
+provided, it is passed to `rnx2rtkp` with `-k` and must exist. If `--rtkconf` is
+omitted, the command is generated from CLI options: kinematic mode,
+L1/L2/L5, GPS+GLONASS+Galileo+BeiDou+QZSS, 10 degree elevation mask, and
+combined post-processing by default. Override those defaults with
+`--rtk-pos-mode`, `--rtk-frequency`, `--navsys`, `--rtk-navsys`,
+`--rtk-elevation-mask`, `--rtk-soltype`, `--rtk-ar-mode`, or repeated
+`--rnx2rtkp-option=TOKEN` arguments.
 
 `--base-resolution low` selects hourly 30 s EUREF data. `high` selects 1 s
 high-rate chunks and falls back to low-rate data with a warning when the
@@ -115,6 +123,15 @@ Base downloads are planned from the generated rover RINEX observation span and
 include every base product that overlaps or touches that span. The default
 `--time-margin 0` avoids fetching adjacent non-overlapping products; set a
 positive margin only when that extra coverage is intentional.
+Downloads reuse cached archives, decompressed files, and converted RINEX
+products by default. Use `--force-download` only when the source archive should
+be fetched again.
+When more than one base observation file survives overlap filtering, the
+pipeline stages those exact files into `<basename>.rtklib-base/` and passes
+`<basename>.rtklib-base/base-*.rnx` or the matching suffix as one argument to
+`rnx2rtkp`. This wildcard is quoted in the generated wrapper and subprocess
+argv, so the shell does not expand it; RTKLIB expands it internally as the
+single base observation input.
 
 The integrated pipeline defaults to `--rinex-compat convbin` for the rover OBS
 file passed to RTKLIB. Standalone `rinex` keeps the broader native ordering by

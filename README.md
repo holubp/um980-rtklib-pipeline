@@ -198,6 +198,15 @@ um980-ppk postprocess rover.unc \
   --rtkconf rtkpost-normal.conf
 ```
 
+`--rtkconf` is optional. When it is omitted, `postprocess` and `pipeline`
+generate a conservative `rnx2rtkp` command-line profile instead of inventing a
+missing config file: kinematic mode, L1/L2/L5, GPS+GLONASS+Galileo+BeiDou+QZSS,
+10 degree elevation mask, and combined forward/backward post-processing. Adjust
+that profile with `--rtk-pos-mode`, `--rtk-frequency`, `--navsys`,
+`--rtk-navsys`, `--rtk-elevation-mask`, `--rtk-soltype`, `--rtk-ar-mode`, or
+repeat `--rnx2rtkp-option=TOKEN` for raw RTKLIB options. Use `--rtkconf` when
+you want a full RTKLIB-EX config such as one distributed with RTKLIB-EX.
+
 Run the integrated pipeline with EUREF base download and RTKLIB execution:
 
 ```bash
@@ -207,7 +216,6 @@ um980-ppk pipeline rover.unc \
   --base-resolution high \
   --base-rinex-version 3 \
   --nav-file BRDC00WRD_R_20261380000_01D_MN.rnx \
-  --rtkconf rtkpost-normal.conf \
   --run-rtklib
 ```
 
@@ -218,6 +226,16 @@ to low-rate data unless `--no-base-fallback` is set. `--base-rinex-version 2`
 selects compact RINEX 2/Hatanaka EUREF names, including BEV low-rate
 `.YYd.gz` names and BKG high-rate `.YYd.Z` names; `auto` plans RINEX 3 first,
 then RINEX 2 alternatives.
+
+Base downloads are cache-first. The downloader reuses existing archives,
+decompressed files, or already converted `.rnx`/`.YYo` products in `--base-dir`
+or `--cache-dir`, and downloads only missing planned products. Add
+`--force-download` when you intentionally want to refresh the source archives.
+When several base RINEX files are retained, the pipeline stages exactly those
+files into `<basename>.rtklib-base/` and passes one wildcard argument to
+`rnx2rtkp`. The wildcard is passed directly to RTKLIB, not expanded by the
+shell, because RTKLIB expects the base station observation input as the second
+positional argument.
 
 Base download planning uses the recorded rover observation time span and
 requests every hourly or 15 minute product that overlaps or touches that span.

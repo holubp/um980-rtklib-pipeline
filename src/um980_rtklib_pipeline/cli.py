@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+import shutil
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -51,6 +52,38 @@ from .solution import (
 from .stream import parse_stream
 
 BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate")
+RTK_POS_MODE_CODES = {
+    "single": "0",
+    "dgps": "1",
+    "kinematic": "2",
+    "static": "3",
+    "moving-base": "4",
+    "fixed": "5",
+    "ppp-kinematic": "6",
+    "ppp-static": "7",
+    "ppp-fixed": "8",
+}
+RTK_FREQUENCY_CODES = {
+    "l1": "1",
+    "l1+l2": "2",
+    "l1+l2+l5": "3",
+    "l1+l5": "4",
+}
+RTK_NAVSYS_CODES = {
+    "gps": "G",
+    "glo": "R",
+    "gal": "E",
+    "bds": "C",
+    "qzs": "J",
+    "sbs": "S",
+    "irn": "I",
+}
+RTK_NAVSYS_PRESETS = {
+    "gps": "G",
+    "gps-glo": "G,R",
+    "gps-glo-gal-bds": "G,R,E,C",
+    "all": "G,R,E,C,J",
+}
 
 
 def _csv_items(value: object) -> list[str]:
@@ -331,8 +364,70 @@ def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station:
     )
     parser.add_argument("--whole-day", action="store_true")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Redownload planned EUREF source archives instead of reusing cached files.",
+    )
     parser.add_argument("--crx2rnx")
     parser.add_argument("--cleanup", action="store_true")
+
+
+def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base_obs: bool) -> None:
+    parser.add_argument("--rtklib-dir")
+    parser.add_argument("--rnx2rtkp", default="rnx2rtkp")
+    parser.add_argument("--convbin")
+    parser.add_argument("--crx2rnx")
+    parser.add_argument("--rtkconf")
+    parser.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
+    parser.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
+    parser.add_argument("--base-obs", action="append", required=require_base_obs)
+    parser.add_argument(
+        "--rtk-pos-mode",
+        choices=sorted(RTK_POS_MODE_CODES),
+        default="kinematic",
+        help="Generated rnx2rtkp mode when --rtkconf is omitted.",
+    )
+    parser.add_argument(
+        "--rtk-frequency",
+        choices=sorted(RTK_FREQUENCY_CODES),
+        default="l1+l2+l5",
+        help="Generated rnx2rtkp frequency setting when --rtkconf is omitted.",
+    )
+    parser.add_argument(
+        "--navsys",
+        choices=sorted(RTK_NAVSYS_PRESETS),
+        default="all",
+        help="Generated rnx2rtkp navigation-system preset when --rtkconf is omitted.",
+    )
+    parser.add_argument(
+        "--rtk-navsys",
+        help="Comma-separated generated rnx2rtkp systems, e.g. gps,glo,gal,bds,qzs,sbs.",
+    )
+    parser.add_argument(
+        "--rtk-elevation-mask",
+        type=float,
+        default=10.0,
+        help="Generated rnx2rtkp elevation mask in degrees when --rtkconf is omitted.",
+    )
+    parser.add_argument(
+        "--rtk-soltype",
+        choices=["forward", "backward", "combined"],
+        default="combined",
+        help="Generated rnx2rtkp post-processing direction when --rtkconf is omitted.",
+    )
+    parser.add_argument(
+        "--rtk-ar-mode",
+        choices=["continuous", "instantaneous", "fix-and-hold"],
+        default="continuous",
+        help="Generated rnx2rtkp ambiguity mode shortcut when --rtkconf is omitted.",
+    )
+    parser.add_argument(
+        "--rnx2rtkp-option",
+        action="append",
+        default=[],
+        help="Additional raw rnx2rtkp argument. Repeat for each token, e.g. --rnx2rtkp-option=-x --rnx2rtkp-option=4.",
+    )
 
 
 def _base_download_attempts(args: argparse.Namespace) -> list[tuple[str, str, str, str]]:
@@ -415,15 +510,16 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
     for index, (resolution, version, provider, rate, urls) in enumerate(planned_by_attempt):
         try:
             logging.info(
-                "downloading EUREF base observations: station=%s provider=%s rate=%s rinex=%s",
+                "%s EUREF base observations: station=%s provider=%s rate=%s rinex=%s",
+                "force-downloading" if args.force_download else "resolving cached/downloaded",
                 station_long,
                 provider,
                 rate,
                 version,
             )
-            downloaded = download_urls(urls, cache_dir)
+            downloaded = download_urls(urls, cache_dir, force=args.force_download)
             for path in downloaded:
-                logging.info("downloaded EUREF base candidate: %s", path)
+                logging.info("resolved EUREF base candidate: %s", path)
             crx2rnx = _resolve_crx2rnx_for_download(args, downloaded)
             normalised = [
                 normalise_rinex_file(path, crx2rnx=crx2rnx, cleanup=args.cleanup)
@@ -495,6 +591,96 @@ def _resolve_crx2rnx_for_download(args: argparse.Namespace, downloaded: list[Pat
     resolved = executable_for_subprocess(candidate)
     logging.info("using crx2rnx for Hatanaka conversion: %s", resolved)
     return resolved
+
+
+def _generated_rtk_options(args: argparse.Namespace) -> list[str]:
+    """Return generated `rnx2rtkp` processing options when no config is used."""
+
+    options = [
+        "-p",
+        RTK_POS_MODE_CODES[args.rtk_pos_mode],
+        "-f",
+        RTK_FREQUENCY_CODES[args.rtk_frequency],
+        "-sys",
+        _rtk_navsys_arg(args),
+        "-m",
+        f"{float(args.rtk_elevation_mask):g}",
+        "-t",
+    ]
+    if args.rtk_soltype == "backward":
+        options.append("-b")
+    elif args.rtk_soltype == "combined":
+        options.append("-c")
+    if args.rtk_ar_mode == "instantaneous":
+        options.append("-i")
+    elif args.rtk_ar_mode == "fix-and-hold":
+        options.append("-h")
+    options.extend(getattr(args, "rnx2rtkp_option", []) or [])
+    return options
+
+
+def _rtk_navsys_arg(args: argparse.Namespace) -> str:
+    requested = getattr(args, "rtk_navsys", None)
+    if not requested:
+        return RTK_NAVSYS_PRESETS[args.navsys]
+    systems: list[str] = []
+    for item in _csv_items(requested):
+        if item not in RTK_NAVSYS_CODES:
+            valid = ", ".join(sorted(RTK_NAVSYS_CODES))
+            raise ValueError(f"unsupported --rtk-navsys item {item!r}; expected one of: {valid}")
+        systems.append(RTK_NAVSYS_CODES[item])
+    return ",".join(dict.fromkeys(systems))
+
+
+def _rtklib_config_and_options(args: argparse.Namespace) -> tuple[Path | None, list[str] | None]:
+    """Resolve RTKLIB config-file mode versus generated command-line mode."""
+
+    extra_options = getattr(args, "rnx2rtkp_option", []) or []
+    if args.rtkconf:
+        if extra_options:
+            logging.info("using --rtkconf plus %d additional raw rnx2rtkp option tokens", len(extra_options))
+            return Path(args.rtkconf), list(extra_options)
+        logging.info("using RTKLIB configuration file: %s", args.rtkconf)
+        return Path(args.rtkconf), None
+    generated = _generated_rtk_options(args)
+    logging.warning(
+        "no --rtkconf supplied; using generated rnx2rtkp CLI options: %s. "
+        "Provide --rtkconf for a full RTKLIB-EX configuration.",
+        " ".join(generated),
+    )
+    return None, generated
+
+
+def _prepare_rtklib_base_obs_argument(base_obs: list[Path], out_dir: Path, basename: str) -> Path | None:
+    """Stage multiple base OBS files and return one wildcard argument for RTKLIB.
+
+    RTKLIB/rnx2rtkp treats the second positional input as the base observation
+    input. When a base station spans several hourly or high-rate RINEX files,
+    passing each file as a separate positional argument causes later base files
+    to be interpreted as navigation inputs. To keep the command deterministic,
+    this function validates the concrete `base_obs` list elsewhere, stages only
+    those files into a managed directory, and returns a wildcard that is passed
+    as one subprocess argument for RTKLIB to expand internally.
+    """
+
+    if len(base_obs) <= 1:
+        return None
+    stage_dir = out_dir / f"{basename}.rtklib-base"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    for stale in stage_dir.glob("base-*"):
+        if stale.is_file() or stale.is_symlink():
+            stale.unlink()
+    staged: list[Path] = []
+    for index, source in enumerate(base_obs):
+        suffix = source.suffix or ".obs"
+        target = stage_dir / f"base-{index:04d}{suffix}"
+        shutil.copyfile(source, target)
+        staged.append(target)
+    suffixes = {path.suffix for path in staged}
+    glob_suffix = suffixes.pop() if len(suffixes) == 1 else ""
+    pattern = stage_dir / f"base-*{glob_suffix}"
+    logging.info("staged %d base observation files for RTKLIB wildcard input: %s", len(staged), pattern)
+    return pattern
 
 
 def _resolve_station_for_base_download(args: argparse.Namespace) -> str:
@@ -863,14 +1049,18 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     logging.info("retained %d base observation files after overlap filtering", len(base_obs))
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
+    rtkconf, rtk_options = _rtklib_config_and_options(args)
+    base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
     logging.info("running RTKLIB postprocessing")
     command = run_rnx2rtkp(
         rnx2rtkp=rnx2rtkp,
-        rtkconf=Path(args.rtkconf),
+        rtkconf=rtkconf,
         output_file=out_dir / f"{base}-rtk.{args.output_format}",
         rover_obs=rover_obs,
         base_obs=base_obs,
         nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav),
+        base_obs_arg=base_obs_arg,
+        rtk_options=rtk_options,
         base_ecef_xyz_m=base_ecef,
         base_llh=base_llh,
         path_style=args.rtklib_path_style,
@@ -924,11 +1114,9 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     if not should_run_rtklib:
         logging.warning(
             "pipeline generated extraction/RINEX products but did not run RTKLIB. "
-            "Provide --run-rtklib with --rtkconf, --nav-file, and --base-obs or --download-base."
+            "Provide --run-rtklib with NAV data and --base-obs or --download-base."
         )
         return 0
-    if not args.rtkconf:
-        raise ValueError("--rtkconf is required when pipeline runs RTKLIB")
     if not base_obs:
         raise ValueError("--base-obs or --download-base is required when pipeline runs RTKLIB")
     logging.info("pipeline step 3/3: run RTKLIB postprocessing")
@@ -953,14 +1141,18 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     logging.info("resolved rnx2rtkp executable: %s", rnx2rtkp)
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
+    rtkconf, rtk_options = _rtklib_config_and_options(args)
+    base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
     logging.info("running RTKLIB postprocessing")
     command = run_rnx2rtkp(
         rnx2rtkp=rnx2rtkp,
-        rtkconf=Path(args.rtkconf),
+        rtkconf=rtkconf,
         output_file=out_dir / f"{base}-rtk.{args.output_format}",
         rover_obs=rover_obs,
         base_obs=base_obs,
         nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + generated_rover_nav),
+        base_obs_arg=base_obs_arg,
+        rtk_options=rtk_options,
         base_ecef_xyz_m=base_ecef,
         base_llh=base_llh,
         path_style=args.rtklib_path_style,
@@ -1080,7 +1272,6 @@ def build_parser() -> argparse.ArgumentParser:
     post = sub.add_parser("postprocess")
     post.add_argument("rover_log")
     post.add_argument("--rover-obs", required=True)
-    post.add_argument("--base-obs", action="append", required=True)
     post.add_argument("--nav-file", action="append")
     post.add_argument("--nav-glob", action="append")
     post.add_argument("--nav-provider", choices=["auto", "custom", "none"], default="auto")
@@ -1089,14 +1280,7 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--use-rover-nav", action="store_true")
     post.add_argument("--no-use-rover-nav", action="store_true")
     post.add_argument("--nav-merge", choices=["best-per-system", "all"], default="best-per-system")
-    post.add_argument("--rtklib-dir")
-    post.add_argument("--rnx2rtkp", default="rnx2rtkp")
-    post.add_argument("--convbin")
-    post.add_argument("--crx2rnx")
-    post.add_argument("--rtkconf", required=True)
-    post.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
-    post.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
-    post.add_argument("--navsys", choices=["gps", "gps-glo", "gps-glo-gal-bds", "all"], default="all")
+    _add_rtklib_processing_args(post, require_base_obs=True)
     _add_base_position_args(post)
     _add_common(post)
     post.set_defaults(func=cmd_postprocess)
@@ -1110,9 +1294,18 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--run-rtklib", action="store_true")
     pipe.add_argument("--rtklib-dir")
     pipe.add_argument("--rnx2rtkp", default="rnx2rtkp")
+    pipe.add_argument("--convbin")
     pipe.add_argument("--rtkconf")
     pipe.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
     pipe.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
+    pipe.add_argument("--rtk-pos-mode", choices=sorted(RTK_POS_MODE_CODES), default="kinematic")
+    pipe.add_argument("--rtk-frequency", choices=sorted(RTK_FREQUENCY_CODES), default="l1+l2+l5")
+    pipe.add_argument("--navsys", choices=sorted(RTK_NAVSYS_PRESETS), default="all")
+    pipe.add_argument("--rtk-navsys")
+    pipe.add_argument("--rtk-elevation-mask", type=float, default=10.0)
+    pipe.add_argument("--rtk-soltype", choices=["forward", "backward", "combined"], default="combined")
+    pipe.add_argument("--rtk-ar-mode", choices=["continuous", "instantaneous", "fix-and-hold"], default="continuous")
+    pipe.add_argument("--rnx2rtkp-option", action="append", default=[])
     pipe.add_argument("--obs-csv", action="store_true", default=True)
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")

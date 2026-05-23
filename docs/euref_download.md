@@ -20,8 +20,10 @@ repeatable/offline reruns. If EPN lookup is not requested or fails in auto mode,
 the pipeline falls back to the base RINEX `APPROX POSITION XYZ` header. Explicit
 `--base-ecef X Y Z` and `--base-llh LAT LON HEIGHT` always take precedence.
 
-BKG EUREF NRT and high-rate downloads use HTTPS `root_ftp` URLs. BEV NRT
-downloads still use the BEV FTP service.
+BKG EUREF NRT and high-rate downloads use the public `ftp://igs.bkg.bund.de/EUREF/...`
+paths used by the archived helper scripts. BEV NRT downloads use the BEV FTP
+service. Known noisy alternatives that failed in manual logs, such as BEV
+hourly `.rnx.gz` mirrors and BKG `root_ftp` HTTPS paths, are not planned.
 
 ## Rate and RINEX Version Selection
 
@@ -36,6 +38,11 @@ High-rate EUREF files are not always published for every station and interval.
 When high-rate data is requested, the CLI logs the failed provider/URLs and
 falls back to low-rate data by default. Use `--no-base-fallback` when a missing
 high-rate file should be a hard failure.
+
+Downloads are cache-first. Existing source archives, decompressed files, and
+converted `.rnx`/`.YYo` products in `--base-dir` or `--cache-dir` are reused;
+only missing products are downloaded. Use `--force-download` to refresh planned
+source archives from the provider.
 
 By default, `--time-margin` is `0`: only base products overlapping or touching
 the recorded interval are requested. Set `--time-margin SECONDS` only when you

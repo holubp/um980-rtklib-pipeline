@@ -51,6 +51,26 @@ def test_pipeline_defaults_to_rtklib_compatible_rinex():
     parser = cli.build_parser()
     args = parser.parse_args(["pipeline", "rover.unc"])
     assert args.rinex_compat == "convbin"
+    assert args.rtkconf is None
+    assert cli._generated_rtk_options(args) == ["-p", "2", "-f", "3", "-sys", "G,R,E,C,J", "-m", "10", "-t", "-c"]
+
+
+def test_postprocess_no_longer_requires_rtklib_config_file():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "postprocess",
+            "rover.unc",
+            "--rover-obs",
+            "rover.obs",
+            "--base-obs",
+            "base.obs",
+            "--nav-file",
+            "brdc.nav",
+        ]
+    )
+    assert args.rtkconf is None
+    assert cli._generated_rtk_options(args)[0:4] == ["-p", "2", "-f", "3"]
 
 
 def test_rinex_v2_url_planning():
@@ -194,6 +214,47 @@ def test_rtklib_validation_rejects_wildcard(tmp_path: Path):
         nav_files=[nav],
     )
     assert args[:5] == ["rnx2rtkp", "-k", str(tmp_path / "rtk.conf"), "-o", str(tmp_path / "out.pos")]
+
+
+def test_rnx2rtkp_command_can_use_generated_options_without_config(tmp_path: Path):
+    obs = tmp_path / "rover.obs"
+    base = tmp_path / "base.obs"
+    nav = tmp_path / "base.nav"
+    args = build_rnx2rtkp_command(
+        rnx2rtkp="rnx2rtkp",
+        rtkconf=None,
+        rtk_options=["-p", "2", "-f", "3", "-sys", "G,R,E,C,J", "-m", "10", "-t", "-c"],
+        output_file=tmp_path / "out.pos",
+        rover_obs=obs,
+        base_obs=[base],
+        nav_files=[nav],
+    )
+    assert args[:11] == ["rnx2rtkp", "-p", "2", "-f", "3", "-sys", "G,R,E,C,J", "-m", "10", "-t", "-c"]
+    assert "-k" not in args
+    assert args[-3:] == [str(obs), str(base), str(nav)]
+
+
+def test_rnx2rtkp_command_can_pass_base_wildcard_as_single_argument(tmp_path: Path):
+    obs = tmp_path / "rover.obs"
+    base_a = tmp_path / "base-0000.rnx"
+    base_b = tmp_path / "base-0001.rnx"
+    nav = tmp_path / "base.nav"
+    base_pattern = tmp_path / "base-*.rnx"
+
+    args = build_rnx2rtkp_command(
+        rnx2rtkp="rnx2rtkp",
+        rtkconf=None,
+        rtk_options=["-p", "2"],
+        output_file=tmp_path / "out.pos",
+        rover_obs=obs,
+        base_obs=[base_a, base_b],
+        nav_files=[nav],
+        base_obs_arg=base_pattern,
+    )
+
+    assert args[-3:] == [str(obs), str(base_pattern), str(nav)]
+    assert str(base_a) not in args
+    assert str(base_b) not in args
 
 
 def test_rnx2rtkp_command_includes_base_ecef(tmp_path: Path):
@@ -539,6 +600,7 @@ def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatc
         base_dir=None,
         crx2rnx=None,
         cleanup=False,
+        force_download=False,
     )
 
     monkeypatch.setattr(
@@ -550,7 +612,8 @@ def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatc
         ),
     )
 
-    def fake_download_urls(urls: list[str], cache_dir: Path):
+    def fake_download_urls(urls: list[str], cache_dir: Path, *, force: bool = False):
+        assert force is False
         attempts.append(urls[0])
         if "highrate" in urls[0]:
             raise RuntimeError("404")
@@ -567,6 +630,59 @@ def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatc
     assert "highrate" in attempts[0]
     assert "nrt" in attempts[1]
     assert any("trying provider=bev-nrt rate=30s rinex=3" in record.getMessage() for record in caplog.records)
+
+
+def test_download_urls_reuses_normalised_cache_without_network(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "CPAR00CZE_R_20261430500_01H_30S_MO.rnx"
+    cached.write_text("rinex\n", encoding="ascii")
+
+    def fail_urlretrieve(url: str, target: Path):
+        raise AssertionError("network should not be used when converted RINEX is cached")
+
+    monkeypatch.setattr("um980_rtklib_pipeline.euref.urlretrieve", fail_urlretrieve)
+    paths = download_urls(
+        ["ftp://gnss.bev.gv.at/pub/nrt/143/05/CPAR00CZE_R_20261430500_01H_30S_MO.crx.gz"],
+        tmp_path,
+    )
+
+    assert paths == [cached]
+
+
+def test_download_urls_force_download_ignores_normalised_cache(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "CPAR00CZE_R_20261430500_01H_30S_MO.rnx"
+    cached.write_text("old rinex\n", encoding="ascii")
+
+    def fake_urlretrieve(url: str, target: Path):
+        target.write_bytes(b"new archive")
+        return str(target), None
+
+    monkeypatch.setattr("um980_rtklib_pipeline.euref.urlretrieve", fake_urlretrieve)
+    paths = download_urls(
+        ["ftp://gnss.bev.gv.at/pub/nrt/143/05/CPAR00CZE_R_20261430500_01H_30S_MO.crx.gz"],
+        tmp_path,
+        force=True,
+    )
+
+    assert [path.name for path in paths] == ["CPAR00CZE_R_20261430500_01H_30S_MO.crx.gz"]
+
+
+def test_multiple_base_obs_are_staged_for_rtklib_wildcard(tmp_path: Path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    first = tmp_path / "TUBO00CZE_R_20261430500_01H_30S_MO.rnx"
+    second = tmp_path / "TUBO00CZE_R_20261430600_01H_30S_MO.rnx"
+    stale = out_dir / "rover.rtklib-base" / "base-stale.rnx"
+    stale.parent.mkdir()
+    stale.write_text("stale\n", encoding="ascii")
+    first.write_text("first\n", encoding="ascii")
+    second.write_text("second\n", encoding="ascii")
+
+    pattern = cli._prepare_rtklib_base_obs_argument([first, second], out_dir, "rover")
+
+    assert pattern == out_dir / "rover.rtklib-base" / "base-*.rnx"
+    assert not stale.exists()
+    assert sorted(path.name for path in pattern.parent.glob("base-*.rnx")) == ["base-0000.rnx", "base-0001.rnx"]
+    assert (pattern.parent / "base-0000.rnx").read_text(encoding="ascii") == "first\n"
 
 
 def test_v2_highrate_fallback_uses_bev_lowrate_provider():
@@ -596,6 +712,7 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     calls: dict[str, object] = {}
     nav = tmp_path / "brdc.rnx"
     base_obs = tmp_path / "base.obs"
+    base_obs_2 = tmp_path / "base2.obs"
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     rover_nav = [
@@ -606,12 +723,14 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     ]
     for path in rover_nav:
         path.write_text("data\n", encoding="ascii")
+    base_obs.write_text("base one\n", encoding="ascii")
+    base_obs_2.write_text("base two\n", encoding="ascii")
 
     args = argparse.Namespace(
         rover_log="rover.unc",
         out_dir=str(out_dir),
         basename="rover",
-        base_obs=[str(base_obs)],
+        base_obs=[str(base_obs), str(base_obs_2)],
         station=None,
         download_base=False,
         run_rtklib=True,
@@ -624,6 +743,14 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
         rtklib_path_style="unix",
         dry_run=True,
         debug=True,
+        rtk_pos_mode="kinematic",
+        rtk_frequency="l1+l2+l5",
+        navsys="all",
+        rtk_navsys=None,
+        rtk_elevation_mask=10.0,
+        rtk_soltype="combined",
+        rtk_ar_mode="continuous",
+        rnx2rtkp_option=[],
         base_ecef=None,
         base_llh=None,
         base_position_source="none",
@@ -657,7 +784,8 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     monkeypatch.setattr(cli, "run_rnx2rtkp", fake_run_rnx2rtkp)
     assert cli.cmd_pipeline(args) == 0
     assert calls["rover_obs"] == out_dir / "rover.direct.obs"
-    assert calls["base_obs"] == [base_obs]
+    assert calls["base_obs"] == [base_obs, base_obs_2]
+    assert calls["base_obs_arg"] == out_dir / "rover.rtklib-base" / "base-*.obs"
     assert calls["nav_files"] == [nav, *rover_nav]
     assert calls["output_file"] == out_dir / "rover-rtk.pos"
     assert calls["debug"] is True
