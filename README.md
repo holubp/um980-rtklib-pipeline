@@ -206,6 +206,12 @@ that profile with `--rtk-pos-mode`, `--rtk-frequency`, `--navsys`,
 `--rtk-navsys`, `--rtk-elevation-mask`, `--rtk-soltype`, `--rtk-ar-mode`, or
 repeat `--rnx2rtkp-option=TOKEN` for raw RTKLIB options. Use `--rtkconf` when
 you want a full RTKLIB-EX config such as one distributed with RTKLIB-EX.
+The repository includes `um980.conf`, an RTKLIB-ex/demo5 profile tuned for
+UM980 multi-constellation, multi-frequency PPK. It enables GPS, GLONASS,
+Galileo, and BeiDou with L1/L2/L5/L6 processing, dynamics, interpolation, and
+fix-and-hold ambiguity handling. Prefer `--rtkconf um980.conf` for serious
+UM980 post-processing; the generated command-line profile is mainly a portable
+fallback.
 
 Run the integrated pipeline with EUREF base download and RTKLIB execution:
 
@@ -216,6 +222,7 @@ um980-ppk pipeline rover.unc \
   --base-resolution high \
   --base-rinex-version 3 \
   --nav-file BRDC00WRD_R_20261380000_01D_MN.rnx \
+  --rtkconf um980.conf \
   --run-rtklib
 ```
 

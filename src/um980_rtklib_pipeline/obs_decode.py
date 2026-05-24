@@ -401,7 +401,7 @@ def _obsvmb_observations(record: StreamRecord) -> list[Observation]:
                 rinex_code=code,
                 band=code[0],
                 pseudorange_m=pseudorange if pseudorange_valid else None,
-                carrier_phase_cycles=-adr if phase_valid else None,
+                carrier_phase_cycles=adr if phase_valid else None,
                 doppler_hz=doppler if phase_valid else None,
                 cn0_dbhz=cn0_raw / 100.0,
                 lock_time_s=lock_time,

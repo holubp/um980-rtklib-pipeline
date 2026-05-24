@@ -113,6 +113,31 @@ def test_obsvma_subset_to_csv_and_rinex(tmp_path: Path):
     assert "E11" in rinex
 
 
+def test_rinex_writer_inverts_um980_carrier_phase_sign(tmp_path: Path):
+    """RINEX carrier phase range should move with pseudorange range."""
+
+    observations = [
+        _observation(tow=132572.0),
+        _observation(tow=132572.5),
+    ]
+    observations[0].pseudorange_m = 22580543.906
+    observations[0].carrier_phase_cycles = -1221049.086
+    observations[1].pseudorange_m = 22580205.539
+    observations[1].carrier_phase_cycles = -1219271.090
+
+    rinex_path = tmp_path / "phase-sign.obs"
+    write_rinex_obs(rinex_path, observations, compatibility="convbin")
+    lines = rinex_path.read_text(encoding="ascii").splitlines()
+    observation_lines = [line for line in lines if line.startswith("G01")]
+    code_values = [float(line[3:17]) for line in observation_lines]
+    carrier_values = [float(line[19:33]) for line in observation_lines]
+
+    assert len(code_values) == 2
+    assert carrier_values == [1221049.086, 1219271.090]
+    assert (carrier_values[1] - carrier_values[0]) * 0.190293672798 < 0
+    assert code_values[1] - code_values[0] < 0
+
+
 def test_native_rinex_filters_unknown_system_and_updates_epoch_count(tmp_path: Path):
     observations = [
         _observation(rinex_sat="G01", sat_system="GPS"),
@@ -207,13 +232,14 @@ def test_obsvmb_binary_observations_decode_to_rinex(tmp_path: Path):
     assert decoded.warnings == []
     assert [(obs.rinex_sat, obs.rinex_code) for obs in decoded.observations] == [("G16", "1C"), ("R15", "2C")]
     assert decoded.observations[0].pseudorange_m == 20814342.474
-    assert decoded.observations[0].carrier_phase_cycles == 109380108.947785
+    assert decoded.observations[0].carrier_phase_cycles == -109380108.947785
     assert decoded.observations[0].doppler_hz == 2648.551025390625
 
     rinex_path = tmp_path / "obsvmb.obs"
     write_rinex_obs(rinex_path, decoded.observations, compatibility="convbin")
     rinex = rinex_path.read_text(encoding="ascii")
     assert "G16" in rinex
+    assert "  109380108.948" in rinex
     assert "R15" in rinex
 
 
@@ -242,6 +268,7 @@ def test_obsvmcmpb_compressed_observations_decode_to_rinex(tmp_path: Path):
     write_rinex_obs(rinex_path, decoded.observations, compatibility="convbin")
     rinex = rinex_path.read_text(encoding="ascii")
     assert "G18" in rinex
+    assert "    1219049.086" in rinex
     assert "R11" in rinex
 
 

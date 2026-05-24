@@ -19,6 +19,9 @@
 - When base observations span multiple files, validate each concrete file but
   pass RTKLIB one base observation argument, usually a staged wildcard, so later
   base files are not misinterpreted as navigation files.
+- Treat generated `rnx2rtkp` command-line options as a conservative fallback.
+  Prefer explicit RTKLIB-ex configs such as `um980.conf` for quality-sensitive
+  comparisons, and keep the selected config visible in verbose logs.
 - Hatanaka conversion must run non-interactively. Use overwrite/timeout
   safeguards for `crx2rnx` so existing `.rnx` files cannot trigger hidden
   prompts or stalled downloads.

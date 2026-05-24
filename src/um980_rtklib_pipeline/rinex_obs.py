@@ -122,6 +122,17 @@ def _format_obs_value(value: float | None, lli: int | None = None) -> str:
     raise ValueError(f"RINEX observation value is too large for fixed-width output: {value}")
 
 
+def _rinex_carrier_phase_cycles(value: float | None) -> float | None:
+    """Convert decoded UM980 ADR phase to standard RINEX carrier phase sign.
+
+    UM980 OBSVM* phase/ADR values use the opposite sign convention from RINEX
+    observation files. Pseudorange and Doppler are written unchanged; only the
+    carrier phase `L*` observations are inverted at the RINEX boundary.
+    """
+
+    return None if value is None else -value
+
+
 def _format_satellite_observation_rows(sat: str, values: list[str], *, wrap: bool) -> list[str]:
     """Return RINEX observation rows for one satellite, wrapped at 80 columns.
 
@@ -239,7 +250,7 @@ def write_rinex_obs(
             values_by_code: dict[str, tuple[float | None, int]] = {}
             for obs in by_sat[sat]:
                 values_by_code["C" + obs.rinex_code] = (obs.pseudorange_m, obs.lli)
-                values_by_code["L" + obs.rinex_code] = (obs.carrier_phase_cycles, obs.lli)
+                values_by_code["L" + obs.rinex_code] = (_rinex_carrier_phase_cycles(obs.carrier_phase_cycles), obs.lli)
                 values_by_code["D" + obs.rinex_code] = (obs.doppler_hz, obs.lli)
                 values_by_code["S" + obs.rinex_code] = (obs.cn0_dbhz, obs.lli)
             values: list[str] = []
