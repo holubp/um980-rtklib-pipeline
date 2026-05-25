@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import logging
 import shlex
-from os import access, X_OK
+from os import access, environ, X_OK
 from pathlib import Path
 from typing import Literal
 
@@ -44,6 +44,17 @@ def is_cygwin() -> bool:
     """Return true when Python is running under Cygwin."""
 
     return sys.platform.startswith("cygwin")
+
+
+def is_termux() -> bool:
+    """Return true when Python is running in an Android/Termux environment."""
+
+    prefix = environ.get("PREFIX", "")
+    return (
+        "/com.termux/" in prefix
+        or prefix.startswith("/data/data/com.termux/")
+        or Path("/data/data/com.termux/files/usr").exists()
+    )
 
 
 def is_windows_path(value: str) -> bool:
@@ -130,7 +141,7 @@ def executable_for_subprocess(executable: str) -> str:
         if converted:
             return converted
     path = Path(executable)
-    if path.exists() and not access(path, X_OK):
+    if path.exists() and not access(path, X_OK) and can_mirror_non_executable_tool(path):
         return str(mirror_non_executable_tool(path))
     return executable
 
@@ -141,6 +152,8 @@ def executable_exists(executable: str) -> bool:
     if shutil.which(executable):
         return True
     path = Path(executable)
+    if is_cygwin() and path.exists():
+        return True
     if path.exists() and (access(path, X_OK) or can_mirror_non_executable_tool(path)):
         return True
     if is_cygwin() and is_windows_path(executable):
@@ -152,7 +165,7 @@ def executable_exists(executable: str) -> bool:
 def can_mirror_non_executable_tool(path: Path) -> bool:
     """Return true if a readable local tool can be mirrored to executable storage."""
 
-    return path.is_file()
+    return is_termux() and path.is_file()
 
 
 def mirror_non_executable_tool(path: Path) -> Path:

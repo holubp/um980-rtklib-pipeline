@@ -792,14 +792,37 @@ def test_rtklib_tool_prefers_user_home_bin(tmp_path: Path, monkeypatch):
     assert resolve_rtklib_tool("rnx2rtkp", cwd=tmp_path / "repo") == str(tool)
 
 
-def test_non_executable_local_tool_is_mirrored_for_subprocess(tmp_path: Path):
+def test_non_executable_local_tool_is_mirrored_for_subprocess(tmp_path: Path, monkeypatch):
     tool = tmp_path / "rnx2rtkp"
     tool.write_bytes(b"binary-placeholder")
     tool.chmod(0o600)
+    monkeypatch.setattr(rtklib, "is_termux", lambda: True)
     mirrored = Path(executable_for_subprocess(str(tool)))
     assert mirrored.exists()
     assert mirrored != tool
     assert mirrored.stat().st_mode & 0o111
+
+
+def test_non_executable_tool_is_not_mirrored_outside_termux(tmp_path: Path, monkeypatch):
+    tool = tmp_path / "rnx2rtkp"
+    tool.write_bytes(b"binary-placeholder")
+    tool.chmod(0o600)
+    monkeypatch.setattr(rtklib, "is_termux", lambda: False)
+    monkeypatch.setattr(rtklib, "is_cygwin", lambda: False)
+
+    assert executable_for_subprocess(str(tool)) == str(tool)
+    assert not rtklib.executable_exists(str(tool))
+
+
+def test_cygwin_non_executable_tool_is_not_mirrored_to_termux(tmp_path: Path, monkeypatch):
+    tool = tmp_path / "rnx2rtkp"
+    tool.write_bytes(b"binary-placeholder")
+    tool.chmod(0o600)
+    monkeypatch.setattr(rtklib, "is_termux", lambda: False)
+    monkeypatch.setattr(rtklib, "is_cygwin", lambda: True)
+
+    assert executable_for_subprocess(str(tool)) == str(tool)
+    assert rtklib.executable_exists(str(tool))
 
 
 def test_rtklib_header_only_output_is_logged(tmp_path: Path, caplog):

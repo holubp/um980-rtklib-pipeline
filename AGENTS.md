@@ -13,6 +13,8 @@
   CSV/analysis instead.
 - Cygwin support must preserve the distinction between local Unix paths and
   Windows paths passed to Windows RTKLIB executables.
+- Termux executable mirroring must only run under Termux/Android. Never rewrite
+  Cygwin or desktop RTKLIB executable paths into `/data/data/com.termux/...`.
 - Explicit RTKLIB helper paths, such as `--crx2rnx ./crx2rnx.exe`, must be
   honored before `--rtklib-dir` search logic. Only bare tool names should be
   combined with configured install directories.

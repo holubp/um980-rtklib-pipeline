@@ -322,7 +322,9 @@ The `build-tools/RTKLIB-ex-bin/` directory is intentionally ignored by git. It
 is a convenient local install location for manually built RTKLIB-ex binaries.
 On Android/Termux shared storage, files in this directory may not be directly
 executable; the pipeline mirrors the selected local tool into Termux-private
-temporary storage before launching it.
+temporary storage before launching it. This mirroring is Termux-only; Cygwin
+keeps the selected RTKLIB executable path and never rewrites it to a Termux
+`/data/data/...` location.
 
 For Android/Termux, `~/RTKLIB-ex-bin/bin/` is preferred because binaries stored
 under `$HOME` can be executed directly.

@@ -44,6 +44,11 @@ exists. Some builds may write solution data to stdout despite `-o`; preserve
 captured stdout as the requested output file, otherwise raise a clear runtime
 error with the command, wrapper, and log paths.
 
+The non-executable binary mirror is only for Android/Termux shared-storage
+constraints. Never route Cygwin or desktop RTKLIB executables through
+`/data/data/com.termux/...`; Cygwin should keep the selected executable path and
+apply path conversion only to RTKLIB input/output/config arguments.
+
 ## RTKLIB Post-Processing
 
 Keep generated `rnx2rtkp` options as a portable fallback. Quality-sensitive

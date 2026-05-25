@@ -316,4 +316,7 @@ provided.
 
 On Android/Termux shared storage, the binaries in `build-tools/RTKLIB-ex-bin/`
 may be readable but not executable. In that case the pipeline copies the chosen
-tool to Termux-private temporary storage and runs the mirrored executable.
+tool to Termux-private temporary storage and runs the mirrored executable. This
+copy-to-temp behavior is disabled outside Termux; Cygwin keeps the selected
+RTKLIB executable path and only converts data/config path arguments according to
+`--rtklib-path-style`.
