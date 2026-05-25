@@ -12,7 +12,9 @@
   not emit unknown-system `U` rows or satellites; keep those observations in
   CSV/analysis instead.
 - Cygwin support must preserve the distinction between local Unix paths and
-  Windows paths passed to Windows RTKLIB executables.
+  Windows paths passed to Windows RTKLIB executables. Windows RTKLIB binaries
+  on Cygwin may be PE files without an `.exe` suffix; do not rely only on file
+  extension for path-style detection.
 - Termux executable mirroring must only run under Termux/Android. Never rewrite
   Cygwin or desktop RTKLIB executable paths into `/data/data/com.termux/...`.
 - Explicit RTKLIB helper paths, such as `--crx2rnx ./crx2rnx.exe`, must be

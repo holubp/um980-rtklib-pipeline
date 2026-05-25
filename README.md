@@ -287,9 +287,10 @@ position. Otherwise `--base-station CPAR` resolves current EPN/EUREF ETRF2000
 ECEF coordinates and emits `-r X Y Z`; auto mode falls back to the base RINEX
 `APPROX POSITION XYZ` header.
 
-On Cygwin, Windows RTKLIB `.exe` tools usually need Windows-style paths for
-input files even though the Python pipeline sees Unix paths. `postprocess`
-auto-detects Cygwin plus `.exe` and passes Windows paths to RTKLIB while still
+On Cygwin, Windows RTKLIB tools usually need Windows-style paths for input
+files even though the Python pipeline sees Unix paths. `postprocess`
+auto-detects Cygwin plus Windows `.exe` or PE binaries, including PE binaries
+without an `.exe` suffix, and passes Windows paths to RTKLIB while still
 validating local files with Unix paths:
 
 ```bash

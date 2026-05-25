@@ -31,8 +31,9 @@ files.
 
 Validate local files with local Python paths. Convert only the argument strings
 passed to RTKLIB tools. Cygwin with Windows `.exe` tools usually requires
-Windows-style input paths, while native Linux/Cygwin builds require Unix paths.
-Keep `--rtklib-path-style` behavior covered by tests.
+Windows-style input paths, and some Windows RTKLIB builds are PE binaries
+without an `.exe` suffix. Native Linux/Cygwin builds require Unix paths. Keep
+`--rtklib-path-style` behavior covered by tests.
 
 Explicit tool paths must win over search directories. In particular,
 `--crx2rnx ./crx2rnx.exe` and other relative or absolute paths must be resolved

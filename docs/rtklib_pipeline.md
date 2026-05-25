@@ -239,8 +239,8 @@ as `C:\ppk\rover.obs`.
 - local validation uses the paths supplied to the Python process;
 - command arguments passed to RTKLIB are converted according to
   `--rtklib-path-style`;
-- `auto` uses Windows argument paths when running on Cygwin with a `.exe`
-  `rnx2rtkp`;
+- `auto` uses Windows argument paths when running on Cygwin with a Windows
+  `.exe` or PE `rnx2rtkp`, including PE binaries without an `.exe` suffix;
 - `unix` is for native Cygwin/Linux RTKLIB builds;
 - `windows` forces Windows argument paths.
 

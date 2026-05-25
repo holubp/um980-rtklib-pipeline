@@ -101,8 +101,9 @@ def detect_rtklib_path_style(rnx2rtkp: str, requested: RtklibPathStyle = "auto")
     """Resolve `auto` path style for RTKLIB command arguments.
 
     Native Linux/macOS RTKLIB builds need POSIX paths. Windows RTKLIB binaries,
-    including `.exe` launched from Cygwin, need Windows paths for input, output,
-    and config files. The executable path itself is handled separately.
+    including `.exe` or PE binaries launched from Cygwin, need Windows paths for
+    input, output, and config files. The executable path itself is handled
+    separately.
     """
 
     if requested != "auto":
@@ -110,9 +111,19 @@ def detect_rtklib_path_style(rnx2rtkp: str, requested: RtklibPathStyle = "auto")
     lower = rnx2rtkp.lower()
     if sys.platform == "win32":
         return "windows"
-    if is_cygwin() and lower.endswith(".exe"):
+    if is_cygwin() and (lower.endswith(".exe") or is_windows_executable(rnx2rtkp)):
         return "windows"
     return "unix"
+
+
+def is_windows_executable(executable: str) -> bool:
+    """Return true when `executable` appears to be a Windows PE binary."""
+
+    try:
+        with Path(executable).open("rb") as file:
+            return file.read(2) == b"MZ"
+    except OSError:
+        return False
 
 
 def path_for_rtklib_argument(path: Path, style: Literal["unix", "windows"]) -> str:
