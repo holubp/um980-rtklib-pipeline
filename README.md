@@ -183,7 +183,11 @@ receiver reports a fine time solution.
 Download base data URLs for a rover time window without fetching:
 
 ```bash
-um980-ppk download-base rover.unc --station CPAR --offline -v
+um980-ppk download-base rover.unc \
+  --station CPAR \
+  --rtklib-dir ~/RTKLIB-ex-bin/bin \
+  --crx2rnx ./crx2rnx.exe \
+  --offline -v
 ```
 
 Run post-processing with explicit inputs:
@@ -210,7 +214,10 @@ you want a full RTKLIB-EX config such as one distributed with RTKLIB-EX.
 latitude/longitude/height content, which RTKLIB config files call
 `out-solformat=llh`. `--output-format nmea` passes RTKLIB's `-n` option,
 equivalent to setting `out-solformat=nmea`; it does not merely rename a `.pos`
-file to `.nmea`.
+file to `.nmea`. If an RTKLIB build writes a successful run to stdout instead
+of honoring `-o`, the pipeline saves that captured stdout as the requested
+output file; if no output exists anywhere, the run fails with the command and
+log paths.
 For solution-quality debugging, add `--rtklib-trace-level 4
 --rtklib-stat-level 2`; these pass `rnx2rtkp -x 4 -y 2` and work with or
 without `--rtkconf`.

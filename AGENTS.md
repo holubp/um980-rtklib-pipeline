@@ -35,3 +35,6 @@
 - Hatanaka conversion must run non-interactively. Use overwrite/timeout
   safeguards for `crx2rnx` so existing `.rnx` files cannot trigger hidden
   prompts or stalled downloads.
+- A zero-exit RTKLIB run is not complete unless the requested solution output
+  exists. If RTKLIB writes solution data to stdout, preserve it as the requested
+  output; otherwise raise a clear error with command and log paths.

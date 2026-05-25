@@ -100,6 +100,25 @@ def test_rtkconf_nmea_output_adds_command_line_override():
     assert rtk_options == ["-n"]
 
 
+def test_download_base_accepts_rtklib_dir_for_crx2rnx_discovery():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "download-base",
+            "rover.unc",
+            "--station",
+            "TUBO",
+            "--rtklib-dir",
+            "RTKLIB_EX_2.5.0",
+            "--crx2rnx",
+            "./crx2rnx.exe",
+        ]
+    )
+
+    assert args.rtklib_dir == "RTKLIB_EX_2.5.0"
+    assert args.crx2rnx == "./crx2rnx.exe"
+
+
 def test_raw_rnx2rtkp_options_can_override_generated_output_format():
     parser = cli.build_parser()
     args = parser.parse_args(
@@ -412,6 +431,65 @@ def test_run_rnx2rtkp_debug_logs_command_before_dry_run(tmp_path: Path, caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert any("RTKLIB command: /bin/sh -k" in message for message in messages)
     assert any(str(command.wrapper_file) in message for message in messages)
+
+
+def _write_minimal_rtklib_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    rover = tmp_path / "rover.obs"
+    base = tmp_path / "base.obs"
+    nav = tmp_path / "base.nav"
+    conf = tmp_path / "rtk.conf"
+    output = tmp_path / "out.nmea"
+    obs_header = "     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n"
+    rover.write_text(obs_header, encoding="ascii")
+    base.write_text(obs_header, encoding="ascii")
+    nav.write_text(
+        "     3.04           NAVIGATION DATA     G                   RINEX VERSION / TYPE\n"
+        "                                                            END OF HEADER\n"
+        "G01 2026 05 20 00 00 00 0.0 0.0 0.0\n",
+        encoding="ascii",
+    )
+    conf.write_text("pos1-posmode =kinematic\n", encoding="ascii")
+    return rover, base, nav, conf, output
+
+
+def test_run_rnx2rtkp_recovers_missing_output_from_stdout(tmp_path: Path, monkeypatch):
+    rover, base, nav, conf, output = _write_minimal_rtklib_inputs(tmp_path)
+    stdout = "$GNRMC,161708.50,A,5000.0000,N,01400.0000,E,0.0,0.0,250526,,,A*00\n"
+
+    def fake_run(*args, **kwargs):
+        return argparse.Namespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(rtklib.subprocess, "run", fake_run)
+
+    run_rnx2rtkp(
+        rnx2rtkp="/bin/sh",
+        rtkconf=conf,
+        output_file=output,
+        rover_obs=rover,
+        base_obs=[base],
+        nav_files=[nav],
+    )
+
+    assert output.read_text(encoding="utf-8") == stdout
+
+
+def test_run_rnx2rtkp_fails_when_successful_run_has_no_output(tmp_path: Path, monkeypatch):
+    rover, base, nav, conf, output = _write_minimal_rtklib_inputs(tmp_path)
+
+    def fake_run(*args, **kwargs):
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(rtklib.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="did not create the requested output file"):
+        run_rnx2rtkp(
+            rnx2rtkp="/bin/sh",
+            rtkconf=conf,
+            output_file=output,
+            rover_obs=rover,
+            base_obs=[base],
+            nav_files=[nav],
+        )
 
 
 def test_parse_epn_station_position():

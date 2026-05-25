@@ -40,7 +40,11 @@ Use `--base-resolution low` for hourly 30 s files and `--base-resolution high`
 for 15 minute 1 s files:
 
 ```bash
-um980-ppk download-base rover.unc --station CPAR --base-resolution high
+um980-ppk download-base rover.unc \
+  --station CPAR \
+  --base-resolution high \
+  --rtklib-dir ~/RTKLIB-ex-bin/bin \
+  --crx2rnx ./crx2rnx.exe
 ```
 
 High-rate EUREF files are not always published for every station and interval.

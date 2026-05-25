@@ -352,9 +352,11 @@ def _resolve_base_position(
     return None, None
 
 
-def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station: bool) -> None:
+def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station: bool, include_rtklib_dir: bool = True) -> None:
     parser.add_argument("--station", required=require_station)
     parser.add_argument("--station-long")
+    if include_rtklib_dir:
+        parser.add_argument("--rtklib-dir")
     parser.add_argument("--base-provider", choices=BASE_PROVIDER_CHOICES, default="bev-nrt")
     parser.add_argument("--base-rate", choices=["30s", "1s"], default="30s")
     parser.add_argument("--base-resolution", choices=["low", "high"], default="low")
@@ -1676,7 +1678,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
     pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="convbin")
-    _add_base_download_args(pipe, require_station=False)
+    _add_base_download_args(pipe, require_station=False, include_rtklib_dir=False)
     _add_base_position_args(pipe)
     _add_common(pipe)
     pipe.set_defaults(func=cmd_pipeline)

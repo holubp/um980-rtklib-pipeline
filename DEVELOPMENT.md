@@ -39,6 +39,11 @@ Explicit tool paths must win over search directories. In particular,
 as local paths before considering `--rtklib-dir`; only bare tool names should be
 combined with RTKLIB install directories.
 
+Do not treat `rnx2rtkp` exit code 0 as success unless the requested output file
+exists. Some builds may write solution data to stdout despite `-o`; preserve
+captured stdout as the requested output file, otherwise raise a clear runtime
+error with the command, wrapper, and log paths.
+
 ## RTKLIB Post-Processing
 
 Keep generated `rnx2rtkp` options as a portable fallback. Quality-sensitive

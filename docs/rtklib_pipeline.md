@@ -120,7 +120,10 @@ latitude/longitude/height content; in RTKLIB config files that content is
 called `out-solformat=llh`. `--output-format nmea` is an RTKLIB output-format
 request, not just a filename suffix. The pipeline adds `rnx2rtkp -n`, which is
 the command-line equivalent of `out-solformat=nmea`, even when `--rtkconf` is
-also supplied.
+also supplied. If a successful RTKLIB run writes solution text to stdout instead
+of creating the `-o` file, the pipeline stores that captured stdout at the
+requested output path. A zero-exit run with no output file and no captured
+solution data is treated as a runtime error.
 
 Use `--rtklib-trace-level 4 --rtklib-stat-level 2` to produce the usual
 debugging equivalent of `rnx2rtkp -x 4 -y 2`. These named options are passed as

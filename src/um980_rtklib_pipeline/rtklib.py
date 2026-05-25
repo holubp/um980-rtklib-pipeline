@@ -374,6 +374,32 @@ def _warn_about_rtklib_result(output_file: Path, stderr: str) -> None:
         logging.warning("RTKLIB progress reported only Q=0 epochs; no usable solution was produced.")
 
 
+def _recover_output_from_stdout(output_file: Path, stdout: str) -> bool:
+    """Write captured RTKLIB stdout to `output_file` when `-o` was not honored."""
+
+    if output_file.exists() or not stdout.strip():
+        return False
+    output_file.write_text(stdout, encoding="utf-8")
+    logging.warning(
+        "RTKLIB did not create %s but wrote data to stdout; saved captured stdout to the requested output file.",
+        output_file,
+    )
+    return True
+
+
+def _raise_missing_rtklib_output(output_file: Path, stdout_log: Path, stderr_log: Path, wrapper_file: Path, args: list[str]) -> None:
+    """Raise a clear error when RTKLIB exits successfully without output."""
+
+    raise RuntimeError(
+        "rnx2rtkp completed with exit code 0 but did not create the requested output file: "
+        f"{output_file}\n"
+        f"command: {format_command(args)}\n"
+        f"stdout log: {stdout_log}\n"
+        f"stderr log: {stderr_log}\n"
+        f"wrapper: {wrapper_file}"
+    )
+
+
 def run_rnx2rtkp(
     *,
     rnx2rtkp: str,
@@ -461,5 +487,8 @@ def run_rnx2rtkp(
                 f"stderr log: {stderr_log}\n"
                 f"wrapper: {wrapper_file}"
             )
+        _recover_output_from_stdout(output_file, result.stdout)
         _warn_about_rtklib_result(output_file, result.stderr)
+        if not output_file.exists():
+            _raise_missing_rtklib_output(output_file, stdout_log, stderr_log, wrapper_file, args)
     return RtklibCommand(args, output_file, stdout_log, stderr_log, wrapper_file)
