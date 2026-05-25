@@ -825,6 +825,13 @@ def test_cygwin_non_executable_tool_is_not_mirrored_to_termux(tmp_path: Path, mo
     assert rtklib.executable_exists(str(tool))
 
 
+def test_cygwin_is_never_detected_as_termux(monkeypatch):
+    monkeypatch.setattr(rtklib.sys, "platform", "cygwin")
+    monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
+
+    assert not rtklib.is_termux()
+
+
 def test_rtklib_header_only_output_is_logged(tmp_path: Path, caplog):
     output = tmp_path / "out.pos"
     output.write_text("% header only\n", encoding="ascii")

@@ -49,6 +49,8 @@ def is_cygwin() -> bool:
 def is_termux() -> bool:
     """Return true when Python is running in an Android/Termux environment."""
 
+    if is_cygwin() or sys.platform != "linux":
+        return False
     prefix = environ.get("PREFIX", "")
     return (
         "/com.termux/" in prefix
