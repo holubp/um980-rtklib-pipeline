@@ -35,6 +35,11 @@ Windows-style input paths, and some Windows RTKLIB builds are PE binaries
 without an `.exe` suffix. Native Linux/Cygwin builds require Unix paths. Keep
 `--rtklib-path-style` behavior covered by tests.
 
+Cygwin `cygpath -w` rewrites literal wildcard characters such as `*` into
+private-use Unicode code points. For RTKLIB wildcard arguments, convert only the
+parent directory and append the wildcard filename unchanged so RTKLIB receives a
+real `*`.
+
 Explicit tool paths must win over search directories. In particular,
 `--crx2rnx ./crx2rnx.exe` and other relative or absolute paths must be resolved
 as local paths before considering `--rtklib-dir`; only bare tool names should be

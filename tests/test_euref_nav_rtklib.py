@@ -794,6 +794,43 @@ def test_cygwin_pe_binary_without_exe_suffix_uses_windows_argument_paths(tmp_pat
     assert args[-3:] == ["C:\\out\\rover.obs", "C:\\base\\base.rnx", "C:\\out\\rover-gps.nav"]
 
 
+def test_cygwin_wildcard_path_preserves_asterisk(monkeypatch):
+    monkeypatch.setattr(rtklib.sys, "platform", "cygwin")
+    calls: list[str] = []
+
+    def fake_cygpath(flag: str, value: str) -> str | None:
+        calls.append(value)
+        if "*" in value:
+            return "C:\\bad\\base-\uf02a.rnx"
+        return "C:\\" + value.replace("/", "\\")
+
+    monkeypatch.setattr(rtklib, "_run_cygpath", fake_cygpath)
+
+    converted = path_for_rtklib_argument(Path("run/rover.rtklib-base/base-*.rnx"), "windows")
+
+    assert converted == "C:\\run\\rover.rtklib-base\\base-*.rnx"
+    assert calls == ["run/rover.rtklib-base"]
+
+
+def test_cygwin_build_command_preserves_base_wildcard_asterisk(tmp_path: Path, monkeypatch):
+    tool = tmp_path / "rnx2rtkp"
+    tool.write_bytes(b"MZwindows-binary-placeholder")
+    monkeypatch.setattr(rtklib.sys, "platform", "cygwin")
+    monkeypatch.setattr(rtklib, "_run_cygpath", lambda flag, value: "C:\\" + value.replace("/", "\\"))
+
+    args = build_rnx2rtkp_command(
+        rnx2rtkp=str(tool),
+        rtkconf=Path("um980.conf"),
+        output_file=Path("run/out.nmea"),
+        rover_obs=Path("run/rover.obs"),
+        base_obs=[Path("run/base-0000.rnx"), Path("run/base-0001.rnx")],
+        base_obs_arg=Path("run/rover.rtklib-base/base-*.rnx"),
+        nav_files=[Path("run/rover-gps.nav")],
+    )
+
+    assert args[-2] == "C:\\run\\rover.rtklib-base\\base-*.rnx"
+
+
 def test_rtklib_dir_resolves_bare_tool_name_only():
     assert resolve_rtklib_tool("rnx2rtkp.exe", rtklib_dir="/opt/rtklib") == "/opt/rtklib/rnx2rtkp.exe"
     assert resolve_rtklib_tool("/custom/rnx2rtkp", rtklib_dir="/opt/rtklib") == "/custom/rnx2rtkp"

@@ -274,7 +274,9 @@ When several base RINEX files are retained, the pipeline stages exactly those
 files into `<basename>.rtklib-base/` and passes one wildcard argument to
 `rnx2rtkp`. The wildcard is passed directly to RTKLIB, not expanded by the
 shell, because RTKLIB expects the base station observation input as the second
-positional argument.
+positional argument. On Cygwin, the directory part is converted to a Windows
+path while the `*` itself is preserved, because `cygpath` maps literal wildcard
+characters to private-use Unicode code points.
 
 Base download planning uses the recorded rover observation time span and
 requests every hourly or 15 minute product that overlaps or touches that span.

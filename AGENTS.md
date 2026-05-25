@@ -15,6 +15,9 @@
   Windows paths passed to Windows RTKLIB executables. Windows RTKLIB binaries
   on Cygwin may be PE files without an `.exe` suffix; do not rely only on file
   extension for path-style detection.
+- Cygwin wildcard arguments must preserve literal `*` characters for RTKLIB.
+  Do not run the full wildcard path through `cygpath`; convert the parent
+  directory and append the wildcard filename unchanged.
 - Termux executable mirroring must only run under Termux/Android. Never rewrite
   Cygwin or desktop RTKLIB executable paths into `/data/data/com.termux/...`.
 - Explicit RTKLIB helper paths, such as `--crx2rnx ./crx2rnx.exe`, must be

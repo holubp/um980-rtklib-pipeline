@@ -182,7 +182,9 @@ pipeline stages those exact files into `<basename>.rtklib-base/` and passes
 `<basename>.rtklib-base/base-*.rnx` or the matching suffix as one argument to
 `rnx2rtkp`. This wildcard is quoted in the generated wrapper and subprocess
 argv, so the shell does not expand it; RTKLIB expands it internally as the
-single base observation input.
+single base observation input. On Cygwin, wildcard conversion preserves `*` by
+converting only the directory part through `cygpath` and appending the wildcard
+filename unchanged.
 
 The integrated pipeline defaults to `--rinex-compat convbin` for the rover OBS
 file passed to RTKLIB. Standalone `rinex` keeps the broader native ordering by

@@ -135,6 +135,8 @@ def path_for_rtklib_argument(path: Path, style: Literal["unix", "windows"]) -> s
     if is_windows_path(value):
         return value.replace("/", "\\")
     if is_cygwin():
+        if has_unresolved_wildcard(path):
+            return cygwin_wildcard_to_windows(path)
         converted = _run_cygpath("-w", value)
         if converted:
             return converted
@@ -144,6 +146,22 @@ def path_for_rtklib_argument(path: Path, style: Literal["unix", "windows"]) -> s
     if sys.platform == "win32":
         return str(Path(value))
     return value
+
+
+def cygwin_wildcard_to_windows(path: Path) -> str:
+    """Convert a Cygwin wildcard path while preserving wildcard characters."""
+
+    parent = path.parent
+    parent_value = str(parent if str(parent) else Path("."))
+    if parent_value == ".":
+        parent_value = "."
+    converted_parent = _run_cygpath("-w", parent_value)
+    if converted_parent:
+        return converted_parent.rstrip("\\/") + "\\" + path.name
+    cygdrive = cygdrive_to_windows(parent_value)
+    if cygdrive:
+        return cygdrive.rstrip("\\/") + "\\" + path.name
+    return str(path).replace("/", "\\")
 
 
 def executable_for_subprocess(executable: str) -> str:
