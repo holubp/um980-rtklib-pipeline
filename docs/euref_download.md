@@ -20,10 +20,19 @@ repeatable/offline reruns. If EPN lookup is not requested or fails in auto mode,
 the pipeline falls back to the base RINEX `APPROX POSITION XYZ` header. Explicit
 `--base-ecef X Y Z` and `--base-llh LAT LON HEIGHT` always take precedence.
 
-BKG EUREF NRT and high-rate downloads use the public `ftp://igs.bkg.bund.de/EUREF/...`
-paths used by the archived helper scripts. BEV NRT downloads use the BEV FTP
-service. Known noisy alternatives that failed in manual logs, such as BEV
-hourly `.rnx.gz` mirrors and BKG `root_ftp` HTTPS paths, are not planned.
+BKG EUREF NRT and high-rate downloads use the current BKG GDC public archive
+paths. HTTPS under `https://igs.bkg.bund.de/root_ftp/` is planned first because
+BKG documents it as the preferred download access; anonymous FTP under
+`ftp://igs-ftp.bkg.bund.de/` is planned as a fallback mirror for the same BKG
+directory layout. High-rate BKG RINEX 3 planning uses verified `_S_` 15-minute
+stream-derived names. For example, on 2026 day 143 the BKG HTTPS and FTP
+mirrors both contain `CPAR00CZE_S_20261430530_15M_01S_MO.crx.gz`, while TUBO
+is absent from that high-rate interval and must fall back to low-rate data.
+BKG URLs are preflighted against the public directory index before download, so
+missing station/rate combinations are reported once instead of producing one
+download warning per missing 15-minute file and mirror.
+BEV NRT downloads keep using the BEV FTP service for hourly
+Hatanaka-compressed `.crx.gz` products.
 
 ## Rate and RINEX Version Selection
 

@@ -11,11 +11,14 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+from .badsat import BadSatConfig, choose_bad_sats, compute_sat_metrics, parse_rtklib_stat
+from .badsat_report import write_badsat_json_report, write_badsat_markdown_report
 from .config import deep_get, load_config
 from .euref import (
     BasePosition,
     download_urls,
     fetch_epn_station_position,
+    filter_urls_by_remote_listing,
     normalise_rinex_file,
     parse_rinex_approx_position,
     planned_urls,
@@ -40,6 +43,7 @@ from .quality import build_analysis, write_analysis_json
 from .rinex_nav import extract_rover_nav, rover_nav_files
 from .rinex_obs import observations_for_rinex, write_rinex_obs
 from .rtklib import executable_exists, executable_for_subprocess, format_command, resolve_rtklib_tool, run_rnx2rtkp
+from .rtklib_config_patch import patch_config_with_autoqc
 from .solution import (
     SolutionPoint,
     extract_solutions,
@@ -380,7 +384,15 @@ def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base
     parser.add_argument("--crx2rnx")
     parser.add_argument("--rtkconf")
     parser.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
-    parser.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
+    parser.add_argument(
+        "--output-format",
+        choices=["nmea", "pos", "llh"],
+        default="pos",
+        help=(
+            "RTKLIB solution output format. pos is the standard .pos file suffix "
+            "for LLH content; nmea passes rnx2rtkp -n, not only a .nmea filename suffix."
+        ),
+    )
     parser.add_argument("--base-obs", action="append", required=require_base_obs)
     parser.add_argument(
         "--rtk-pos-mode",
@@ -428,6 +440,35 @@ def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base
         default=[],
         help="Additional raw rnx2rtkp argument. Repeat for each token, e.g. --rnx2rtkp-option=-x --rnx2rtkp-option=4.",
     )
+    parser.add_argument(
+        "--rtklib-trace-level",
+        type=int,
+        choices=range(0, 6),
+        metavar="0..5",
+        help="Pass rnx2rtkp -x LEVEL to write a debug trace file, e.g. 4 for AR/residual diagnostics.",
+    )
+    parser.add_argument(
+        "--rtklib-stat-level",
+        type=int,
+        choices=[0, 1, 2],
+        metavar="0..2",
+        help="Pass rnx2rtkp -y LEVEL to write solution status details; 2 includes residuals.",
+    )
+    _add_auto_sat_qc_args(parser)
+
+
+def _add_auto_sat_qc_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--auto-sat-qc",
+        action="store_true",
+        help="Run explicit two-pass RTKLIB `.stat` based satellite QC. Requires --rtkconf.",
+    )
+    parser.add_argument("--auto-sat-qc-source", choices=["stat"], default="stat")
+    parser.add_argument("--max-auto-exclude", type=int, default=4)
+    parser.add_argument("--max-high-el-exclude", type=int, default=1)
+    parser.add_argument("--max-low-el-exclude", type=int, default=3)
+    parser.add_argument("--min-remaining-sats", type=int, default=9)
+    parser.add_argument("--min-remaining-constellations", type=int, default=2)
 
 
 def _base_download_attempts(args: argparse.Namespace) -> list[tuple[str, str, str, str]]:
@@ -517,7 +558,14 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
                 rate,
                 version,
             )
-            downloaded = download_urls(urls, cache_dir, force=args.force_download)
+            listed_urls = filter_urls_by_remote_listing(urls, cache_dir, force=args.force_download)
+            if len(listed_urls) != len(urls):
+                logging.info(
+                    "remote listing preflight retained %d of %d planned EUREF URLs",
+                    len(listed_urls),
+                    len(urls),
+                )
+            downloaded = download_urls(listed_urls, cache_dir, force=args.force_download)
             for path in downloaded:
                 logging.info("resolved EUREF base candidate: %s", path)
             crx2rnx = _resolve_crx2rnx_for_download(args, downloaded)
@@ -615,7 +663,51 @@ def _generated_rtk_options(args: argparse.Namespace) -> list[str]:
         options.append("-i")
     elif args.rtk_ar_mode == "fix-and-hold":
         options.append("-h")
+    options.extend(_rtklib_command_override_options(args))
     options.extend(getattr(args, "rnx2rtkp_option", []) or [])
+    return options
+
+
+def _rtklib_command_override_options(args: argparse.Namespace) -> list[str]:
+    """Return named RTKLIB command-line overrides that also apply with configs."""
+
+    return _rtklib_output_format_options(args) + _rtklib_debug_output_options(args)
+
+
+def _rtklib_output_format_options(args: argparse.Namespace) -> list[str]:
+    """Return `rnx2rtkp` options required by `--output-format`.
+
+    Args:
+        args: CLI arguments containing `output_format`.
+
+    Returns:
+        Command-line option tokens that make RTKLIB produce the requested
+        content, not just the requested output filename suffix.
+
+    Raises:
+        ValueError: If an unsupported output format reaches this helper.
+    """
+
+    output_format = getattr(args, "output_format", "pos")
+    if output_format == "nmea":
+        return ["-n"]
+    if output_format in {"pos", "llh"}:
+        # RTKLIB calls normal latitude/longitude/height solution content `llh`.
+        # `pos` is the conventional filename suffix used for that default.
+        return []
+    raise ValueError(f"unsupported --output-format {output_format!r}")
+
+
+def _rtklib_debug_output_options(args: argparse.Namespace) -> list[str]:
+    """Return `rnx2rtkp` trace/stat options requested for solution debugging."""
+
+    options: list[str] = []
+    trace_level = getattr(args, "rtklib_trace_level", None)
+    if trace_level is not None:
+        options.extend(["-x", str(trace_level)])
+    stat_level = getattr(args, "rtklib_stat_level", None)
+    if stat_level is not None:
+        options.extend(["-y", str(stat_level)])
     return options
 
 
@@ -635,11 +727,14 @@ def _rtk_navsys_arg(args: argparse.Namespace) -> str:
 def _rtklib_config_and_options(args: argparse.Namespace) -> tuple[Path | None, list[str] | None]:
     """Resolve RTKLIB config-file mode versus generated command-line mode."""
 
-    extra_options = getattr(args, "rnx2rtkp_option", []) or []
     if args.rtkconf:
-        if extra_options:
-            logging.info("using --rtkconf plus %d additional raw rnx2rtkp option tokens", len(extra_options))
-            return Path(args.rtkconf), list(extra_options)
+        override_options = _rtklib_command_override_options(args) + (getattr(args, "rnx2rtkp_option", []) or [])
+        if override_options:
+            logging.info(
+                "using --rtkconf plus %d rnx2rtkp command-line override tokens",
+                len(override_options),
+            )
+            return Path(args.rtkconf), override_options
         logging.info("using RTKLIB configuration file: %s", args.rtkconf)
         return Path(args.rtkconf), None
     generated = _generated_rtk_options(args)
@@ -649,6 +744,212 @@ def _rtklib_config_and_options(args: argparse.Namespace) -> tuple[Path | None, l
         " ".join(generated),
     )
     return None, generated
+
+
+def _run_rtklib_with_optional_auto_qc(
+    *,
+    args: argparse.Namespace,
+    rnx2rtkp: str,
+    rtkconf: Path | None,
+    output_file: Path,
+    rover_obs: Path,
+    base_obs: list[Path],
+    nav_files: list[Path],
+    base_obs_arg: Path | None,
+    rtk_options: list[str] | None,
+    base_ecef: tuple[float, float, float] | None,
+    base_llh: tuple[float, float, float] | None,
+):
+    """Run one-pass RTKLIB or explicit two-pass auto-satellite-QC."""
+
+    if not getattr(args, "auto_sat_qc", False):
+        return run_rnx2rtkp(
+            rnx2rtkp=rnx2rtkp,
+            rtkconf=rtkconf,
+            output_file=output_file,
+            rover_obs=rover_obs,
+            base_obs=base_obs,
+            nav_files=nav_files,
+            base_obs_arg=base_obs_arg,
+            rtk_options=rtk_options,
+            base_ecef_xyz_m=base_ecef,
+            base_llh=base_llh,
+            path_style=args.rtklib_path_style,
+            dry_run=args.dry_run,
+            debug=_debug_enabled(args),
+        )
+    return _run_auto_sat_qc(
+        args=args,
+        rnx2rtkp=rnx2rtkp,
+        rtkconf=rtkconf,
+        output_file=output_file,
+        rover_obs=rover_obs,
+        base_obs=base_obs,
+        nav_files=nav_files,
+        base_obs_arg=base_obs_arg,
+        rtk_options=rtk_options,
+        base_ecef=base_ecef,
+        base_llh=base_llh,
+    )
+
+
+def _run_auto_sat_qc(
+    *,
+    args: argparse.Namespace,
+    rnx2rtkp: str,
+    rtkconf: Path | None,
+    output_file: Path,
+    rover_obs: Path,
+    base_obs: list[Path],
+    nav_files: list[Path],
+    base_obs_arg: Path | None,
+    rtk_options: list[str] | None,
+    base_ecef: tuple[float, float, float] | None,
+    base_llh: tuple[float, float, float] | None,
+):
+    """Run explicit two-pass satellite QC from RTKLIB `.stat` evidence."""
+
+    if args.auto_sat_qc_source != "stat":
+        raise ValueError("only --auto-sat-qc-source stat is supported")
+    if rtkconf is None:
+        raise ValueError("--auto-sat-qc requires --rtkconf; use um980-autoqc-baseline.conf for pass 1")
+    root = output_file.with_suffix("") if output_file.suffix else output_file
+    suffix = output_file.suffix or ".pos"
+    pass1_output = root.parent / f"{root.name}.pass1{suffix}"
+    pass1_stat = root.parent / f"{root.name}.pass1.stat"
+    final_stat = root.with_suffix(".stat")
+    derived_config = root.parent / f"{root.name}.autoqc.derived.conf"
+    report_md = root.parent / f"{root.name}.autoqc.report.md"
+    report_json = root.parent / f"{root.name}.autoqc.report.json"
+    stat_options = _rtklib_options_with_stat_level(rtk_options, 2)
+    logging.info("auto-sat-qc: enabled explicitly by user")
+    logging.info("auto-sat-qc: pass 1 config: %s", rtkconf)
+    logging.info("auto-sat-qc: pass 1 stat: %s", pass1_stat)
+    pass1_command = run_rnx2rtkp(
+        rnx2rtkp=rnx2rtkp,
+        rtkconf=rtkconf,
+        output_file=pass1_output,
+        rover_obs=rover_obs,
+        base_obs=base_obs,
+        nav_files=nav_files,
+        base_obs_arg=base_obs_arg,
+        rtk_options=stat_options,
+        base_ecef_xyz_m=base_ecef,
+        base_llh=base_llh,
+        path_style=args.rtklib_path_style,
+        dry_run=args.dry_run,
+        debug=_debug_enabled(args),
+    )
+    if args.dry_run:
+        logging.info("auto-sat-qc: dry-run stopped before stat parsing")
+        return pass1_command
+    _move_rtklib_stat(pass1_output, pass1_stat)
+    observations = parse_rtklib_stat(pass1_stat)
+    if not observations:
+        raise ValueError(f"auto-sat-qc: pass 1 stat contains no $SAT rows: {pass1_stat}")
+    metrics = compute_sat_metrics(observations)
+    config = BadSatConfig(
+        max_auto_exclude=args.max_auto_exclude,
+        max_high_el_exclude=args.max_high_el_exclude,
+        max_low_el_exclude=args.max_low_el_exclude,
+        min_remaining_sats=args.min_remaining_sats,
+        min_remaining_constellations=args.min_remaining_constellations,
+    )
+    decision = choose_bad_sats(metrics, config)
+    _log_auto_qc_decision(decision)
+    patch_config_with_autoqc(
+        base_config=rtkconf,
+        out_config=derived_config,
+        exclude_sats=decision.exclude_sats,
+        recommended_elmask=decision.recommended_elmask,
+        source_stat=pass1_stat,
+        watch_sats=decision.watch_sats,
+    )
+    write_badsat_markdown_report(report_md, decision)
+    write_badsat_json_report(report_json, decision)
+    logging.info("auto-sat-qc: derived config written: %s", derived_config)
+    logging.info("auto-sat-qc: report written: %s", report_md)
+    logging.info("auto-sat-qc: running pass 2 with derived config")
+    command = run_rnx2rtkp(
+        rnx2rtkp=rnx2rtkp,
+        rtkconf=derived_config,
+        output_file=output_file,
+        rover_obs=rover_obs,
+        base_obs=base_obs,
+        nav_files=nav_files,
+        base_obs_arg=base_obs_arg,
+        rtk_options=stat_options,
+        base_ecef_xyz_m=base_ecef,
+        base_llh=base_llh,
+        path_style=args.rtklib_path_style,
+        dry_run=False,
+        debug=_debug_enabled(args),
+    )
+    _move_rtklib_stat(output_file, final_stat)
+    return command
+
+
+def _rtklib_options_with_stat_level(options: list[str] | None, level: int) -> list[str]:
+    """Return RTKLIB options with a single `-y LEVEL` entry."""
+
+    result: list[str] = []
+    skip_next = False
+    for item in options or []:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "-y":
+            skip_next = True
+            continue
+        result.append(item)
+    result.extend(["-y", str(level)])
+    return result
+
+
+def _move_rtklib_stat(output_file: Path, target: Path) -> None:
+    """Move RTKLIB's default appended `.stat` file to the requested path."""
+
+    source = Path(str(output_file) + ".stat")
+    if not source.exists():
+        raise FileNotFoundError(f"RTKLIB stat output was not created: {source}")
+    if source != target:
+        source.replace(target)
+
+
+def _log_auto_qc_decision(decision) -> None:
+    if decision.exclude_sats or decision.recommended_elmask is not None:
+        elmask = (
+            f"elmask -> {decision.recommended_elmask:g}"
+            if decision.recommended_elmask is not None
+            else "elmask unchanged"
+        )
+        logging.info(
+            "auto-sat-qc: selected actions: %s; exclude %s; watch %s",
+            elmask,
+            " ".join(decision.exclude_sats) or "none",
+            " ".join(decision.watch_sats) or "none",
+        )
+    else:
+        logging.info("auto-sat-qc: no satellite exclusions selected; no elevation-mask change selected")
+        logging.info("auto-sat-qc: derived config still written for reproducibility")
+    for metric in decision.metrics:
+        if metric.watch_score <= 0 and metric.hard_score <= 0:
+            continue
+        blocked = ";".join(decision.blocked_reasons.get(metric.sat, [])) or "none"
+        logging.debug(
+            "auto-sat-qc: %s hard_score=%.1f watch_score=%.1f mean_el=%.1f combined_p95=%.2f "
+            "phase_p95=%.3f residual_gt5=%d rej_delta=%d blocked=%s reasons=%s",
+            metric.sat,
+            metric.hard_score,
+            metric.watch_score,
+            metric.mean_el,
+            metric.combined_p95,
+            metric.phase_p95,
+            metric.residual_gt5,
+            metric.rej_delta,
+            blocked,
+            ";".join(metric.reasons) or "none",
+        )
 
 
 def _prepare_rtklib_base_obs_argument(base_obs: list[Path], out_dir: Path, basename: str) -> Path | None:
@@ -1052,7 +1353,8 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     rtkconf, rtk_options = _rtklib_config_and_options(args)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
     logging.info("running RTKLIB postprocessing")
-    command = run_rnx2rtkp(
+    command = _run_rtklib_with_optional_auto_qc(
+        args=args,
         rnx2rtkp=rnx2rtkp,
         rtkconf=rtkconf,
         output_file=out_dir / f"{base}-rtk.{args.output_format}",
@@ -1061,11 +1363,8 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav),
         base_obs_arg=base_obs_arg,
         rtk_options=rtk_options,
-        base_ecef_xyz_m=base_ecef,
+        base_ecef=base_ecef,
         base_llh=base_llh,
-        path_style=args.rtklib_path_style,
-        dry_run=args.dry_run,
-        debug=_debug_enabled(args),
     )
     logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
     print(format_command(command.args))
@@ -1144,7 +1443,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     rtkconf, rtk_options = _rtklib_config_and_options(args)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
     logging.info("running RTKLIB postprocessing")
-    command = run_rnx2rtkp(
+    command = _run_rtklib_with_optional_auto_qc(
+        args=args,
         rnx2rtkp=rnx2rtkp,
         rtkconf=rtkconf,
         output_file=out_dir / f"{base}-rtk.{args.output_format}",
@@ -1153,11 +1453,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + generated_rover_nav),
         base_obs_arg=base_obs_arg,
         rtk_options=rtk_options,
-        base_ecef_xyz_m=base_ecef,
+        base_ecef=base_ecef,
         base_llh=base_llh,
-        path_style=args.rtklib_path_style,
-        dry_run=args.dry_run,
-        debug=_debug_enabled(args),
     )
     logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
     print(format_command(command.args))
@@ -1297,7 +1594,15 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--convbin")
     pipe.add_argument("--rtkconf")
     pipe.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
-    pipe.add_argument("--output-format", choices=["nmea", "pos", "llh"], default="pos")
+    pipe.add_argument(
+        "--output-format",
+        choices=["nmea", "pos", "llh"],
+        default="pos",
+        help=(
+            "RTKLIB solution output format. pos is the standard .pos file suffix "
+            "for LLH content; nmea passes rnx2rtkp -n, not only a .nmea filename suffix."
+        ),
+    )
     pipe.add_argument("--rtk-pos-mode", choices=sorted(RTK_POS_MODE_CODES), default="kinematic")
     pipe.add_argument("--rtk-frequency", choices=sorted(RTK_FREQUENCY_CODES), default="l1+l2+l5")
     pipe.add_argument("--navsys", choices=sorted(RTK_NAVSYS_PRESETS), default="all")
@@ -1306,6 +1611,21 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--rtk-soltype", choices=["forward", "backward", "combined"], default="combined")
     pipe.add_argument("--rtk-ar-mode", choices=["continuous", "instantaneous", "fix-and-hold"], default="continuous")
     pipe.add_argument("--rnx2rtkp-option", action="append", default=[])
+    pipe.add_argument(
+        "--rtklib-trace-level",
+        type=int,
+        choices=range(0, 6),
+        metavar="0..5",
+        help="Pass rnx2rtkp -x LEVEL to write a debug trace file, e.g. 4 for AR/residual diagnostics.",
+    )
+    pipe.add_argument(
+        "--rtklib-stat-level",
+        type=int,
+        choices=[0, 1, 2],
+        metavar="0..2",
+        help="Pass rnx2rtkp -y LEVEL to write solution status details; 2 includes residuals.",
+    )
+    _add_auto_sat_qc_args(pipe)
     pipe.add_argument("--obs-csv", action="store_true", default=True)
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")

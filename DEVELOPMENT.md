@@ -34,6 +34,23 @@ passed to RTKLIB tools. Cygwin with Windows `.exe` tools usually requires
 Windows-style input paths, while native Linux/Cygwin builds require Unix paths.
 Keep `--rtklib-path-style` behavior covered by tests.
 
+## RTKLIB Post-Processing
+
+Keep generated `rnx2rtkp` options as a portable fallback. Quality-sensitive
+work should use explicit config files such as `um980.conf` or
+`um980-autoqc-baseline.conf`.
+
+The optional two-pass satellite QC path is split into reusable modules:
+
+- `badsat.py` parses RTKLIB `.stat` `$SAT` rows and selects conservative
+  exclusions/watch-list entries.
+- `rtklib_config_patch.py` writes the exact derived RTKLIB config used for pass
+  2.
+- `badsat_report.py` writes Markdown and JSON reports.
+
+Do not make automatic satellite QC implicit. It must require `--auto-sat-qc`,
+write pass-1 stat evidence, and keep the derived config inspectable.
+
 ## EUREF Fixtures
 
 Keep `test-euref.zip`, downloaded station observations, and RTKLIB-ex source/bin
@@ -41,3 +58,8 @@ trees out of git. Use the archived helper scripts only to verify URL naming
 conventions; live servers may not publish every legacy RINEX 2 or high-rate
 product for a given station/time. Missing products must warn with the attempted
 URLs before fallback or failure.
+
+BKG URL templates must be verified against public directory listings and sample
+files before being added. BKG high-rate downloads preflight the directory index
+so missing station/time combinations fall back with one clear warning rather
+than one failed download per 15-minute file and mirror.

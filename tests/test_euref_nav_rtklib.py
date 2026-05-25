@@ -10,6 +10,7 @@ from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline.euref import (
     _run_crx2rnx,
     download_urls,
+    filter_urls_by_remote_listing,
     normalise_rinex_file,
     parse_epn_station_position,
     parse_rinex_approx_position,
@@ -73,6 +74,88 @@ def test_postprocess_no_longer_requires_rtklib_config_file():
     assert cli._generated_rtk_options(args)[0:4] == ["-p", "2", "-f", "3"]
 
 
+def test_generated_rtk_options_request_real_nmea_output():
+    parser = cli.build_parser()
+    args = parser.parse_args(["pipeline", "rover.unc", "--output-format", "nmea"])
+
+    assert "-n" in cli._generated_rtk_options(args)
+
+
+def test_rtkconf_nmea_output_adds_command_line_override():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--rtkconf",
+            "um980.conf",
+            "--output-format",
+            "nmea",
+        ]
+    )
+
+    rtkconf, rtk_options = cli._rtklib_config_and_options(args)
+
+    assert rtkconf == Path("um980.conf")
+    assert rtk_options == ["-n"]
+
+
+def test_raw_rnx2rtkp_options_can_override_generated_output_format():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--output-format",
+            "nmea",
+            "--rnx2rtkp-option=-e",
+        ]
+    )
+
+    assert cli._generated_rtk_options(args)[-2:] == ["-n", "-e"]
+
+
+def test_rtklib_trace_and_stat_levels_are_named_options():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--rtklib-trace-level",
+            "4",
+            "--rtklib-stat-level",
+            "2",
+        ]
+    )
+
+    assert cli._generated_rtk_options(args)[-4:] == ["-x", "4", "-y", "2"]
+
+
+def test_rtkconf_keeps_trace_and_stat_command_line_overrides():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "postprocess",
+            "rover.unc",
+            "--rover-obs",
+            "rover.obs",
+            "--base-obs",
+            "base.obs",
+            "--rtkconf",
+            "um980.conf",
+            "--rtklib-trace-level",
+            "4",
+            "--rtklib-stat-level",
+            "2",
+        ]
+    )
+
+    rtkconf, rtk_options = cli._rtklib_config_and_options(args)
+
+    assert rtkconf == Path("um980.conf")
+    assert rtk_options == ["-x", "4", "-y", "2"]
+
+
 def test_rinex_v2_url_planning():
     urls = planned_urls(
         station="tubo",
@@ -107,8 +190,29 @@ def test_highrate_url_planning_includes_only_touching_chunks():
         for url in urls
     ] == [
         "TUBO00CZE_S_20261422100_15M_01S_MO.crx.gz",
+        "TUBO00CZE_S_20261422100_15M_01S_MO.crx.gz",
+        "TUBO00CZE_S_20261422115_15M_01S_MO.crx.gz",
         "TUBO00CZE_S_20261422115_15M_01S_MO.crx.gz",
     ]
+    assert urls[0].startswith("https://igs.bkg.bund.de/root_ftp/EUREF/highrate/")
+    assert urls[1].startswith("ftp://igs-ftp.bkg.bund.de/EUREF/highrate/")
+
+
+def test_verified_bkg_highrate_sample_urls():
+    urls = planned_urls(
+        station="CPAR",
+        start=datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        end=datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        provider_name="bkg-euref-highrate",
+        base_rate="1s",
+        rinex_version="3",
+    )
+
+    assert urls == [
+        "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/2026/143/f/CPAR00CZE_S_20261430530_15M_01S_MO.crx.gz",
+        "ftp://igs-ftp.bkg.bund.de/EUREF/highrate/2026/143/f/CPAR00CZE_S_20261430530_15M_01S_MO.crx.gz",
+    ]
+    assert not any("_R_" in url for url in urls)
 
 
 def test_hourly_url_planning_uses_recorded_span_without_margin():
@@ -578,6 +682,49 @@ def test_download_urls_continues_after_failed_alternative(tmp_path: Path, monkey
     assert [path.name for path in paths] == ["present.rnx.gz"]
 
 
+def test_bkg_listing_preflight_skips_absent_highrate_station(tmp_path: Path, monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return b'<a href="CPAR00CZE_S_20261430530_15M_01S_MO.crx.gz">CPAR</a>'
+
+    monkeypatch.setattr("um980_rtklib_pipeline.euref.urlopen", lambda url, timeout: Response())
+    urls = [
+        "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/2026/143/f/TUBO00CZE_S_20261430530_15M_01S_MO.crx.gz",
+        "ftp://igs-ftp.bkg.bund.de/EUREF/highrate/2026/143/f/TUBO00CZE_S_20261430530_15M_01S_MO.crx.gz",
+    ]
+
+    with pytest.raises(RuntimeError, match="no planned BKG base observation files are listed"):
+        filter_urls_by_remote_listing(urls, tmp_path)
+
+
+def test_bkg_listing_preflight_keeps_verified_and_cached_urls(tmp_path: Path, monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return b'<a href="CPAR00CZE_S_20261430530_15M_01S_MO.crx.gz">CPAR</a>'
+
+    monkeypatch.setattr("um980_rtklib_pipeline.euref.urlopen", lambda url, timeout: Response())
+    cached = tmp_path / "TUBO00CZE_S_20261430530_15M_01S_MO.rnx"
+    cached.write_text("cached\n", encoding="ascii")
+    urls = [
+        "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/2026/143/f/CPAR00CZE_S_20261430530_15M_01S_MO.crx.gz",
+        "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/2026/143/f/TUBO00CZE_S_20261430530_15M_01S_MO.crx.gz",
+    ]
+
+    assert filter_urls_by_remote_listing(urls, tmp_path) == urls
+
+
 def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatch, caplog):
     caplog.set_level(logging.WARNING)
     attempts: list[str] = []
@@ -624,6 +771,7 @@ def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatc
         )
         return [low_file]
 
+    monkeypatch.setattr(cli, "filter_urls_by_remote_listing", lambda urls, cache_dir, *, force=False: urls)
     monkeypatch.setattr(cli, "download_urls", fake_download_urls)
     paths = cli._download_base_files(args)
     assert paths == [low_file]

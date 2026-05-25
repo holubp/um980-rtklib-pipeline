@@ -115,6 +115,54 @@ combined post-processing by default. Override those defaults with
 `--rtk-elevation-mask`, `--rtk-soltype`, `--rtk-ar-mode`, or repeated
 `--rnx2rtkp-option=TOKEN` arguments.
 
+`--output-format pos` is the conventional `.pos` suffix for RTKLIB's normal
+latitude/longitude/height content; in RTKLIB config files that content is
+called `out-solformat=llh`. `--output-format nmea` is an RTKLIB output-format
+request, not just a filename suffix. The pipeline adds `rnx2rtkp -n`, which is
+the command-line equivalent of `out-solformat=nmea`, even when `--rtkconf` is
+also supplied.
+
+Use `--rtklib-trace-level 4 --rtklib-stat-level 2` to produce the usual
+debugging equivalent of `rnx2rtkp -x 4 -y 2`. These named options are passed as
+command-line overrides in both generated-option mode and `--rtkconf` mode.
+
+## Two-Pass Satellite QC
+
+The pipeline supports an explicit opt-in two-pass mode:
+
+```bash
+um980-ppk pipeline rover.unc \
+  --download-base \
+  --station CPAR \
+  --rtkconf um980-autoqc-baseline.conf \
+  --auto-sat-qc \
+  --run-rtklib
+```
+
+This mode requires `--rtkconf`; use `um980-autoqc-baseline.conf` as the pass-1
+baseline unless intentionally testing another profile. Pass 1 enables RTKLIB
+solution-status residual output with `-y 2`, parses `$SAT` rows from the
+generated `.stat`, and applies conservative satellite QC rules. Pass 2 runs
+with an inspectable derived config. For an output stem `run`, the expected
+artefacts are:
+
+```text
+run.pass1.pos
+run.pass1.stat
+run.autoqc.derived.conf
+run.autoqc.report.md
+run.autoqc.report.json
+run.pos
+run.stat
+```
+
+The derived config may add `pos1-exclsats` and/or raise `pos1-elmask`. Safety
+limits default to `--max-auto-exclude 4`, `--max-high-el-exclude 1`,
+`--max-low-el-exclude 3`, `--min-remaining-sats 9`, and
+`--min-remaining-constellations 2`. Satellites that look suspicious but are
+blocked by caps or geometry protection are listed in the watch list instead of
+being excluded.
+
 `--base-resolution low` selects hourly 30 s EUREF data. `high` selects 1 s
 high-rate chunks and falls back to low-rate data with a warning when the
 high-rate files are unavailable. `--base-rinex-version 2` enables compact RINEX

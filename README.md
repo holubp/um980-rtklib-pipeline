@@ -206,6 +206,19 @@ that profile with `--rtk-pos-mode`, `--rtk-frequency`, `--navsys`,
 `--rtk-navsys`, `--rtk-elevation-mask`, `--rtk-soltype`, `--rtk-ar-mode`, or
 repeat `--rnx2rtkp-option=TOKEN` for raw RTKLIB options. Use `--rtkconf` when
 you want a full RTKLIB-EX config such as one distributed with RTKLIB-EX.
+`--output-format pos` uses the conventional `.pos` suffix for RTKLIB's default
+latitude/longitude/height content, which RTKLIB config files call
+`out-solformat=llh`. `--output-format nmea` passes RTKLIB's `-n` option,
+equivalent to setting `out-solformat=nmea`; it does not merely rename a `.pos`
+file to `.nmea`.
+For solution-quality debugging, add `--rtklib-trace-level 4
+--rtklib-stat-level 2`; these pass `rnx2rtkp -x 4 -y 2` and work with or
+without `--rtkconf`.
+For explicit diagnostic two-pass satellite QC, use `--auto-sat-qc` with a
+baseline config such as `um980-autoqc-baseline.conf`. This runs pass 1 with
+RTKLIB `.stat` residual output, writes `<stem>.autoqc.derived.conf` plus
+Markdown/JSON reports, then runs pass 2 with the derived config. It is
+intentionally opt-in and never runs by default.
 The repository includes `um980.conf`, an RTKLIB-ex/demo5 profile tuned for
 UM980 multi-constellation, multi-frequency PPK. It enables GPS, GLONASS,
 Galileo, and BeiDou with L1/L2/L5/L6 processing, dynamics, interpolation, and
@@ -223,6 +236,18 @@ um980-ppk pipeline rover.unc \
   --base-rinex-version 3 \
   --nav-file BRDC00WRD_R_20261380000_01D_MN.rnx \
   --rtkconf um980.conf \
+  --run-rtklib
+```
+
+Two-pass satellite QC example:
+
+```bash
+um980-ppk pipeline rover.unc \
+  --download-base \
+  --station CPAR \
+  --base-resolution high \
+  --rtkconf um980-autoqc-baseline.conf \
+  --auto-sat-qc \
   --run-rtklib
 ```
 

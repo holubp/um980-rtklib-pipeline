@@ -80,14 +80,17 @@ PROVIDERS = {
         "bkg_euref_nrt_v3_hourly",
         "obs",
         (
-            "ftp://igs.bkg.bund.de/EUREF/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.crx.gz",
+            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.crx.gz",
+            "ftp://igs-ftp.bkg.bund.de/EUREF/nrt/{doy}/{hh}/{station_long}_R_{yyyy}{doy}{hh}00_01H_30S_MO.crx.gz",
         ),
     ),
     "bkg-euref-highrate": Provider(
         "bkg_euref_highrate_v3",
         "obs",
         (
-            "ftp://igs.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station_long}_S_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
+            "ftp://igs-ftp.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
             "{station_long}_S_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
         ),
     ),
@@ -102,14 +105,17 @@ PROVIDERS = {
         "bkg_euref_nrt_v2_hourly",
         "obs",
         (
-            "ftp://igs.bkg.bund.de/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}d.Z",
+            "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}d.Z",
+            "ftp://igs-ftp.bkg.bund.de/EUREF/nrt/{doy}/{hh}/{station4}{doy}{hour_letter}.{yy}d.Z",
         ),
     ),
     "bkg-euref-highrate-v2": Provider(
         "bkg_euref_highrate_v2",
         "obs",
         (
-            "ftp://igs.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
+            "ftp://igs-ftp.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
             "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
         ),
     ),
@@ -321,6 +327,104 @@ def download_urls(urls: list[str], cache_dir: Path, *, retries: int = 1, force: 
             + "\n".join(f"- {url}" for url in urls)
         )
     return paths
+
+
+def filter_urls_by_remote_listing(
+    urls: list[str],
+    cache_dir: Path,
+    *,
+    force: bool = False,
+    timeout_s: float = 20.0,
+) -> list[str]:
+    """Drop BKG archive URLs whose directory listing proves they are absent.
+
+    Args:
+        urls: Planned source archive URLs.
+        cache_dir: Local cache directory used to preserve already cached files.
+        force: When true, ignore local cache and verify source listing anyway.
+        timeout_s: Maximum seconds for each remote directory listing request.
+
+    Returns:
+        URLs that are either already cached, not safely list-checkable, or listed
+        in the remote BKG directory.
+
+    Raises:
+        RuntimeError: If every planned URL was checked and found absent.
+    """
+
+    listings: dict[str, set[str] | None] = {}
+    filtered: list[str] = []
+    checked = 0
+    missing: list[str] = []
+    for url in urls:
+        target = cache_dir / url.rsplit("/", 1)[-1]
+        if not force and _cached_product_for_url_target(target) is not None:
+            filtered.append(url)
+            continue
+        listing_url = _bkg_listing_url_for(url)
+        if listing_url is None:
+            filtered.append(url)
+            continue
+        if listing_url not in listings:
+            listings[listing_url] = _fetch_directory_listing_names(listing_url, timeout_s=timeout_s)
+        names = listings[listing_url]
+        if names is None:
+            filtered.append(url)
+            continue
+        checked += 1
+        name = url.rsplit("/", 1)[-1]
+        if name in names:
+            filtered.append(url)
+        else:
+            missing.append(url)
+    if not filtered and checked:
+        raise RuntimeError(
+            "no planned BKG base observation files are listed in the public archive directories. "
+            "The station is likely unavailable for that rate/time range. "
+            + _summarise_url_list(missing, "checked URLs")
+        )
+    if missing:
+        logging.info("skipped %d BKG URLs not present in directory listings", len(missing))
+    return filtered
+
+
+def _summarise_url_list(urls: list[str], label: str, *, limit: int = 5) -> str:
+    """Return a compact multiline URL summary for logs/errors."""
+
+    shown = urls[:limit]
+    suffix = "" if len(urls) <= limit else f"\n... {len(urls) - limit} more {label}"
+    return f"{label}:\n" + "\n".join(f"- {url}" for url in shown) + suffix
+
+
+def _bkg_listing_url_for(url: str) -> str | None:
+    """Return the canonical BKG HTTPS directory listing URL for a source URL."""
+
+    directory = url.rsplit("/", 1)[0] + "/"
+    https_prefix = "https://igs.bkg.bund.de/root_ftp/"
+    ftp_prefix = "ftp://igs-ftp.bkg.bund.de/"
+    if directory.startswith(https_prefix):
+        return directory
+    if directory.startswith(ftp_prefix):
+        return https_prefix + directory[len(ftp_prefix) :]
+    return None
+
+
+def _fetch_directory_listing_names(listing_url: str, *, timeout_s: float) -> set[str] | None:
+    """Fetch filenames from a public Apache-style directory index."""
+
+    try:
+        with urlopen(listing_url, timeout=timeout_s) as response:  # noqa: S310 - explicit provider listing.
+            page = response.read().decode("utf-8", errors="ignore")
+    except Exception as exc:  # pragma: no cover - network dependent
+        logging.warning("could not verify BKG directory listing %s: %s; planned URLs will be tried directly", listing_url, exc)
+        return None
+    names = {
+        html.unescape(match)
+        for match in re.findall(r'href=["\']([^"\']+)["\']', page, flags=re.IGNORECASE)
+        if not match.endswith("/")
+    }
+    logging.info("verified BKG directory listing: %s (%d files)", listing_url, len(names))
+    return names
 
 
 def _cached_product_for_url_target(target: Path) -> Path | None:
