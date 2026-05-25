@@ -42,7 +42,14 @@ from .obs_decode import decode_observations, write_observations_csv
 from .quality import build_analysis, write_analysis_json
 from .rinex_nav import extract_rover_nav, rover_nav_files
 from .rinex_obs import observations_for_rinex, write_rinex_obs
-from .rtklib import executable_exists, executable_for_subprocess, format_command, resolve_rtklib_tool, run_rnx2rtkp
+from .rtklib import (
+    executable_exists,
+    executable_for_subprocess,
+    format_command,
+    is_windows_path,
+    resolve_rtklib_tool,
+    run_rnx2rtkp,
+)
 from .rtklib_config_patch import patch_config_with_autoqc
 from .solution import (
     SolutionPoint,
@@ -629,16 +636,54 @@ def _resolve_crx2rnx_for_download(args: argparse.Namespace, downloaded: list[Pat
     if not any(requires_crx2rnx(path) for path in downloaded):
         return args.crx2rnx
 
-    requested = args.crx2rnx or "crx2rnx"
-    candidate = resolve_rtklib_tool(requested, rtklib_dir=getattr(args, "rtklib_dir", None))
-    if not executable_exists(candidate):
+    candidate = _find_crx2rnx_candidate(args)
+    if candidate is None:
         raise RuntimeError(
             "crx2rnx is required to convert downloaded Hatanaka base observations before extraction; "
-            f"looked for {candidate}. Provide --crx2rnx or install RTKLIB-ex under ~/RTKLIB-ex-bin/bin."
+            "looked in --crx2rnx, --rtklib-dir, the current directory, ~/RTKLIB-ex-bin/bin, "
+            "build-tools/RTKLIB-ex-bin/bin, and PATH."
         )
     resolved = executable_for_subprocess(candidate)
     logging.info("using crx2rnx for Hatanaka conversion: %s", resolved)
     return resolved
+
+
+def _find_crx2rnx_candidate(args: argparse.Namespace) -> str | None:
+    """Find a usable `crx2rnx` converter for downloaded Hatanaka files."""
+
+    explicit = getattr(args, "crx2rnx", None)
+    rtklib_dir = getattr(args, "rtklib_dir", None)
+    if explicit:
+        if is_windows_path(explicit):
+            return explicit if executable_exists(explicit) else None
+        explicit_path = Path(explicit)
+        if explicit_path.parent != Path(".") or explicit.startswith("."):
+            explicit_candidate = explicit_path if explicit_path.is_absolute() else Path.cwd() / explicit_path
+            return str(explicit_candidate) if executable_exists(str(explicit_candidate)) else None
+        current_dir_candidate = str(Path.cwd() / explicit)
+        if executable_exists(current_dir_candidate):
+            return current_dir_candidate
+        candidate = resolve_rtklib_tool(explicit, rtklib_dir=rtklib_dir)
+        if executable_exists(candidate):
+            return candidate
+        return None
+
+    tool_names = ["crx2rnx", "crx2rnx.exe"]
+    candidates: list[str] = []
+    if rtklib_dir:
+        candidates.extend(str(Path(rtklib_dir) / name) for name in tool_names)
+    candidates.extend(str(Path.cwd() / name) for name in tool_names)
+    candidates.append(resolve_rtklib_tool("crx2rnx"))
+    candidates.append(resolve_rtklib_tool("crx2rnx.exe"))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if executable_exists(candidate):
+            return candidate
+    return None
 
 
 def _generated_rtk_options(args: argparse.Namespace) -> list[str]:

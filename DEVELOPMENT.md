@@ -34,6 +34,11 @@ passed to RTKLIB tools. Cygwin with Windows `.exe` tools usually requires
 Windows-style input paths, while native Linux/Cygwin builds require Unix paths.
 Keep `--rtklib-path-style` behavior covered by tests.
 
+Explicit tool paths must win over search directories. In particular,
+`--crx2rnx ./crx2rnx.exe` and other relative or absolute paths must be resolved
+as local paths before considering `--rtklib-dir`; only bare tool names should be
+combined with RTKLIB install directories.
+
 ## RTKLIB Post-Processing
 
 Keep generated `rnx2rtkp` options as a portable fallback. Quality-sensitive

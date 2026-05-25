@@ -569,6 +569,87 @@ def test_download_base_auto_resolves_crx2rnx_for_hatanaka_downloads(tmp_path: Pa
     assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == f"{tool}.run"
 
 
+def test_download_base_prefers_crx2rnx_from_rtklib_dir(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool = rtklib_dir / "crx2rnx"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx=None, rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_resolves_crx2rnx_from_current_directory(tmp_path: Path, monkeypatch):
+    tool = tmp_path / "crx2rnx"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx=None, rtklib_dir=None)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_resolves_explicit_bare_crx2rnx_from_current_directory(tmp_path: Path, monkeypatch):
+    tool = tmp_path / "crx2rnx"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx="crx2rnx", rtklib_dir=None)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool_name, rtklib_dir=None: tool_name)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_honors_explicit_relative_crx2rnx_before_rtklib_dir(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool = tmp_path / "crx2rnx.exe"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx="./crx2rnx.exe", rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_honors_explicit_subdir_crx2rnx_before_rtklib_dir(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool_dir = tmp_path / "tools"
+    tool_dir.mkdir()
+    tool = tool_dir / "crx2rnx.exe"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx="tools/crx2rnx.exe", rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_uses_crx2rnx_exe_from_rtklib_dir(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool = rtklib_dir / "crx2rnx.exe"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx=None, rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
 def test_download_base_rejects_hatanaka_without_crx2rnx_before_extraction(tmp_path: Path, monkeypatch):
     downloaded = tmp_path / "base.crx.gz"
     downloaded.write_bytes(b"not actually gzip")

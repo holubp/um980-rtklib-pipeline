@@ -306,6 +306,11 @@ RTKLIB tools are resolved in this order:
 4. repo-local `build-tools/RTKLIB-ex-bin/bin/`;
 5. system `PATH`.
 
+For Hatanaka base observations, `crx2rnx` is resolved separately from
+`--crx2rnx`, `--rtklib-dir`, the current directory, user-local/repo-local
+RTKLIB-ex installs, and `PATH`. Automatic discovery accepts both `crx2rnx` and
+`crx2rnx.exe`.
+
 The `build-tools/RTKLIB-ex-bin/` directory is intentionally ignored by git. It
 is a convenient local install location for manually built RTKLIB-ex binaries.
 On Android/Termux shared storage, files in this directory may not be directly

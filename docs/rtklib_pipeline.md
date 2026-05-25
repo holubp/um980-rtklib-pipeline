@@ -307,6 +307,10 @@ this order:
 4. `build-tools/RTKLIB-ex-bin/bin/`;
 5. system `PATH`.
 
+For downloaded Hatanaka base files, `crx2rnx` discovery also checks the current
+directory and considers `crx2rnx.exe` when no explicit `--crx2rnx` path is
+provided.
+
 On Android/Termux shared storage, the binaries in `build-tools/RTKLIB-ex-bin/`
 may be readable but not executable. In that case the pipeline copies the chosen
 tool to Termux-private temporary storage and runs the mirrored executable.
