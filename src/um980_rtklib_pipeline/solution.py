@@ -25,6 +25,8 @@ from .nmea import (
 )
 from .stream import StreamRecord
 
+PositionNmeaMode = Literal["all", "best"]
+
 
 @dataclass
 class SolutionPoint:
@@ -340,6 +342,75 @@ def write_lines(path: Path, lines: list[str]) -> None:
     """
 
     path.write_text("".join(line.rstrip("\r\n") + "\r\n" for line in lines), encoding="ascii", errors="ignore")
+
+
+def position_nmea_records(lines: list[str], mode: PositionNmeaMode = "best") -> list[str]:
+    """Return original NMEA position sentences.
+
+    Args:
+        lines: Checksum-valid or checksum-absent NMEA sentence lines.
+        mode: `all` keeps every usable position sentence; `best` keeps the
+            highest-information sentence per NMEA timestamp.
+
+    Returns:
+        Filtered original NMEA sentences containing position reports. GGA and
+        GNS are preferred over RMC in `best` mode because they carry fix
+        quality/mode information. Fractional timestamp text is preserved in the
+        grouping key, so multi-Hz position streams keep every epoch.
+    """
+
+    if mode == "all":
+        return [line for line in lines if _position_nmea_candidate(line) is not None]
+    if mode != "best":
+        raise ValueError(f"unsupported position NMEA mode: {mode}")
+
+    records: list[str] = []
+    current_key: str | None = None
+    current_best: tuple[int, str] | None = None
+    for line in lines:
+        candidate = _position_nmea_candidate(line)
+        if candidate is None:
+            continue
+        key, rank = candidate
+        if current_key is not None and key != current_key and current_best is not None:
+            records.append(current_best[1])
+            current_best = None
+        current_key = key
+        if current_best is None or rank > current_best[0]:
+            current_best = (rank, line)
+    if current_best is not None:
+        records.append(current_best[1])
+    return records
+
+
+def _position_nmea_candidate(line: str) -> tuple[str, int] | None:
+    parsed = parse_sentence(line)
+    if parsed is None:
+        return None
+    typ = sentence_type(parsed.talker_type)
+    fields = parsed.fields
+    if typ == "GGA":
+        if len(fields) < 6 or dm_to_decimal(fields[1], fields[2]) is None or dm_to_decimal(fields[3], fields[4]) is None:
+            return None
+        fix = int_or_none(fields[5]) or 0
+        if fix <= 0:
+            return None
+        return fields[0], 300 + fix
+    if typ == "GNS":
+        if len(fields) < 6 or dm_to_decimal(fields[1], fields[2]) is None or dm_to_decimal(fields[3], fields[4]) is None:
+            return None
+        modes = fields[5]
+        usable_modes = sum(1 for char in modes if char and char.upper() != "N")
+        if usable_modes <= 0:
+            return None
+        return fields[0], 250 + usable_modes
+    if typ == "RMC":
+        if len(fields) < 6 or fields[1] != "A":
+            return None
+        if dm_to_decimal(fields[2], fields[3]) is None or dm_to_decimal(fields[4], fields[5]) is None:
+            return None
+        return fields[0], 100
+    return None
 
 
 def write_solution_nmea(path: Path, points: list[SolutionPoint]) -> None:

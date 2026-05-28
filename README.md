@@ -166,6 +166,18 @@ Extract solution products and observations:
 um980-ppk extract rover.unc -v --analysis-json --obs-csv --solution all
 ```
 
+NMEA extraction writes:
+
+- `<basename>.all.nmea`: every checksum-valid original NMEA sentence.
+- `<basename>.position.nmea`: original position sentences only. By default,
+  `--position-nmea best` keeps the best sentence per NMEA timestamp, preferring
+  GGA/GNS over RMC because they carry fix quality or mode information. Fractional
+  timestamps are preserved, so multi-Hz position streams keep every epoch.
+- `<basename>.solution.nmea`: compact proprietary `PUM980Q` solution summaries.
+
+Use `--position-nmea all` to keep every valid GGA/GNS/RMC position sentence, or
+`--position-nmea none` to skip the compact original-position file.
+
 Create rover RINEX observation output:
 
 ```bash
@@ -221,17 +233,27 @@ log paths.
 For solution-quality debugging, add `--rtklib-trace-level 4
 --rtklib-stat-level 2`; these pass `rnx2rtkp -x 4 -y 2` and work with or
 without `--rtkconf`.
-For explicit diagnostic two-pass satellite QC, use `--auto-sat-qc` with a
-baseline config such as `um980-autoqc-baseline.conf`. This runs pass 1 with
-RTKLIB `.stat` residual output, writes `<stem>.autoqc.derived.conf` plus
-Markdown/JSON reports, then runs pass 2 with the derived config. It is
-intentionally opt-in and never runs by default.
-The repository includes `um980.conf`, an RTKLIB-ex/demo5 profile tuned for
-UM980 multi-constellation, multi-frequency PPK. It enables GPS, GLONASS,
-Galileo, and BeiDou with L1/L2/L5/L6 processing, dynamics, interpolation, and
-fix-and-hold ambiguity handling. Prefer `--rtkconf um980.conf` for serious
-UM980 post-processing; the generated command-line profile is mainly a portable
-fallback.
+## Bundled RTKLIB Configs
+
+The repository includes several RTKLIB-ex configs for different operating
+modes:
+
+- `um980-onepass-gps-gal-bds-el28.conf`: default choice for a reasonably
+  high-quality single-pass solution.
+- `um980.conf`: reference UM980 configuration for multi-constellation,
+  multi-frequency post-processing.
+- `um980-autoqc-baseline.conf`: baseline only for explicit `--auto-sat-qc`
+  two-pass runs. Do not use it as the normal one-pass config.
+- `um980-onepass-best-current-debug.conf`: debugging profile only. It is meant
+  for diagnostics and comparisons, not routine production processing.
+
+Use `--rtkconf` with one of these configs when you want a full RTKLIB-EX
+configuration. The generated command-line profile is mainly a portable
+fallback. For explicit diagnostic two-pass satellite QC, use `--auto-sat-qc`
+with `um980-autoqc-baseline.conf`. This runs pass 1 with RTKLIB `.stat`
+residual output, writes `<stem>.autoqc.derived.conf` plus Markdown/JSON reports,
+then runs pass 2 with the derived config. It is intentionally opt-in and never
+runs by default.
 
 Run the integrated pipeline with EUREF base download and RTKLIB execution:
 
@@ -242,7 +264,7 @@ um980-ppk pipeline rover.unc \
   --base-resolution high \
   --base-rinex-version 3 \
   --nav-file BRDC00WRD_R_20261380000_01D_MN.rnx \
-  --rtkconf um980.conf \
+  --rtkconf um980-onepass-gps-gal-bds-el28.conf \
   --run-rtklib
 ```
 
@@ -318,8 +340,9 @@ RTKLIB tools are resolved in this order:
 
 For Hatanaka base observations, `crx2rnx` is resolved separately from
 `--crx2rnx`, `--rtklib-dir`, the current directory, user-local/repo-local
-RTKLIB-ex installs, and `PATH`. Automatic discovery accepts both `crx2rnx` and
-`crx2rnx.exe`.
+RTKLIB-ex installs, and `PATH`. Explicit local paths such as
+`--crx2rnx ./crx2rnx` are resolved before `--rtklib-dir`; on Cygwin the matching
+`.exe` sibling is also considered.
 
 The `build-tools/RTKLIB-ex-bin/` directory is intentionally ignored by git. It
 is a convenient local install location for manually built RTKLIB-ex binaries.

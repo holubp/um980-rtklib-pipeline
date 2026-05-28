@@ -70,11 +70,11 @@ and Hatanaka `.crx`, `.d`, and `.YYd` files require `crx2rnx`. The CLI
 preflights this before extracting any downloaded Hatanaka files, so a missing
 converter fails without leaving a partially extracted cache. `crx2rnx` is
 resolved from `--crx2rnx`, `--rtklib-dir`, the current directory,
-`~/RTKLIB-ex-bin/bin`, `build-tools/RTKLIB-ex-bin/bin`, or PATH. Both
-`crx2rnx` and `crx2rnx.exe` are considered when the converter is discovered
-automatically. Conversion is run non-interactively with force-overwrite and
-timeout safeguards, so an existing `.rnx` file cannot hide an overwrite prompt
-inside the pipeline.
+`~/RTKLIB-ex-bin/bin`, `build-tools/RTKLIB-ex-bin/bin`, or PATH. Explicit local
+paths such as `--crx2rnx ./crx2rnx` are resolved before `--rtklib-dir`; on
+Cygwin the matching `.exe` sibling is also considered. Conversion is run
+non-interactively with force-overwrite and timeout safeguards, so an existing
+`.rnx` file cannot hide an overwrite prompt inside the pipeline.
 `--base-rinex-version auto` tries RINEX 3 before RINEX 2.
 
 The legacy `pfa2` short code appears in the archived v2 helper script and can be

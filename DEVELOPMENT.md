@@ -21,6 +21,11 @@ message is detected but not fully validated, report it as unsupported or warn
 clearly in analysis output. A plausible but wrong RINEX file is worse than a
 clear failure.
 
+Keep original NMEA sentence filtering structured. Position-only NMEA outputs
+should parse sentence fields, preserve original lines, keep fractional
+timestamps for multi-Hz data, and prefer GGA/GNS over RMC only when selecting a
+single best sentence for the same timestamp.
+
 Header-only RINEX NAV files are rejected. Rover ASCII `GPSEPHA`, `GLOEPHA`, and
 validated `GALEPHA` records may be written as non-empty RTKLIB-readable sidecar
 files. Missing, malformed, or unsupported ephemeris records must stay visible as

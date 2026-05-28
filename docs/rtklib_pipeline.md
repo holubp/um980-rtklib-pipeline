@@ -96,6 +96,19 @@ PYTHONPATH=src pytest -q
 available: extraction, rover RINEX OBS generation, optional EUREF base download,
 base position resolution, NAV validation, and `rnx2rtkp` execution.
 
+During extraction, NMEA outputs are split by purpose:
+
+- `<basename>.all.nmea` contains every checksum-valid original NMEA sentence.
+- `<basename>.position.nmea` contains original position sentences only. The
+  default `--position-nmea best` keeps the best GGA/GNS/RMC sentence per NMEA
+  timestamp, preferring GGA/GNS over RMC for fix-quality information and
+  preserving fractional timestamps for multi-Hz logs.
+- `<basename>.solution.nmea` contains compact proprietary `PUM980Q` solution
+  summaries.
+
+Use `--position-nmea all` to keep every valid original GGA/GNS/RMC position
+sentence, or `--position-nmea none` to suppress `<basename>.position.nmea`.
+
 ```bash
 um980-ppk pipeline rover.unc \
   --download-base \
@@ -128,6 +141,22 @@ solution data is treated as a runtime error.
 Use `--rtklib-trace-level 4 --rtklib-stat-level 2` to produce the usual
 debugging equivalent of `rnx2rtkp -x 4 -y 2`. These named options are passed as
 command-line overrides in both generated-option mode and `--rtkconf` mode.
+
+## Bundled RTKLIB Configs
+
+The repository includes several RTKLIB-ex configs with different intended use:
+
+- `um980-onepass-gps-gal-bds-el28.conf`: default choice for a reasonably
+  high-quality single-pass solution.
+- `um980.conf`: reference UM980 configuration for multi-constellation,
+  multi-frequency post-processing.
+- `um980-autoqc-baseline.conf`: baseline only for explicit `--auto-sat-qc`
+  two-pass runs. Do not use it as the normal one-pass config.
+- `um980-onepass-best-current-debug.conf`: debugging profile only. It is meant
+  for diagnostics and comparisons, not routine production processing.
+
+Use `--rtkconf` with one of these configs when you want a full RTKLIB-EX
+configuration. The generated command-line profile is mainly a portable fallback.
 
 ## Two-Pass Satellite QC
 

@@ -100,6 +100,13 @@ def test_rtkconf_nmea_output_adds_command_line_override():
     assert rtk_options == ["-n"]
 
 
+def test_extract_defaults_to_best_position_nmea_output():
+    parser = cli.build_parser()
+    args = parser.parse_args(["extract", "rover.unc"])
+
+    assert args.position_nmea == "best"
+
+
 def test_download_base_accepts_rtklib_dir_for_crx2rnx_discovery():
     parser = cli.build_parser()
     args = parser.parse_args(
@@ -699,6 +706,34 @@ def test_download_base_honors_explicit_relative_crx2rnx_before_rtklib_dir(tmp_pa
     assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
 
 
+def test_download_base_honors_explicit_relative_crx2rnx_without_exe_suffix(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool = tmp_path / "crx2rnx.exe"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx="./crx2rnx", rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_honors_explicit_backslash_relative_crx2rnx_on_cygwin(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool = tmp_path / "crx2rnx.exe"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx=".\\crx2rnx", rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
 def test_download_base_honors_explicit_subdir_crx2rnx_before_rtklib_dir(tmp_path: Path, monkeypatch):
     rtklib_dir = tmp_path / "rtklib"
     rtklib_dir.mkdir()
@@ -708,6 +743,22 @@ def test_download_base_honors_explicit_subdir_crx2rnx_before_rtklib_dir(tmp_path
     tool.write_text("#!/bin/sh\n")
     tool.chmod(0o755)
     args = argparse.Namespace(crx2rnx="tools/crx2rnx.exe", rtklib_dir=str(rtklib_dir))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)
+
+    assert cli._resolve_crx2rnx_for_download(args, [Path("base.crx.gz")]) == str(tool)
+
+
+def test_download_base_honors_explicit_subdir_crx2rnx_without_exe_suffix(tmp_path: Path, monkeypatch):
+    rtklib_dir = tmp_path / "rtklib"
+    rtklib_dir.mkdir()
+    tool_dir = tmp_path / "tools"
+    tool_dir.mkdir()
+    tool = tool_dir / "crx2rnx.exe"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    args = argparse.Namespace(crx2rnx="tools/crx2rnx", rtklib_dir=str(rtklib_dir))
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "executable_for_subprocess", lambda executable: executable)

@@ -54,6 +54,7 @@ from .rtklib_config_patch import patch_config_with_autoqc
 from .solution import (
     SolutionPoint,
     extract_solutions,
+    position_nmea_records,
     write_all_records_csv,
     write_gpx,
     write_lines,
@@ -658,13 +659,15 @@ def _find_crx2rnx_candidate(args: argparse.Namespace) -> str | None:
     if explicit:
         if is_windows_path(explicit):
             return explicit if executable_exists(explicit) else None
-        explicit_path = Path(explicit)
+        explicit_path = Path(explicit.replace("\\", "/"))
         if explicit_path.parent != Path(".") or explicit.startswith("."):
-            explicit_candidate = explicit_path if explicit_path.is_absolute() else Path.cwd() / explicit_path
-            return str(explicit_candidate) if executable_exists(str(explicit_candidate)) else None
-        current_dir_candidate = str(Path.cwd() / explicit)
-        if executable_exists(current_dir_candidate):
-            return current_dir_candidate
+            for explicit_candidate in _crx2rnx_path_candidates(explicit_path):
+                if executable_exists(str(explicit_candidate)):
+                    return str(explicit_candidate)
+            return None
+        for current_dir_candidate in _crx2rnx_path_candidates(Path.cwd() / explicit_path):
+            if executable_exists(str(current_dir_candidate)):
+                return str(current_dir_candidate)
         candidate = resolve_rtklib_tool(explicit, rtklib_dir=rtklib_dir)
         if executable_exists(candidate):
             return candidate
@@ -686,6 +689,15 @@ def _find_crx2rnx_candidate(args: argparse.Namespace) -> str | None:
         if executable_exists(candidate):
             return candidate
     return None
+
+
+def _crx2rnx_path_candidates(path: Path) -> list[Path]:
+    """Return exact and Windows-suffix variants for a requested converter path."""
+
+    candidates = [path if path.is_absolute() else Path.cwd() / path]
+    if candidates[0].suffix.lower() != ".exe":
+        candidates.append(candidates[0].with_name(candidates[0].name + ".exe"))
+    return candidates
 
 
 def _generated_rtk_options(args: argparse.Namespace) -> list[str]:
@@ -1227,11 +1239,20 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
     solution = args.solution
     if solution in {"all", "nmea"}:
+        position_nmea_mode = getattr(args, "position_nmea", "best")
         all_nmea = out_dir / f"{base}.all.nmea"
+        position_nmea = out_dir / f"{base}.position.nmea"
         solution_nmea = out_dir / f"{base}.solution.nmea"
         write_lines(all_nmea, solutions.all_nmea)
+        if position_nmea_mode != "none":
+            write_lines(position_nmea, position_nmea_records(solutions.all_nmea, position_nmea_mode))
         write_solution_nmea(solution_nmea, solutions.solution_points)
-        logging.info("wrote NMEA outputs: %s, %s", all_nmea, solution_nmea)
+        logging.info(
+            "wrote NMEA outputs: %s%s, %s",
+            all_nmea,
+            f", {position_nmea}" if position_nmea_mode != "none" else "",
+            solution_nmea,
+        )
     if solution in {"all", "csv"}:
         solution_csv = out_dir / f"{base}.solution.csv"
         all_records_csv = out_dir / f"{base}.solution_all_records.csv"
@@ -1600,6 +1621,15 @@ def build_parser() -> argparse.ArgumentParser:
         _add_common(p)
         if name in {"extract", "rinex"}:
             p.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
+            p.add_argument(
+                "--position-nmea",
+                choices=["none", "all", "best"],
+                default="best",
+                help=(
+                    "Write <basename>.position.nmea from original position sentences. "
+                    "best keeps GGA/GNS over RMC per timestamp; all keeps every usable GGA/GNS/RMC."
+                ),
+            )
             p.add_argument("--track-source", choices=["auto", "nmea", "ppp", "adr", "gga"], default="auto")
             p.add_argument("--obs-csv", action="store_true")
             p.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="none")
@@ -1675,6 +1705,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auto_sat_qc_args(pipe)
     pipe.add_argument("--obs-csv", action="store_true", default=True)
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
+    pipe.add_argument(
+        "--position-nmea",
+        choices=["none", "all", "best"],
+        default="best",
+        help=(
+            "Write <basename>.position.nmea from original position sentences. "
+            "best keeps GGA/GNS over RMC per timestamp; all keeps every usable GGA/GNS/RMC."
+        ),
+    )
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
     pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="convbin")

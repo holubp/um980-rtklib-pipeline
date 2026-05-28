@@ -4,6 +4,9 @@
   logs or generated output products.
 - Unsupported UM980 records must be surfaced in warnings and analysis JSON.
   Never silently drop them when they affect downstream products.
+- Position-only NMEA outputs must preserve original receiver sentences and
+  multi-Hz fractional timestamps. Prefer GGA/GNS over RMC only when choosing one
+  best original position sentence for the same timestamp.
 - Do not write placeholder NAV files. Empty or header-only NAV inputs must be
   rejected before RTKLIB is invoked.
 - RINEX signal mappings must be explicit and tested. When using placeholder
