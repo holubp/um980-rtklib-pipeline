@@ -26,6 +26,11 @@ should parse sentence fields, preserve original lines, keep fractional
 timestamps for multi-Hz data, and prefer GGA/GNS over RMC only when selecting a
 single best sentence for the same timestamp.
 
+Keep RTKLIB post-processing summaries source-aware. Standard `.pos`/`.llh`
+outputs expose RTKLIB `Q` values, while NMEA outputs expose GGA fix-quality
+codes with different meanings for values such as 4 and 5. Do not reuse RTKLIB
+`Q` labels for NMEA quality summaries.
+
 Header-only RINEX NAV files are rejected. Rover ASCII `GPSEPHA`, `GLOEPHA`, and
 validated `GALEPHA` records may be written as non-empty RTKLIB-readable sidecar
 files. Missing, malformed, or unsupported ephemeris records must stay visible as

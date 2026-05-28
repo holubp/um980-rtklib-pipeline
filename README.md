@@ -233,6 +233,14 @@ log paths.
 For solution-quality debugging, add `--rtklib-trace-level 4
 --rtklib-stat-level 2`; these pass `rnx2rtkp -x 4 -y 2` and work with or
 without `--rtkconf`.
+When RTKLIB finishes successfully in `-v` or `-d` mode, the CLI prints a
+solution-quality summary from the requested output file. The summary reports
+epoch counts and percentages for each `Q=` value in standard `.pos`/`.llh`
+output, plus cumulative time and track length for segments ending in that
+quality. For NMEA output, the same summary uses GGA fix-quality fields and
+labels them separately because NMEA quality codes are not the same as RTKLIB
+`Q` values.
+
 ## Bundled RTKLIB Configs
 
 The repository includes several RTKLIB-ex configs for different operating

@@ -51,6 +51,7 @@ from .rtklib import (
     run_rnx2rtkp,
 )
 from .rtklib_config_patch import patch_config_with_autoqc
+from .rtklib_summary import format_rtklib_solution_summary, summarize_rtklib_solution
 from .solution import (
     SolutionPoint,
     extract_solutions,
@@ -975,6 +976,19 @@ def _move_rtklib_stat(output_file: Path, target: Path) -> None:
         source.replace(target)
 
 
+def _log_rtklib_solution_summary(args: argparse.Namespace, output_file: Path) -> None:
+    """Log RTKLIB quality statistics when verbose diagnostics are enabled."""
+
+    if not _verbose_enabled(args) or getattr(args, "dry_run", False):
+        return
+    summary = summarize_rtklib_solution(output_file)
+    if summary is None:
+        logging.warning("RTKLIB solution summary unavailable: no parseable quality-coded positions in %s", output_file)
+        return
+    for line in format_rtklib_solution_summary(summary):
+        logging.info("%s", line)
+
+
 def _log_auto_qc_decision(decision) -> None:
     if decision.exclude_sats or decision.recommended_elmask is not None:
         elmask = (
@@ -1434,7 +1448,9 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
-    logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
+    output_file = out_dir / f"{base}-rtk.{args.output_format}"
+    logging.info("RTKLIB postprocessing finished: %s", output_file)
+    _log_rtklib_solution_summary(args, output_file)
     print(format_command(command.args))
     return 0
 
@@ -1524,7 +1540,9 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
-    logging.info("RTKLIB postprocessing finished: %s", out_dir / f"{base}-rtk.{args.output_format}")
+    output_file = out_dir / f"{base}-rtk.{args.output_format}"
+    logging.info("RTKLIB postprocessing finished: %s", output_file)
+    _log_rtklib_solution_summary(args, output_file)
     print(format_command(command.args))
     return 0
 

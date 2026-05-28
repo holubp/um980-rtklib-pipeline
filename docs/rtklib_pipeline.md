@@ -141,6 +141,11 @@ solution data is treated as a runtime error.
 Use `--rtklib-trace-level 4 --rtklib-stat-level 2` to produce the usual
 debugging equivalent of `rnx2rtkp -x 4 -y 2`. These named options are passed as
 command-line overrides in both generated-option mode and `--rtkconf` mode.
+In `-v` or `-d` mode, successful RTKLIB runs also print a compact solution
+summary. It includes epoch counts and percentages per `Q=` value, plus
+cumulative time and track length for segments ending in each quality for normal
+`.pos`/`.llh` output. For NMEA output, it uses GGA fix-quality fields and labels
+them separately because NMEA quality codes differ from RTKLIB `Q` values.
 
 ## Bundled RTKLIB Configs
 

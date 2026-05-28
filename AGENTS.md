@@ -7,6 +7,8 @@
 - Position-only NMEA outputs must preserve original receiver sentences and
   multi-Hz fractional timestamps. Prefer GGA/GNS over RMC only when choosing one
   best original position sentence for the same timestamp.
+- RTKLIB solution summaries must distinguish RTKLIB `.pos`/`.llh` `Q` values
+  from NMEA GGA fix-quality codes; their labels are not interchangeable.
 - Do not write placeholder NAV files. Empty or header-only NAV inputs must be
   rejected before RTKLIB is invoked.
 - RINEX signal mappings must be explicit and tested. When using placeholder
