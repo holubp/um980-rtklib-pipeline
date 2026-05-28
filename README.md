@@ -226,7 +226,10 @@ you want a full RTKLIB-EX config such as one distributed with RTKLIB-EX.
 latitude/longitude/height content, which RTKLIB config files call
 `out-solformat=llh`. `--output-format nmea` passes RTKLIB's `-n` option,
 equivalent to setting `out-solformat=nmea`; it does not merely rename a `.pos`
-file to `.nmea`. If an RTKLIB build writes a successful run to stdout instead
+file to `.nmea`. Repeat `--output-format` or pass a comma-separated list, for
+example `--output-format pos,nmea`, to create multiple solution products from
+the same extracted rover/base/NAV inputs. The pipeline runs `rnx2rtkp` once per
+requested format. If an RTKLIB build writes a successful run to stdout instead
 of honoring `-o`, the pipeline saves that captured stdout as the requested
 output file; if no output exists anywhere, the run fails with the command and
 log paths.
@@ -239,7 +242,9 @@ epoch counts and percentages for each `Q=` value in standard `.pos`/`.llh`
 output, plus cumulative time and track length for segments ending in that
 quality. For NMEA output, the same summary uses GGA fix-quality fields and
 labels them separately because NMEA quality codes are not the same as RTKLIB
-`Q` values.
+`Q` values. Each quality line also shows the closest RTKLIB/GGA correspondence:
+`Q=1` to GGA quality `4`, `Q=2` to GGA `5`, `Q=4` to GGA `2`, and `Q=5` to GGA
+`1`.
 
 ## Bundled RTKLIB Configs
 

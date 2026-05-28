@@ -133,9 +133,12 @@ latitude/longitude/height content; in RTKLIB config files that content is
 called `out-solformat=llh`. `--output-format nmea` is an RTKLIB output-format
 request, not just a filename suffix. The pipeline adds `rnx2rtkp -n`, which is
 the command-line equivalent of `out-solformat=nmea`, even when `--rtkconf` is
-also supplied. If a successful RTKLIB run writes solution text to stdout instead
-of creating the `-o` file, the pipeline stores that captured stdout at the
-requested output path. A zero-exit run with no output file and no captured
+also supplied. Repeat `--output-format` or pass comma-separated values, such as
+`--output-format pos,nmea`, to produce multiple solution products from one
+pipeline extraction/base-download pass. The RTKLIB stage runs `rnx2rtkp` once
+per requested format. If a successful RTKLIB run writes solution text to stdout
+instead of creating the `-o` file, the pipeline stores that captured stdout at
+the requested output path. A zero-exit run with no output file and no captured
 solution data is treated as a runtime error.
 
 Use `--rtklib-trace-level 4 --rtklib-stat-level 2` to produce the usual
@@ -145,7 +148,9 @@ In `-v` or `-d` mode, successful RTKLIB runs also print a compact solution
 summary. It includes epoch counts and percentages per `Q=` value, plus
 cumulative time and track length for segments ending in each quality for normal
 `.pos`/`.llh` output. For NMEA output, it uses GGA fix-quality fields and labels
-them separately because NMEA quality codes differ from RTKLIB `Q` values.
+them separately because NMEA quality codes differ from RTKLIB `Q` values. Each
+quality line includes the closest cross-reference: RTKLIB `Q=1/2/4/5` maps to
+GGA quality `4/5/2/1`, respectively.
 
 ## Bundled RTKLIB Configs
 

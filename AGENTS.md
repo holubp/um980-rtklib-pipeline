@@ -9,6 +9,9 @@
   best original position sentence for the same timestamp.
 - RTKLIB solution summaries must distinguish RTKLIB `.pos`/`.llh` `Q` values
   from NMEA GGA fix-quality codes; their labels are not interchangeable.
+  Cross-reference them explicitly as Q=1/2/4/5 to GGA quality 4/5/2/1.
+- Multiple RTKLIB output formats must invoke `rnx2rtkp` separately per format;
+  do not fake NMEA or other formats by only changing file suffixes.
 - Do not write placeholder NAV files. Empty or header-only NAV inputs must be
   rejected before RTKLIB is invoked.
 - RINEX signal mappings must be explicit and tested. When using placeholder

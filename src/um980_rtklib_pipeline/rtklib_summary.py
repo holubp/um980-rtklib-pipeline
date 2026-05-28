@@ -28,6 +28,15 @@ NMEA_GGA_LABELS = {
     5: "rtk float",
 }
 
+RTKLIB_Q_TO_NMEA_GGA = {
+    0: 0,
+    1: 4,
+    2: 5,
+    4: 2,
+    5: 1,
+}
+NMEA_GGA_TO_RTKLIB_Q = {value: key for key, value in RTKLIB_Q_TO_NMEA_GGA.items()}
+
 
 @dataclass(frozen=True)
 class RtklibSolutionSample:
@@ -145,7 +154,8 @@ def format_rtklib_solution_summary(summary: RtklibSolutionSummary) -> list[str]:
         label = _quality_label(summary.quality_system, bucket.quality)
         lines.append(
             (
-                f"{_quality_prefix(summary.quality_system)}={bucket.quality} ({label}): "
+                f"{_quality_prefix(summary.quality_system)}={bucket.quality} "
+                f"({_quality_label_with_mapping(summary.quality_system, bucket.quality, label)}): "
                 f"{bucket.count} epochs ({bucket.percent:.1f}%), "
                 f"duration={_format_duration(bucket.duration_s)}, "
                 f"track={_format_distance(bucket.distance_m)}"
@@ -237,6 +247,20 @@ def _quality_prefix(system: QualitySystem) -> str:
 def _quality_label(system: QualitySystem, quality: int) -> str:
     labels = RTKLIB_Q_LABELS if system == "rtklib_q" else NMEA_GGA_LABELS
     return labels.get(quality, "other")
+
+
+def _quality_label_with_mapping(system: QualitySystem, quality: int, label: str) -> str:
+    if system == "rtklib_q":
+        mapped = RTKLIB_Q_TO_NMEA_GGA.get(quality)
+        if mapped is None:
+            return label
+        mapped_label = NMEA_GGA_LABELS.get(mapped, "other")
+        return f"{label}; GGA quality={mapped} {mapped_label}"
+    mapped = NMEA_GGA_TO_RTKLIB_Q.get(quality)
+    if mapped is None:
+        return label
+    mapped_label = RTKLIB_Q_LABELS.get(mapped, "other")
+    return f"{label}; RTKLIB Q={mapped} {mapped_label}"
 
 
 def _nmea_time_of_day_s(value: str) -> float | None:

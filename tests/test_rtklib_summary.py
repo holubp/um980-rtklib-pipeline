@@ -63,8 +63,8 @@ def test_rtklib_summary_format_includes_epoch_percent_duration_and_track(tmp_pat
     assert summary is not None
     lines = format_rtklib_solution_summary(summary)
     assert lines[0].startswith("RTKLIB solution summary: epochs=2 duration=1s track=")
-    assert "RTKLIB Q=1 (fixed): 1 epochs (50.0%), duration=1s, track=" in lines[1]
-    assert "RTKLIB Q=5 (single): 1 epochs (50.0%), duration=0s, track=0.0 m" == lines[2]
+    assert "RTKLIB Q=1 (fixed; GGA quality=4 rtk fixed): 1 epochs (50.0%), duration=1s, track=" in lines[1]
+    assert "RTKLIB Q=5 (single; GGA quality=1 gps): 1 epochs (50.0%), duration=0s, track=0.0 m" == lines[2]
 
 
 def test_rtklib_nmea_summary_format_uses_gga_quality_labels(tmp_path: Path):
@@ -79,8 +79,8 @@ def test_rtklib_nmea_summary_format_uses_gga_quality_labels(tmp_path: Path):
 
     assert summary is not None
     lines = format_rtklib_solution_summary(summary)
-    assert "NMEA GGA quality=4 (rtk fixed): 1 epochs (50.0%)" in lines[1]
-    assert "NMEA GGA quality=5 (rtk float): 1 epochs (50.0%)" in lines[2]
+    assert "NMEA GGA quality=4 (rtk fixed; RTKLIB Q=1 fixed): 1 epochs (50.0%)" in lines[1]
+    assert "NMEA GGA quality=5 (rtk float; RTKLIB Q=2 float): 1 epochs (50.0%)" in lines[2]
 
 
 def test_cli_logs_rtklib_summary_only_in_verbose_mode(tmp_path: Path, caplog):
@@ -97,4 +97,4 @@ def test_cli_logs_rtklib_summary_only_in_verbose_mode(tmp_path: Path, caplog):
 
     cli._log_rtklib_solution_summary(argparse.Namespace(verbose=True, debug=False, dry_run=False), output)
     assert "RTKLIB solution summary: epochs=2" in caplog.text
-    assert "RTKLIB Q=1 (fixed): 1 epochs (50.0%)" in caplog.text
+    assert "RTKLIB Q=1 (fixed; GGA quality=4 rtk fixed): 1 epochs (50.0%)" in caplog.text

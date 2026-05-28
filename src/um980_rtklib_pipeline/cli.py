@@ -397,11 +397,14 @@ def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base
     parser.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
     parser.add_argument(
         "--output-format",
-        choices=["nmea", "pos", "llh"],
-        default="pos",
+        action="append",
+        default=None,
+        metavar="FORMAT",
         help=(
-            "RTKLIB solution output format. pos is the standard .pos file suffix "
-            "for LLH content; nmea passes rnx2rtkp -n, not only a .nmea filename suffix."
+            "RTKLIB solution output format: pos, llh, or nmea. Repeat the option "
+            "or pass a comma-separated list to run rnx2rtkp once per format. pos "
+            "is the standard .pos file suffix for LLH content; nmea passes "
+            "rnx2rtkp -n, not only a .nmea filename suffix."
         ),
     )
     parser.add_argument("--base-obs", action="append", required=require_base_obs)
@@ -701,9 +704,33 @@ def _crx2rnx_path_candidates(path: Path) -> list[Path]:
     return candidates
 
 
-def _generated_rtk_options(args: argparse.Namespace) -> list[str]:
+RTKLIB_OUTPUT_FORMATS = {"nmea", "pos", "llh"}
+
+
+def _rtklib_output_formats(args: argparse.Namespace) -> list[str]:
+    """Return validated RTKLIB output formats requested for this run."""
+
+    raw = getattr(args, "output_format", None)
+    if raw is None:
+        values = ["pos"]
+    elif isinstance(raw, str):
+        values = [raw]
+    else:
+        values = list(raw)
+    formats: list[str] = []
+    for value in values:
+        for item in _csv_items(value):
+            if item not in RTKLIB_OUTPUT_FORMATS:
+                valid = ", ".join(sorted(RTKLIB_OUTPUT_FORMATS))
+                raise ValueError(f"unsupported --output-format item {item!r}; expected one of: {valid}")
+            formats.append(item)
+    return list(dict.fromkeys(formats)) or ["pos"]
+
+
+def _generated_rtk_options(args: argparse.Namespace, *, output_format: str | None = None) -> list[str]:
     """Return generated `rnx2rtkp` processing options when no config is used."""
 
+    selected_format = output_format or _rtklib_output_formats(args)[0]
     options = [
         "-p",
         RTK_POS_MODE_CODES[args.rtk_pos_mode],
@@ -723,22 +750,23 @@ def _generated_rtk_options(args: argparse.Namespace) -> list[str]:
         options.append("-i")
     elif args.rtk_ar_mode == "fix-and-hold":
         options.append("-h")
-    options.extend(_rtklib_command_override_options(args))
+    options.extend(_rtklib_command_override_options(args, output_format=selected_format))
     options.extend(getattr(args, "rnx2rtkp_option", []) or [])
     return options
 
 
-def _rtklib_command_override_options(args: argparse.Namespace) -> list[str]:
+def _rtklib_command_override_options(args: argparse.Namespace, *, output_format: str | None = None) -> list[str]:
     """Return named RTKLIB command-line overrides that also apply with configs."""
 
-    return _rtklib_output_format_options(args) + _rtklib_debug_output_options(args)
+    selected_format = output_format or _rtklib_output_formats(args)[0]
+    return _rtklib_output_format_options(selected_format) + _rtklib_debug_output_options(args)
 
 
-def _rtklib_output_format_options(args: argparse.Namespace) -> list[str]:
+def _rtklib_output_format_options(output_format: str) -> list[str]:
     """Return `rnx2rtkp` options required by `--output-format`.
 
     Args:
-        args: CLI arguments containing `output_format`.
+        output_format: One validated RTKLIB output format.
 
     Returns:
         Command-line option tokens that make RTKLIB produce the requested
@@ -748,7 +776,6 @@ def _rtklib_output_format_options(args: argparse.Namespace) -> list[str]:
         ValueError: If an unsupported output format reaches this helper.
     """
 
-    output_format = getattr(args, "output_format", "pos")
     if output_format == "nmea":
         return ["-n"]
     if output_format in {"pos", "llh"}:
@@ -784,23 +811,28 @@ def _rtk_navsys_arg(args: argparse.Namespace) -> str:
     return ",".join(dict.fromkeys(systems))
 
 
-def _rtklib_config_and_options(args: argparse.Namespace) -> tuple[Path | None, list[str] | None]:
+def _rtklib_config_and_options(args: argparse.Namespace, *, output_format: str | None = None) -> tuple[Path | None, list[str] | None]:
     """Resolve RTKLIB config-file mode versus generated command-line mode."""
 
+    selected_format = output_format or _rtklib_output_formats(args)[0]
     if args.rtkconf:
-        override_options = _rtklib_command_override_options(args) + (getattr(args, "rnx2rtkp_option", []) or [])
+        override_options = _rtklib_command_override_options(args, output_format=selected_format) + (
+            getattr(args, "rnx2rtkp_option", []) or []
+        )
         if override_options:
             logging.info(
-                "using --rtkconf plus %d rnx2rtkp command-line override tokens",
+                "using --rtkconf plus %d rnx2rtkp command-line override tokens for %s output",
                 len(override_options),
+                selected_format,
             )
             return Path(args.rtkconf), override_options
         logging.info("using RTKLIB configuration file: %s", args.rtkconf)
         return Path(args.rtkconf), None
-    generated = _generated_rtk_options(args)
+    generated = _generated_rtk_options(args, output_format=selected_format)
     logging.warning(
-        "no --rtkconf supplied; using generated rnx2rtkp CLI options: %s. "
+        "no --rtkconf supplied; using generated rnx2rtkp CLI options for %s output: %s. "
         "Provide --rtkconf for a full RTKLIB-EX configuration.",
+        selected_format,
         " ".join(generated),
     )
     return None, generated
@@ -987,6 +1019,54 @@ def _log_rtklib_solution_summary(args: argparse.Namespace, output_file: Path) ->
         return
     for line in format_rtklib_solution_summary(summary):
         logging.info("%s", line)
+
+
+def _rtklib_output_file(out_dir: Path, basename: str, output_format: str) -> Path:
+    """Return the output path for one RTKLIB solution format."""
+
+    return out_dir / f"{basename}-rtk.{output_format}"
+
+
+def _run_rtklib_output_formats(
+    *,
+    args: argparse.Namespace,
+    rnx2rtkp: str,
+    out_dir: Path,
+    basename: str,
+    rover_obs: Path,
+    base_obs: list[Path],
+    nav_files: list[Path],
+    base_obs_arg: Path | None,
+    base_ecef: tuple[float, float, float] | None,
+    base_llh: tuple[float, float, float] | None,
+):
+    """Run RTKLIB once per requested solution output format."""
+
+    formats = _rtklib_output_formats(args)
+    if len(formats) > 1:
+        logging.info("running RTKLIB postprocessing for output formats: %s", ", ".join(formats))
+    commands = []
+    for output_format in formats:
+        output_file = _rtklib_output_file(out_dir, basename, output_format)
+        rtkconf, rtk_options = _rtklib_config_and_options(args, output_format=output_format)
+        logging.info("running RTKLIB postprocessing for %s output", output_format)
+        command = _run_rtklib_with_optional_auto_qc(
+            args=args,
+            rnx2rtkp=rnx2rtkp,
+            rtkconf=rtkconf,
+            output_file=output_file,
+            rover_obs=rover_obs,
+            base_obs=base_obs,
+            nav_files=nav_files,
+            base_obs_arg=base_obs_arg,
+            rtk_options=rtk_options,
+            base_ecef=base_ecef,
+            base_llh=base_llh,
+        )
+        logging.info("RTKLIB postprocessing finished: %s", output_file)
+        _log_rtklib_solution_summary(args, output_file)
+        commands.append(command)
+    return commands
 
 
 def _log_auto_qc_decision(decision) -> None:
@@ -1432,26 +1512,21 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     logging.info("retained %d base observation files after overlap filtering", len(base_obs))
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
-    rtkconf, rtk_options = _rtklib_config_and_options(args)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
-    logging.info("running RTKLIB postprocessing")
-    command = _run_rtklib_with_optional_auto_qc(
+    commands = _run_rtklib_output_formats(
         args=args,
         rnx2rtkp=rnx2rtkp,
-        rtkconf=rtkconf,
-        output_file=out_dir / f"{base}-rtk.{args.output_format}",
+        out_dir=out_dir,
+        basename=base,
         rover_obs=rover_obs,
         base_obs=base_obs,
         nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav),
         base_obs_arg=base_obs_arg,
-        rtk_options=rtk_options,
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
-    output_file = out_dir / f"{base}-rtk.{args.output_format}"
-    logging.info("RTKLIB postprocessing finished: %s", output_file)
-    _log_rtklib_solution_summary(args, output_file)
-    print(format_command(command.args))
+    for command in commands:
+        print(format_command(command.args))
     return 0
 
 
@@ -1524,26 +1599,21 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     logging.info("resolved rnx2rtkp executable: %s", rnx2rtkp)
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
-    rtkconf, rtk_options = _rtklib_config_and_options(args)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
-    logging.info("running RTKLIB postprocessing")
-    command = _run_rtklib_with_optional_auto_qc(
+    commands = _run_rtklib_output_formats(
         args=args,
         rnx2rtkp=rnx2rtkp,
-        rtkconf=rtkconf,
-        output_file=out_dir / f"{base}-rtk.{args.output_format}",
+        out_dir=out_dir,
+        basename=base,
         rover_obs=rover_obs,
         base_obs=base_obs,
         nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + generated_rover_nav),
         base_obs_arg=base_obs_arg,
-        rtk_options=rtk_options,
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
-    output_file = out_dir / f"{base}-rtk.{args.output_format}"
-    logging.info("RTKLIB postprocessing finished: %s", output_file)
-    _log_rtklib_solution_summary(args, output_file)
-    print(format_command(command.args))
+    for command in commands:
+        print(format_command(command.args))
     return 0
 
 
@@ -1691,11 +1761,14 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
     pipe.add_argument(
         "--output-format",
-        choices=["nmea", "pos", "llh"],
-        default="pos",
+        action="append",
+        default=None,
+        metavar="FORMAT",
         help=(
-            "RTKLIB solution output format. pos is the standard .pos file suffix "
-            "for LLH content; nmea passes rnx2rtkp -n, not only a .nmea filename suffix."
+            "RTKLIB solution output format: pos, llh, or nmea. Repeat the option "
+            "or pass a comma-separated list to run rnx2rtkp once per format. pos "
+            "is the standard .pos file suffix for LLH content; nmea passes "
+            "rnx2rtkp -n, not only a .nmea filename suffix."
         ),
     )
     pipe.add_argument("--rtk-pos-mode", choices=sorted(RTK_POS_MODE_CODES), default="kinematic")

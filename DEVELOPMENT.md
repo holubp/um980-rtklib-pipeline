@@ -29,7 +29,12 @@ single best sentence for the same timestamp.
 Keep RTKLIB post-processing summaries source-aware. Standard `.pos`/`.llh`
 outputs expose RTKLIB `Q` values, while NMEA outputs expose GGA fix-quality
 codes with different meanings for values such as 4 and 5. Do not reuse RTKLIB
-`Q` labels for NMEA quality summaries.
+`Q` labels for NMEA quality summaries. When showing cross-references, use the
+explicit mapping Q=1/2/4/5 to GGA quality 4/5/2/1.
+
+Multiple RTKLIB output formats must share the same prepared rover/base/NAV
+inputs but run `rnx2rtkp` separately per format. Output-format options such as
+NMEA `-n` are command-level RTKLIB settings, not post-hoc filename conversions.
 
 Header-only RINEX NAV files are rejected. Rover ASCII `GPSEPHA`, `GLOEPHA`, and
 validated `GALEPHA` records may be written as non-empty RTKLIB-readable sidecar

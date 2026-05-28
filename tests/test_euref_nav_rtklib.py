@@ -81,6 +81,22 @@ def test_generated_rtk_options_request_real_nmea_output():
     assert "-n" in cli._generated_rtk_options(args)
 
 
+def test_rtklib_output_format_accepts_repeated_and_csv_values():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--output-format",
+            "pos,nmea",
+            "--output-format",
+            "llh",
+        ]
+    )
+
+    assert cli._rtklib_output_formats(args) == ["pos", "nmea", "llh"]
+
+
 def test_rtkconf_nmea_output_adds_command_line_override():
     parser = cli.build_parser()
     args = parser.parse_args(
@@ -98,6 +114,27 @@ def test_rtkconf_nmea_output_adds_command_line_override():
 
     assert rtkconf == Path("um980.conf")
     assert rtk_options == ["-n"]
+
+
+def test_rtkconf_multiple_output_formats_resolve_per_format_options():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--rtkconf",
+            "um980.conf",
+            "--output-format",
+            "pos,nmea",
+        ]
+    )
+
+    pos_conf, pos_options = cli._rtklib_config_and_options(args, output_format="pos")
+    nmea_conf, nmea_options = cli._rtklib_config_and_options(args, output_format="nmea")
+
+    assert pos_conf == nmea_conf == Path("um980.conf")
+    assert pos_options is None
+    assert nmea_options == ["-n"]
 
 
 def test_extract_defaults_to_best_position_nmea_output():
@@ -1240,3 +1277,72 @@ def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monke
     assert calls["nav_files"] == [nav, *rover_nav]
     assert calls["output_file"] == out_dir / "rover-rtk.pos"
     assert calls["debug"] is True
+
+
+def test_pipeline_runs_rtklib_once_per_requested_output_format(tmp_path: Path, monkeypatch):
+    calls: list[dict[str, object]] = []
+    nav = tmp_path / "brdc.rnx"
+    base_obs = tmp_path / "base.obs"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    nav.write_text("nav\n", encoding="ascii")
+    base_obs.write_text("base\n", encoding="ascii")
+
+    args = argparse.Namespace(
+        rover_log="rover.unc",
+        out_dir=str(out_dir),
+        basename="rover",
+        base_obs=[str(base_obs)],
+        station=None,
+        download_base=False,
+        run_rtklib=True,
+        rtkconf=str(tmp_path / "rtk.conf"),
+        nav_file=[nav],
+        nav_merge="all",
+        rnx2rtkp="rnx2rtkp",
+        rtklib_dir=None,
+        output_format=["pos,nmea"],
+        rtklib_path_style="unix",
+        dry_run=True,
+        debug=False,
+        rtk_pos_mode="kinematic",
+        rtk_frequency="l1+l2+l5",
+        navsys="all",
+        rtk_navsys=None,
+        rtk_elevation_mask=10.0,
+        rtk_soltype="combined",
+        rtk_ar_mode="continuous",
+        rnx2rtkp_option=[],
+        base_ecef=None,
+        base_llh=None,
+        base_position_source="none",
+        base_station=None,
+        base_position_cache_dir=None,
+        verbose=False,
+        log_file=None,
+    )
+
+    monkeypatch.setattr(cli, "cmd_extract", lambda _args: 0)
+    monkeypatch.setattr(cli, "cmd_rinex", lambda _args: 0)
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
+
+    class Candidate:
+        path = nav
+
+    class Resolution:
+        warnings: list[str] = []
+        selected = [Candidate()]
+
+    monkeypatch.setattr(cli, "resolve_nav_sources", lambda **_kwargs: Resolution())
+
+    def fake_run_rnx2rtkp(**kwargs):
+        calls.append(kwargs)
+        return argparse.Namespace(args=["rnx2rtkp", str(kwargs["output_file"])], output_file=kwargs["output_file"])
+
+    monkeypatch.setattr(cli, "run_rnx2rtkp", fake_run_rnx2rtkp)
+
+    assert cli.cmd_pipeline(args) == 0
+
+    assert [call["output_file"] for call in calls] == [out_dir / "rover-rtk.pos", out_dir / "rover-rtk.nmea"]
+    assert calls[0]["rtk_options"] is None
+    assert calls[1]["rtk_options"] == ["-n"]
