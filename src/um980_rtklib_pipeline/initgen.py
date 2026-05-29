@@ -86,6 +86,12 @@ ION_MESSAGES: dict[str, dict[str, str]] = {
     "bd3": {"ascii": "BD3IONA", "binary": "BD3IONB"},
     "gal": {"ascii": "GALIONA", "binary": "GALIONB"},
 }
+UTC_MESSAGES: dict[str, dict[str, str]] = {
+    "gps": {"ascii": "GPSUTCA", "binary": "GPSUTCB"},
+    "bds": {"ascii": "BDSUTCA", "binary": "BDSUTCB"},
+    "bd3": {"ascii": "BD3UTCA", "binary": "BD3UTCB"},
+    "gal": {"ascii": "GALUTCA", "binary": "GALUTCB"},
+}
 DEFAULT_PPP_TIMEOUT_S = 120
 DEFAULT_PPP_CONVERGE = (15, 30)
 DEBUG_ASCII_EPHEMERIS_SYSTEMS = ("gps", "glo", "gal", "bds", "bd3", "qzss")
@@ -111,6 +117,9 @@ class InitProfile:
         raw_format: Raw observation format (`none`, `obsvma`, `obsvmb`, or
             `obsvmcmpb`).
         raw_hz: Raw observation output rate in hertz.
+        bestnav_format: Receiver-solution BESTNAV logging format (`none`,
+            `ascii`, or `binary`).
+        bestnav_hz: BESTNAV output rate in hertz.
         expected_obs_per_epoch: Expected observations per raw epoch for bitrate
             estimation.
         ephemeris: Mapping of ASCII ephemeris message names to periods in
@@ -133,6 +142,12 @@ class InitProfile:
         ion_period_s: Optional periodic repeat interval in seconds for selected
             ionosphere parameter families. When set, the generated commands
             include `MSG PERIOD` in addition to `ONCHANGED`.
+        utc_messages: UTC/time-system parameter families to include (`gps`,
+            `bds`, `bd3`, `gal`). Each selected family is emitted as
+            `ONCHANGED` and, when `utc_period_s` is set, with that periodic
+            interval.
+        utc_period_s: Optional periodic repeat interval in seconds for selected
+            UTC/time-system parameter families.
         include_gpsion: Backwards-compatible shortcut for adding `gps` to
             `ion_messages`.
         save_config: Append `SAVECONFIG`.
@@ -147,6 +162,8 @@ class InitProfile:
     nmea: dict[str, float] = field(default_factory=lambda: dict(NMEA_PRESETS["minimal"]))
     raw_format: str = "none"
     raw_hz: float = 0.0
+    bestnav_format: str = "none"
+    bestnav_hz: float = 0.0
     expected_obs_per_epoch: int = 100
     ephemeris: dict[str, float | str] = field(default_factory=dict)
     ephemeris_format: str = "ascii"
@@ -159,6 +176,8 @@ class InitProfile:
     diagnostic_format: str = "ascii"
     ion_messages: tuple[str, ...] = ()
     ion_period_s: float | None = None
+    utc_messages: tuple[str, ...] = ()
+    utc_period_s: float | None = None
     include_gpsion: bool = False
     save_config: bool = False
 
@@ -307,13 +326,35 @@ def _ion_message_name(family: str, diagnostic_format: str) -> str:
     return ION_MESSAGES[family][diagnostic_format]
 
 
+def _utc_message_name(family: str, diagnostic_format: str) -> str:
+    """Return the UM980 UTC/time-system command name for a family and format."""
+
+    return UTC_MESSAGES[family][diagnostic_format]
+
+
+def _bestnav_message_name(profile: InitProfile) -> str | None:
+    """Return the selected BESTNAV command name, if enabled."""
+
+    if profile.bestnav_format == "ascii":
+        return "BESTNAVA"
+    if profile.bestnav_format == "binary":
+        return "BESTNAVB"
+    return None
+
+
 def _effective_nmea_rates(profile: InitProfile) -> dict[str, float]:
     """Return NMEA-like periodic rates used for serial-capacity estimates."""
 
     rates = dict(profile.nmea)
+    bestnav_message = _bestnav_message_name(profile)
+    if bestnav_message and profile.bestnav_hz > 0:
+        rates[bestnav_message] = profile.bestnav_hz
     if profile.ion_period_s and profile.ion_period_s > 0:
         for family in _profile_ion_messages(profile):
             rates[_ion_message_name(family, profile.diagnostic_format)] = 1.0 / profile.ion_period_s
+    if profile.utc_period_s and profile.utc_period_s > 0:
+        for family in profile.utc_messages:
+            rates[_utc_message_name(family, profile.diagnostic_format)] = 1.0 / profile.utc_period_s
     return rates
 
 
@@ -359,6 +400,10 @@ def validate_profile(profile: InitProfile) -> None:
         raise ValueError("mode base requires --base-lat, --base-lon and --base-height")
     if profile.raw_format not in {"none", "obsvma", "obsvmb", "obsvmcmpb"}:
         raise ValueError(f"unsupported raw format: {profile.raw_format}")
+    if profile.bestnav_format not in {"none", "ascii", "binary"}:
+        raise ValueError(f"unsupported BESTNAV format: {profile.bestnav_format}")
+    if profile.bestnav_format != "none" and profile.bestnav_hz <= 0:
+        raise ValueError("BESTNAV frequency must be greater than zero when BESTNAV logging is enabled")
     if profile.ephemeris_format not in {"ascii", "binary"}:
         raise ValueError(f"unsupported ephemeris format: {profile.ephemeris_format}")
     if profile.diagnostic_format not in {"ascii", "binary"}:
@@ -370,6 +415,11 @@ def validate_profile(profile: InitProfile) -> None:
         raise ValueError(f"unsupported ionosphere message families: {', '.join(invalid_ion)}")
     if profile.ion_period_s is not None and profile.ion_period_s <= 0:
         raise ValueError("ionosphere repeat period must be greater than zero seconds")
+    invalid_utc = sorted(set(profile.utc_messages) - set(UTC_MESSAGES))
+    if invalid_utc:
+        raise ValueError(f"unsupported UTC/time-system message families: {', '.join(invalid_utc)}")
+    if profile.utc_period_s is not None and profile.utc_period_s <= 0:
+        raise ValueError("UTC/time-system repeat period must be greater than zero seconds")
 
 
 def render_init_script(
@@ -451,6 +501,11 @@ def render_init_script(
         lines.append("MODE ROVER")
     lines.append("")
 
+    bestnav_message = _bestnav_message_name(profile)
+    if bestnav_message and profile.bestnav_hz > 0:
+        lines.append(f"{bestnav_message} {profile.port} {hz_to_period_text(profile.bestnav_hz)}")
+        lines.append("")
+
     if profile.raw_format != "none" and profile.raw_hz > 0:
         lines.append(f"{profile.raw_format.upper()} {profile.port} {hz_to_period_text(profile.raw_hz)}")
         lines.append("")
@@ -481,7 +536,12 @@ def render_init_script(
         lines.append(f"{message} ONCHANGED")
         if profile.ion_period_s:
             lines.append(f"{message} {profile.ion_period_s:g}")
-    if profile.include_tropinfo or ion_messages:
+    for family in profile.utc_messages:
+        message = _utc_message_name(family, profile.diagnostic_format)
+        lines.append(f"{message} ONCHANGED")
+        if profile.utc_period_s:
+            lines.append(f"{message} {profile.utc_period_s:g}")
+    if profile.include_tropinfo or ion_messages or profile.utc_messages:
         lines.append("")
 
     if profile.save_config:
@@ -505,6 +565,8 @@ def write_json_report(path: Path, profile: InitProfile, estimate: BitrateEstimat
             "baud": profile.baud,
             "raw_format": profile.raw_format,
             "raw_hz": profile.raw_hz,
+            "bestnav_format": profile.bestnav_format,
+            "bestnav_hz": profile.bestnav_hz,
             "expected_obs_per_epoch": profile.expected_obs_per_epoch,
             "ephemeris_format": profile.ephemeris_format,
             "debug_ascii_ephemeris": profile.debug_ascii_ephemeris,
@@ -519,6 +581,8 @@ def write_json_report(path: Path, profile: InitProfile, estimate: BitrateEstimat
             "diagnostic_format": profile.diagnostic_format,
             "ion_messages": list(profile.ion_messages),
             "ion_period_s": profile.ion_period_s,
+            "utc_messages": list(profile.utc_messages),
+            "utc_period_s": profile.utc_period_s,
         },
         "estimated_payload": estimate.as_dict(),
         "format_comparison_at_requested_rate": {

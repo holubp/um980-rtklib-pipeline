@@ -11,7 +11,14 @@ from typing import Literal
 
 RecordKind = Literal["nmea", "unicore_ascii", "unicore_binary", "noise"]
 BINARY_MESSAGE_TYPES = {
+    4: "BDSIONB",
+    8: "GPSIONB",
+    9: "GALIONB",
     12: "OBSVMB",
+    19: "GPSUTCB",
+    20: "GALUTCB",
+    21: "BD3IONB",
+    22: "BD3UTCB",
     106: "GPSEPHB",
     107: "GLOEPHB",
     108: "BDSEPHB",
@@ -19,6 +26,8 @@ BINARY_MESSAGE_TYPES = {
     110: "QZSSEPHB",
     112: "IRNSSEPHB",
     138: "OBSVMCMPB",
+    2012: "BDSUTCB",
+    2118: "BESTNAVB",
     2999: "BD3EPHB",
 }
 

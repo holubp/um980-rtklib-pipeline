@@ -25,6 +25,8 @@ DEFAULT_NMEA_BYTES: dict[str, int] = {
     "GNGSV": 90,
     "PPPNAVA": 180,
     "ADRNAVA": 180,
+    "BESTNAVA": 240,
+    "BESTNAVB": 220,
     "TROPINFOA": 160,
     "TROPINFOB": 160,
     "GPSIONA": 120,
@@ -35,6 +37,14 @@ DEFAULT_NMEA_BYTES: dict[str, int] = {
     "BD3IONB": 120,
     "GALIONA": 120,
     "GALIONB": 120,
+    "GPSUTCA": 120,
+    "GPSUTCB": 120,
+    "BDSUTCA": 120,
+    "BDSUTCB": 120,
+    "BD3UTCA": 120,
+    "BD3UTCB": 120,
+    "GALUTCA": 120,
+    "GALUTCB": 120,
 }
 
 GSV_LINES_PER_EPOCH: dict[str, int] = {

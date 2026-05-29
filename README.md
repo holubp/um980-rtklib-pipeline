@@ -106,9 +106,6 @@ not sit silently while large `.unc` files are being processed. Pass `-d` or
 the exact shell-quoted `crx2rnx` and `rnx2rtkp` commands, wrapper path, and
 stdout/stderr log paths before execution.
 
-See [COLLECT-DATA.md](COLLECT-DATA.md) for the private capture plan needed to
-finish parser coverage and serial-capacity calibration.
-
 ## Examples
 
 Generate a receiver command script:
@@ -142,6 +139,36 @@ um980-ppk init generate \
   --out um980-binary-ephem.cmd
 ```
 
+For high-rate receiver-solution export plus RTKLIB raw observations, enable
+BESTNAV explicitly. BESTNAV is a receiver solution product; it is useful for
+NMEA tracks and diagnostics, but RTKLIB estimation still uses `OBSVMB` or
+`OBSVMCMPB` plus ephemerides/NAV and base observations.
+
+```bash
+um980-ppk init generate \
+  --port COM1 \
+  --baud 230400 \
+  --mode rover \
+  --raw-format obsvmcmpb \
+  --raw-hz 5 \
+  --bestnav-format binary \
+  --bestnav-hz 20 \
+  --nmea-preset none \
+  --ephemeris every=300 \
+  --ephemeris-format binary \
+  --include-ion \
+  --include-utc \
+  --diagnostic-format binary \
+  --out um980-bestnav-rtklib.cmd
+```
+
+The generated receiver-side profile is equivalent to logging `BESTNAVB COM1
+0.05`, `OBSVMCMPB COM1 0.2`, binary ephemerides every 300 seconds, and
+`GPSIONB`/`BDSIONB`/`BD3IONB`/`GALIONB` plus
+`GPSUTCB`/`BDSUTCB`/`BD3UTCB`/`GALUTCB` on change. Use
+`--bestnav-format ascii --diagnostic-format ascii` for the ASCII alternative
+(`BESTNAVA`, `GPSIONA`, `GPSUTCA`, and related `...A` families).
+
 For an RTKLIB-ex `convbin -r unicore` trial, use a binary-only capture profile:
 `OBSVMB`, binary ephemeris commands, and no NMEA or ASCII diagnostic messages on
 the captured stream. See [UM980 Logging](docs/um980_logging.md#convbin-trial-capture)
@@ -158,7 +185,9 @@ can be enabled independently with `--ion gps,bds,bd3,gal` or `--include-ion`;
 the generator emits the selected `...IONA`/`...IONB` command as `ONCHANGED`.
 Add `--ion-period 300` to also repeat those messages periodically so sliced logs
 still contain ionosphere parameters even if no receiver `ONCHANGED` event occurs
-during the slice.
+during the slice. UTC/time-system logging uses the matching options
+`--utc gps,bds,bd3,gal`, `--include-utc`, and `--utc-period 300`, and follows
+the same ASCII/binary diagnostic suffix selection.
 
 Extract solution products and observations:
 
@@ -177,6 +206,41 @@ NMEA extraction writes:
 
 Use `--position-nmea all` to keep every valid GGA/GNS/RMC position sentence, or
 `--position-nmea none` to skip the compact original-position file.
+
+Generate standard app-readable NMEA from BESTNAV receiver-solution records:
+
+```bash
+um980-ppk extract rover.unc \
+  --bestnav-nmea rover.bestnav-20hz.nmea \
+  --bestnav-nmea-rate native \
+  --bestnav-nmea-sentences GGA,RMC,VTG \
+  -v
+```
+
+Downsample without interpolation by timestamp:
+
+```bash
+um980-ppk extract rover.unc \
+  --bestnav-nmea rover.bestnav-5hz.nmea \
+  --bestnav-nmea-rate 5 \
+  --bestnav-nmea-sentences GGA,RMC,VTG \
+  -v
+```
+
+Generated BESTNAV NMEA currently supports checksummed `GGA`, `RMC`, and `VTG`
+with `GN` talker IDs by default; use `--bestnav-nmea-talk-id GP` for older
+applications. The output is derived from decoded `BESTNAVA` or documented
+message-ID 2118 `BESTNAVB` records and does not require live NMEA in the input
+file.
+
+Verbose extraction also prints message-family statistics for live NMEA,
+BESTNAV, raw observations, ephemerides, ION, UTC, TROPINFO, malformed records,
+and unsupported records. `--analysis-json` stores the same structured
+`message_stats` plus preserved diagnostic payload fields. ION and UTC messages
+are preserved as diagnostics for now; they are not written into RINEX NAV
+headers until each family has a verified RTKLIB-compatible RINEX mapping.
+TROPINFO is logged as receiver/PPP diagnostic information and is not passed to
+`rnx2rtkp`.
 
 Create rover RINEX observation output:
 

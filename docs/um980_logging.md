@@ -15,6 +15,32 @@ Use `--solution-hz` to set the primary NMEA solution cadence for `GNGGA` and
 and 20 Hz. Individual messages can still be overridden with repeated `--nmea`
 arguments.
 
+BESTNAV logging is separate from live NMEA. Use it when you want a high-rate
+receiver-solution product that can later be converted to ordinary app-readable
+NMEA without requiring live `$GGA`/`$RMC` on the capture stream:
+
+```bash
+um980-ppk init generate \
+  --port COM1 \
+  --baud 230400 \
+  --mode rover \
+  --raw-format obsvmcmpb \
+  --raw-hz 5 \
+  --bestnav-format binary \
+  --bestnav-hz 20 \
+  --nmea-preset none \
+  --ephemeris every=300 \
+  --ephemeris-format binary \
+  --include-ion \
+  --include-utc \
+  --diagnostic-format binary
+```
+
+The BESTNAV command emitted by the generator is `BESTNAVA COM1 PERIOD` for
+`--bestnav-format ascii`, or `BESTNAVB COM1 PERIOD` for `binary`. `--bestnav-hz`
+must be positive; 20 Hz renders as `0.05`, and 5 Hz renders as `0.2`. BESTNAV
+is not raw observation data and is not used as RTKLIB input.
+
 Use `--debug-ascii-ephemeris` only for short diagnostic captures. It emits all
 ASCII ephemeris messages every 300 seconds:
 
@@ -174,6 +200,25 @@ GALIONA 300
 
 With `--diagnostic-format binary`, the same commands use `GPSIONB`, `BDSIONB`,
 `BD3IONB`, and `GALIONB`.
+
+UTC/time-system parameters use the same family and diagnostic-format model:
+
+```bash
+um980-ppk init generate \
+  --include-utc \
+  --utc-period 300 \
+  --diagnostic-format binary
+```
+
+This emits `GPSUTCB`, `BDSUTCB`, `BD3UTCB`, and `GALUTCB` as `ONCHANGED` plus
+the requested repeat interval. Use `--utc gps,bds,bd3,gal` to select families
+explicitly, and use `--diagnostic-format ascii` for `GPSUTCA`, `BDSUTCA`,
+`BD3UTCA`, and `GALUTCA`.
+
+The parser preserves ION, UTC, and TROPINFO payloads in analysis JSON and
+message statistics. ION/UTC records are not written into generated RINEX NAV
+headers until each mapping is verified against RINEX syntax and RTKLIB parser
+expectations. TROPINFO remains diagnostic-only and is not passed to RTKLIB.
 
 The ephemeris estimate is per satellite record, not one line per constellation.
 GPS and GLONASS ASCII line sizes are measured from UM980 private captures;

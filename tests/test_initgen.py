@@ -5,6 +5,7 @@ from um980_rtklib_pipeline.initgen import (
     ASCII_EPHEMERIS_WARNING,
     InitProfile,
     NMEA_PRESETS,
+    UTC_MESSAGES,
     debug_ascii_ephemeris_policy,
     ephemeris_policy,
     render_init_script,
@@ -144,6 +145,26 @@ def test_ion_period_adds_repeat_commands_and_bitrate():
     assert "GPSIONA ONCHANGED" in script
     assert "GPSIONA 300" in script
     assert estimate.nmea_bytes_per_s > baseline.nmea_bytes_per_s
+
+
+def test_bestnav_and_utc_messages_are_rendered_with_selected_format():
+    profile = InitProfile(
+        nmea={},
+        raw_format="obsvmcmpb",
+        raw_hz=5,
+        bestnav_format="binary",
+        bestnav_hz=20,
+        diagnostic_format="binary",
+        utc_messages=("gps", "bds", "bd3", "gal"),
+    )
+
+    script, estimate = render_init_script(profile)
+
+    assert "BESTNAVB COM1 0.05" in script
+    assert "OBSVMCMPB COM1 0.2" in script
+    for family in UTC_MESSAGES:
+        assert f"{UTC_MESSAGES[family]['binary']} ONCHANGED" in script
+    assert estimate.nmea_bytes_per_s > 0
 
 
 def test_invalid_ion_period_fails():

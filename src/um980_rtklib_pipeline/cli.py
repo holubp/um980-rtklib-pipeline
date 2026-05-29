@@ -13,7 +13,15 @@ from pathlib import Path
 
 from .badsat import BadSatConfig, choose_bad_sats, compute_sat_metrics, parse_rtklib_stat
 from .badsat_report import write_badsat_json_report, write_badsat_markdown_report
+from .bestnav import (
+    bestnav_records_to_nmea,
+    extract_bestnav_records,
+    filter_bestnav_records,
+    parse_bestnav_rate,
+    parse_bestnav_sentences,
+)
 from .config import deep_get, load_config
+from .diagnostics import extract_diagnostics
 from .euref import (
     BasePosition,
     download_urls,
@@ -30,6 +38,7 @@ from .initgen import (
     InitProfile,
     ION_MESSAGES,
     NMEA_PRESETS,
+    UTC_MESSAGES,
     debug_ascii_ephemeris_policy,
     ephemeris_policy,
     parse_nmea_overrides,
@@ -37,6 +46,7 @@ from .initgen import (
     write_json_report,
 )
 from .logging_config import configure_logging
+from .message_stats import build_message_stats, log_message_stats
 from .nav_resolver import resolve_nav_sources
 from .obs_decode import decode_observations, write_observations_csv
 from .quality import build_analysis, write_analysis_json
@@ -149,6 +159,54 @@ def _resolve_ion_messages(args: argparse.Namespace, diag_cfg: dict[str, object])
     return unique
 
 
+def _resolve_utc_messages(args: argparse.Namespace, diag_cfg: dict[str, object]) -> tuple[str, ...]:
+    """Resolve requested UTC/time-system command families from CLI and config."""
+
+    requested: list[str] = []
+    requested.extend(_csv_items(diag_cfg.get("utc")))
+    if getattr(args, "include_utc", False):
+        requested.append("all")
+    requested.extend(_csv_items(getattr(args, "utc", None)))
+    if "all" in requested:
+        requested.extend(UTC_MESSAGES)
+    unique = tuple(item for item in dict.fromkeys(requested) if item != "all")
+    invalid = sorted(set(unique) - set(UTC_MESSAGES))
+    if invalid:
+        raise ValueError(f"unsupported --utc values: {', '.join(invalid)}")
+    return unique
+
+
+def _add_bestnav_nmea_args(parser: argparse.ArgumentParser) -> None:
+    """Add BESTNAV-derived NMEA product arguments."""
+
+    parser.add_argument(
+        "--bestnav-nmea",
+        help="Write generated GGA/RMC/VTG NMEA from decoded BESTNAV receiver-solution records.",
+    )
+    parser.add_argument(
+        "--bestnav-nmea-sentences",
+        default="GGA,RMC,VTG",
+        help="Comma-separated generated BESTNAV NMEA sentences. Supported: GGA,RMC,VTG.",
+    )
+    parser.add_argument(
+        "--bestnav-nmea-rate",
+        default="native",
+        help="native or a positive Hz value. Numeric values decimate by timestamp without interpolation.",
+    )
+    parser.add_argument(
+        "--bestnav-nmea-source",
+        choices=["auto", "ascii", "binary"],
+        default="auto",
+        help="BESTNAV source for generated NMEA. auto uses every decoded source.",
+    )
+    parser.add_argument(
+        "--bestnav-nmea-talk-id",
+        choices=["GN", "GP"],
+        default="GN",
+        help="Talker ID for generated BESTNAV NMEA sentences.",
+    )
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -235,14 +293,46 @@ def _extract_bundle(args: argparse.Namespace):
     rover_nav = extract_rover_nav(records)
     converted_nav = sum(rover_nav.converted.values())
     logging.info("scanned rover navigation: converted=%d warnings=%d", converted_nav, len(rover_nav.warnings))
+    logging.info("scanning BESTNAV receiver-solution records")
+    bestnav = extract_bestnav_records(records)
+    logging.info(
+        "decoded BESTNAV records: present=%d valid_epochs=%d malformed=%d",
+        sum(bestnav.present.values()),
+        len(bestnav.records),
+        sum(bestnav.malformed.values()),
+    )
+    logging.info("scanning ION/UTC/TROPINFO diagnostics")
+    diagnostics = extract_diagnostics(records)
+    logging.info(
+        "preserved diagnostics: records=%d malformed=%d present_not_converted=%d",
+        len(diagnostics.records),
+        sum(diagnostics.malformed.values()),
+        sum(diagnostics.present_not_converted.values()),
+    )
+    message_stats = build_message_stats(
+        records=records,
+        stream=stream_diag,
+        solutions=solutions,
+        observations=observations,
+        rover_nav=rover_nav,
+        bestnav=bestnav,
+    )
+    if logging.getLogger().isEnabledFor(logging.INFO):
+        log_message_stats(message_stats, debug=logging.getLogger().isEnabledFor(logging.DEBUG))
     logging.info("building analysis report")
     analysis = build_analysis(
         stream=stream_diag,
         solutions=solutions,
         observations=observations,
         rover_nav=rover_nav,
+        extra={
+            "bestnav": bestnav.as_dict(),
+            "diagnostics": diagnostics.as_dict(),
+            "message_stats": message_stats.as_dict(),
+        },
     )
-    return rover, records, stream_diag, solutions, observations, rover_nav, analysis
+    analysis["warnings"] = list(dict.fromkeys([*analysis.get("warnings", []), *bestnav.warnings, *message_stats.warnings]))
+    return rover, records, stream_diag, solutions, observations, rover_nav, bestnav, message_stats, analysis
 
 
 def _print_analysis_summary(analysis: dict[str, object]) -> None:
@@ -1184,6 +1274,9 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         raw_hz = 1.0 / args.raw_period if args.raw_period else 0.0
     if raw_hz is None:
         raw_hz = float(raw_cfg.get("hz", 0.0))
+    bestnav_cfg = config.get("bestnav", {}) if isinstance(config.get("bestnav", {}), dict) else {}
+    bestnav_format = (args.bestnav_format or bestnav_cfg.get("format", "none")).lower()
+    bestnav_hz = args.bestnav_hz if args.bestnav_hz is not None else bestnav_cfg.get("hz", 0.0)
 
     eph_format = (
         args.ephemeris_format
@@ -1220,6 +1313,11 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         if args.ion_period is not None
         else diag_cfg.get("ion_period_s", diag_cfg.get("ion_period"))
     )
+    utc_period = (
+        args.utc_period
+        if args.utc_period is not None
+        else diag_cfg.get("utc_period_s", diag_cfg.get("utc_period"))
+    )
     diagnostic_format = (
         args.diagnostic_format
         or str(diag_cfg.get("format", diag_cfg.get("diagnostic_format", "ascii")))
@@ -1235,6 +1333,8 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         nmea=nmea,
         raw_format=(args.raw_format or raw_cfg.get("format", "none")).lower(),
         raw_hz=float(raw_hz),
+        bestnav_format=bestnav_format,
+        bestnav_hz=float(bestnav_hz),
         expected_obs_per_epoch=int(
             args.expected_obs_per_epoch or raw_cfg.get("expected_obs_per_epoch", 100)
         ),
@@ -1257,6 +1357,8 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         diagnostic_format=diagnostic_format,
         ion_messages=_resolve_ion_messages(args, diag_cfg),
         ion_period_s=float(ion_period) if ion_period is not None else None,
+        utc_messages=_resolve_utc_messages(args, diag_cfg),
+        utc_period_s=float(utc_period) if utc_period is not None else None,
         include_gpsion=False,
         save_config=bool(args.save_config or config.get("save_config", False)),
     )
@@ -1304,7 +1406,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
-    rover, _, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
+    rover, _, _, solutions, observations, rover_nav, _, _, analysis = _extract_bundle(args)
     if args.analysis_json:
         out_dir = ensure_out_dir(args.out_dir)
         base = basename_for(rover, args.basename)
@@ -1314,6 +1416,34 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     _log_analysis_warnings(analysis)
     _print_analysis_summary(analysis)
     return 0
+
+
+def _write_bestnav_nmea(path: Path, bestnav, args: argparse.Namespace) -> None:
+    """Write generated NMEA from BESTNAV receiver-solution records."""
+
+    sentences = parse_bestnav_sentences(args.bestnav_nmea_sentences)
+    rate = parse_bestnav_rate(args.bestnav_nmea_rate)
+    selected = filter_bestnav_records(
+        bestnav.records,
+        source=args.bestnav_nmea_source,
+        rate_hz=rate,
+    )
+    lines = bestnav_records_to_nmea(selected, sentences=sentences, talk_id=args.bestnav_nmea_talk_id)
+    if not lines:
+        present = ", ".join(f"{key}={value}" for key, value in sorted(bestnav.present.items())) or "none"
+        raise ValueError(
+            "no valid BESTNAV records were available for generated NMEA "
+            f"(requested source={args.bestnav_nmea_source}, present={present})"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_lines(path, lines)
+    logging.info(
+        "wrote BESTNAV-derived NMEA: %s (%d sentences, %d epochs, rate=%s)",
+        path,
+        len(lines),
+        len(selected),
+        args.bestnav_nmea_rate,
+    )
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
@@ -1327,7 +1457,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
-    rover, _, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
+    rover, _, _, solutions, observations, rover_nav, bestnav, _, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(rover, args.basename)
 
@@ -1361,6 +1491,8 @@ def cmd_extract(args: argparse.Namespace) -> int:
         obs_csv = out_dir / f"{base}.observations.csv"
         write_observations_csv(obs_csv, observations.observations)
         logging.info("wrote observation CSV: %s", obs_csv)
+    if getattr(args, "bestnav_nmea", None):
+        _write_bestnav_nmea(Path(args.bestnav_nmea), bestnav, args)
     if args.analysis_json:
         analysis_path = out_dir / f"{base}.analysis.json"
         write_analysis_json(analysis_path, analysis)
@@ -1382,7 +1514,7 @@ def cmd_rinex(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
-    rover, records, _, solutions, observations, rover_nav, analysis = _extract_bundle(args)
+    rover, records, _, solutions, observations, rover_nav, _, _, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(rover, args.basename)
     if args.obs_csv:
@@ -1443,7 +1575,7 @@ def cmd_rinex(args: argparse.Namespace) -> int:
 
 
 def _time_window_from_solutions(args: argparse.Namespace, margin_s: int):
-    rover, _, _, solutions, _, _, _ = _extract_bundle(args)
+    rover, _, _, solutions, _, _, _, _, _ = _extract_bundle(args)
     if not solutions.solution_points:
         raise ValueError("no rover time window could be determined from solution records")
     start = min(point.time_utc for point in solutions.solution_points) - timedelta(seconds=margin_s)
@@ -1653,6 +1785,8 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--raw-format", choices=["none", "obsvma", "obsvmb", "obsvmcmpb"])
     gen.add_argument("--raw-hz", type=float)
     gen.add_argument("--raw-period", type=float)
+    gen.add_argument("--bestnav-format", choices=["none", "ascii", "binary"], default=None)
+    gen.add_argument("--bestnav-hz", type=float, help="Emit BESTNAVA/B at this frequency in Hz.")
     gen.add_argument("--expected-sats", type=int)
     gen.add_argument("--expected-obs-per-epoch", type=int)
     gen.add_argument("--ephemeris")
@@ -1694,6 +1828,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gen.add_argument("--include-ion", action="store_true", help="Enable all ionosphere families.")
     gen.add_argument("--include-gpsion", action="store_true", help="Compatibility shortcut for --ion gps.")
+    gen.add_argument(
+        "--utc",
+        help="Comma-separated UTC/time-system families to emit as ONCHANGED: gps,bds,bd3,gal.",
+    )
+    gen.add_argument(
+        "--utc-period",
+        type=float,
+        help="Also repeat selected UTC/time-system messages every N seconds, e.g. 300.",
+    )
+    gen.add_argument("--include-utc", action="store_true", help="Enable all UTC/time-system families.")
     gen.add_argument("--save-config", action="store_true")
     gen.add_argument("--no-save-config", action="store_true")
     gen.add_argument("--strict-bitrate", action="store_true")
@@ -1723,6 +1867,8 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="none")
             p.add_argument("--rinex-version", default="3.04")
             p.add_argument("--rinex-compat", choices=["native", "convbin"], default="native")
+            if name == "extract":
+                _add_bestnav_nmea_args(p)
         p.set_defaults(func=func)
 
     dl = sub.add_parser("download-base")
@@ -1808,6 +1954,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
     pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="convbin")
+    _add_bestnav_nmea_args(pipe)
     _add_base_download_args(pipe, require_station=False, include_rtklib_dir=False)
     _add_base_position_args(pipe)
     _add_common(pipe)

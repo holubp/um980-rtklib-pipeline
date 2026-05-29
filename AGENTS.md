@@ -7,6 +7,12 @@
 - Position-only NMEA outputs must preserve original receiver sentences and
   multi-Hz fractional timestamps. Prefer GGA/GNS over RMC only when choosing one
   best original position sentence for the same timestamp.
+- BESTNAV-derived NMEA is a receiver-solution export product, not RTKLIB raw
+  input. Keep it separate from live NMEA extraction and never feed BESTNAV into
+  RTKLIB estimation in place of OBSVM*/NAV/base observations.
+- ION/UTC/TROPINFO records must be counted and preserved in analysis output.
+  Do not write them into RINEX NAV headers until the exact family mapping is
+  verified against RINEX syntax and RTKLIB parser behavior.
 - RTKLIB solution summaries must distinguish RTKLIB `.pos`/`.llh` `Q` values
   from NMEA GGA fix-quality codes; their labels are not interchangeable.
   Cross-reference them explicitly as Q=1/2/4/5 to GGA quality 4/5/2/1.

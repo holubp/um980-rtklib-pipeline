@@ -109,6 +109,36 @@ During extraction, NMEA outputs are split by purpose:
 Use `--position-nmea all` to keep every valid original GGA/GNS/RMC position
 sentence, or `--position-nmea none` to suppress `<basename>.position.nmea`.
 
+BESTNAV-derived NMEA is a separate product. It is generated from receiver
+solution records, not from live NMEA sentences, and it is not used as RTKLIB raw
+input:
+
+```bash
+um980-ppk extract rover.unc \
+  --bestnav-nmea rover.bestnav-20hz.nmea \
+  --bestnav-nmea-rate native \
+  --bestnav-nmea-sentences GGA,RMC,VTG \
+  -v
+```
+
+For smaller mapping files, decimate by timestamp without interpolation:
+
+```bash
+um980-ppk extract rover.unc \
+  --bestnav-nmea rover.bestnav-5hz.nmea \
+  --bestnav-nmea-rate 5
+```
+
+`--bestnav-nmea-talk-id GN` is the default for multi-GNSS logs; use `GP` only
+for older applications. `BESTNAVA` and documented message-ID 2118 `BESTNAVB`
+records are decoded into standard checksummed `GGA`, `RMC`, and `VTG`.
+
+With `-v`, extraction logs a concise message summary covering live NMEA,
+BESTNAV, raw observations, ephemerides, ION, UTC, TROPINFO, malformed records,
+and unsupported records. With `-d`, it also logs the per-family counters.
+`--analysis-json` stores these under `message_stats` and preserves ION/UTC/TROP
+diagnostic payload fields under `diagnostics`.
+
 ```bash
 um980-ppk pipeline rover.unc \
   --download-base \

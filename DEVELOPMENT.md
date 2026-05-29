@@ -26,6 +26,19 @@ should parse sentence fields, preserve original lines, keep fractional
 timestamps for multi-Hz data, and prefer GGA/GNS over RMC only when selecting a
 single best sentence for the same timestamp.
 
+Keep BESTNAV receiver-solution export separate from both live NMEA extraction
+and RTKLIB raw processing. `BESTNAVA`/documented `BESTNAVB` may generate
+checksummed app-readable NMEA, but RTKLIB estimation still requires raw
+observations plus NAV/base inputs. When adding new BESTNAV fields, validate the
+message layout with the Unicore manual and tests before emitting generated
+sentences.
+
+ION, UTC, and TROPINFO records should flow into message statistics and analysis
+JSON even when they are not yet consumed downstream. Only enrich RINEX NAV
+headers after verifying the exact RINEX header syntax and RTKLIB parser support
+for the specific message family. Until then, mark them present-not-converted
+rather than creating plausible but unsafe header lines.
+
 Keep RTKLIB post-processing summaries source-aware. Standard `.pos`/`.llh`
 outputs expose RTKLIB `Q` values, while NMEA outputs expose GGA fix-quality
 codes with different meanings for values such as 4 and 5. Do not reuse RTKLIB
