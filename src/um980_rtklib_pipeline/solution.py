@@ -5,12 +5,17 @@ from __future__ import annotations
 import csv
 import logging
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
 from typing import Literal
 
+from .bestnav import (
+    BestNavRecord,
+    bestnav_records_to_nmea,
+    filter_bestnav_records,
+)
 from .nmea import (
     FIX_QUALITY,
     NmeaRecord,
@@ -56,7 +61,7 @@ class SolutionPoint:
     """
 
     time_utc: datetime
-    source: Literal["GGA", "GNS", "RMC", "PPPNAVA", "ADRNAVA"]
+    source: Literal["GGA", "GNS", "RMC", "PPPNAVA", "ADRNAVA", "BESTNAV"]
     lat: float
     lon: float
     h_ell: float | None = None
@@ -96,6 +101,7 @@ class SolutionExtraction:
     all_rows: list[dict[str, object]]
     nmea_cadence: dict[str, dict[str, float | int]]
     warnings: list[str]
+    solution_nmea: list[str] = field(default_factory=list)
 
 
 def _gga_solution(record: NmeaRecord, context_date: datetime | None) -> SolutionPoint | None:
@@ -237,6 +243,7 @@ def extract_solutions(records: list[StreamRecord], *, progress: bool = False) ->
     points: list[SolutionPoint] = []
     all_rows: list[dict[str, object]] = []
     warnings: list[str] = []
+    solution_nmea: list[str] = []
     context_date: datetime | None = None
     timestamps_by_type: dict[str, list[datetime]] = {}
     progress_step = 100_000
@@ -285,6 +292,7 @@ def extract_solutions(records: list[StreamRecord], *, progress: bool = False) ->
         if point is not None:
             points.append(point)
             solution_records.append(stream_record.text)
+            solution_nmea.append(stream_record.text)
             timestamps_by_type.setdefault(parsed.talker_type, []).append(point.time_utc)
             row.update(
                 {
@@ -297,7 +305,96 @@ def extract_solutions(records: list[StreamRecord], *, progress: bool = False) ->
         all_rows.append(row)
 
     cadence = {name: _cadence(values) for name, values in timestamps_by_type.items()}
-    return SolutionExtraction(all_nmea, solution_records, points, all_rows, cadence, warnings)
+    return SolutionExtraction(all_nmea, solution_records, points, all_rows, cadence, warnings, solution_nmea)
+
+
+def bestnav_records_to_solution_extraction(
+    records: list[BestNavRecord],
+    *,
+    source: Literal["auto", "ascii", "binary"] = "auto",
+    talk_id: str = "GN",
+) -> SolutionExtraction:
+    """Convert decoded BESTNAV records into normal solution outputs.
+
+    Args:
+        records: Decoded BESTNAV receiver-solution records.
+        source: BESTNAV source filter. ``binary`` selects BESTNAVB only.
+        talk_id: NMEA talker ID for generated GGA/RMC/VTG sentences.
+
+    Returns:
+        A solution extraction whose points, CSV rows, GPX data, and
+        ``solution_nmea`` are derived from BESTNAV epochs.
+    """
+
+    selected = filter_bestnav_records(records, source=source, rate_hz=None)
+    points = [_bestnav_solution_point(record) for record in selected if _bestnav_has_valid_position(record)]
+    lines = bestnav_records_to_nmea(selected, sentences=("GGA", "RMC", "VTG"), talk_id=talk_id)
+    rows = [
+        {
+            "offset": point.source,
+            "type": "BESTNAV",
+            "checksum_ok": True,
+            "time_utc": point.time_utc.isoformat(),
+            "lat": point.lat,
+            "lon": point.lon,
+            "height": point.h_ell if point.h_ell is not None else point.h_msl,
+            "text": "",
+        }
+        for point in points
+    ]
+    return SolutionExtraction(
+        all_nmea=[],
+        solution_records=lines,
+        solution_points=points,
+        all_rows=rows,
+        nmea_cadence={"BESTNAV": _cadence([point.time_utc for point in points])},
+        warnings=[],
+        solution_nmea=lines,
+    )
+
+
+def _bestnav_solution_point(record: BestNavRecord) -> SolutionPoint:
+    fix_quality = _bestnav_fix_quality(record)
+    h_msl = record.height_msl_m
+    h_ell = h_msl + record.undulation_m if h_msl is not None and record.undulation_m is not None else None
+    return SolutionPoint(
+        time_utc=record.time_utc,
+        source="BESTNAV",
+        lat=record.lat_deg,
+        lon=record.lon_deg,
+        h_ell=h_ell,
+        h_msl=h_msl,
+        fix_quality=fix_quality,
+        fix_quality_text=FIX_QUALITY.get(fix_quality),
+        pos_type=record.pos_type,
+        sol_status=record.pos_sol_status,
+        num_sats=record.satellites_used or record.satellites_tracked,
+        sigma_e=record.lon_sigma_m,
+        sigma_n=record.lat_sigma_m,
+        sigma_u=record.height_sigma_m,
+        speed_mps=record.horizontal_speed_mps,
+        course_deg=record.track_deg,
+        age_diff=record.differential_age_s,
+    )
+
+
+def _bestnav_has_valid_position(record: BestNavRecord) -> bool:
+    return record.pos_sol_status.upper() not in {"NONE", "NO_SOLUTION", "SOL_INVALID", "INSUFFICIENT_OBS"}
+
+
+def _bestnav_fix_quality(record: BestNavRecord) -> int:
+    pos_type = record.pos_type.upper()
+    if not _bestnav_has_valid_position(record):
+        return 0
+    if any(token in pos_type for token in ("NARROW_INT", "L1_INT", "RTKFIXED", "FIXED")):
+        return 4
+    if any(token in pos_type for token in ("NARROW_FLOAT", "RTKFLOAT", "FLOAT")):
+        return 5
+    if "DIFF" in pos_type or "SBAS" in pos_type:
+        return 2
+    if "INS" in pos_type and "GNSS" not in pos_type and "RTK" not in pos_type:
+        return 6
+    return 1
 
 
 def write_solution_csv(path: Path, points: list[SolutionPoint]) -> None:
@@ -413,13 +510,20 @@ def _position_nmea_candidate(line: str) -> tuple[str, int] | None:
     return None
 
 
-def write_solution_nmea(path: Path, points: list[SolutionPoint]) -> None:
+def write_solution_nmea(path: Path, points: list[SolutionPoint], nmea_lines: list[str] | None = None) -> None:
     """Write compact proprietary NMEA solution summary records.
 
     Args:
         path: Destination NMEA path.
         points: Solution points to summarise.
+        nmea_lines: Optional already-generated NMEA solution records. When
+            provided, these are written directly instead of proprietary summary
+            records.
     """
+
+    if nmea_lines is not None:
+        write_lines(path, nmea_lines)
+        return
 
     lines = []
     for point in points:

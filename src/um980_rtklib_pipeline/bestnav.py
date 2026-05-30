@@ -16,7 +16,7 @@ from typing import Literal
 
 from .nmea import make_sentence
 from .stream import StreamRecord
-from .timeutil import gps_week_tow_to_datetime
+from .timeutil import gps_week_tow_to_utc_datetime
 
 BestNavSource = Literal["BESTNAVA", "BESTNAVB"]
 BestNavNmeaSentence = Literal["GGA", "RMC", "VTG"]
@@ -191,7 +191,7 @@ def parse_bestnavb(raw: bytes, *, raw_record_index: int | None = None) -> BestNa
 
     return BestNavRecord(
         source="BESTNAVB",
-        time_utc=gps_week_tow_to_datetime(gps_week, tow_s),
+        time_utc=gps_week_tow_to_utc_datetime(gps_week, tow_s),
         gps_week=gps_week,
         tow_s=tow_s,
         pos_sol_status=SOLUTION_STATUS_NAMES.get(pos_status_id, f"STATUS_{pos_status_id}"),
@@ -241,7 +241,7 @@ def parse_bestnava(text: str, *, raw_record_index: int | None = None) -> BestNav
     header = _csv_fields(header_text)
     payload = _csv_fields(payload_text)
     gps_week, tow_s = _extract_header_time(header)
-    time_utc = gps_week_tow_to_datetime(gps_week, tow_s)
+    time_utc = gps_week_tow_to_utc_datetime(gps_week, tow_s)
     if len(payload) < 6:
         raise ValueError("BESTNAVA payload is too short")
 

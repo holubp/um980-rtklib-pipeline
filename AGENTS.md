@@ -10,6 +10,12 @@
 - BESTNAV-derived NMEA is a receiver-solution export product, not RTKLIB raw
   input. Keep it separate from live NMEA extraction and never feed BESTNAV into
   RTKLIB estimation in place of OBSVM*/NAV/base observations.
+- BESTNAV may be used as an explicit solution-track source for CSV/GPX/NMEA
+  exports. Preserve native multi-Hz epochs by default and generate standard
+  GGA/RMC/VTG when writing BESTNAV-derived `solution.nmea`.
+- Mixed binary logs can contain arbitrary `$` bytes. NMEA extraction must
+  validate ASCII sentence shape and checksum-bearing lines before accepting
+  them as receiver NMEA.
 - ION/UTC/TROPINFO records must be counted and preserved in analysis output.
   Do not write them into RINEX NAV headers until the exact family mapping is
   verified against RINEX syntax and RTKLIB parser behavior.

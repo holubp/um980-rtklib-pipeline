@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import binascii
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
@@ -30,6 +31,23 @@ BINARY_MESSAGE_TYPES = {
     2118: "BESTNAVB",
     2999: "BD3EPHB",
 }
+KNOWN_NMEA_SENTENCE_TYPES = {
+    "DTM",
+    "GBS",
+    "GGA",
+    "GLL",
+    "GNS",
+    "GRS",
+    "GSA",
+    "GST",
+    "GSV",
+    "RMC",
+    "THS",
+    "VTG",
+    "ZDA",
+}
+KNOWN_PROPRIETARY_NMEA_TYPES = {"ADRNAVA", "PPPNAVA"}
+NMEA_LINE_RE = re.compile(rb"^\$([A-Z0-9]{5}|P[A-Z0-9]{3,}|ADRNAVA|PPPNAVA)(?:,[ -~]*)?(?:\*[0-9A-Fa-f]{2})?\r?\n?$")
 
 
 @dataclass(frozen=True)
@@ -129,6 +147,36 @@ def nmea_checksum_ok(line: bytes) -> bool | None:
     return actual == expected
 
 
+def is_plausible_nmea_line(line: bytes) -> bool:
+    """Return true when a byte line is structurally plausible NMEA text.
+
+    Mixed UM980 binary logs may contain arbitrary ``$`` bytes inside binary
+    payloads. This guard prevents those fragments from being treated as live
+    NMEA by requiring ASCII text, a normal talker/sentence family, and a valid
+    checksum when a checksum is present.
+    """
+
+    if not line.startswith(b"$") or len(line) > 1024 or not NMEA_LINE_RE.match(line):
+        return False
+    try:
+        text = line.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return False
+    msg_type = record_message_type(text, "$")
+    if not msg_type:
+        return False
+    if msg_type in KNOWN_PROPRIETARY_NMEA_TYPES:
+        return True
+    if msg_type.startswith("P"):
+        return True
+    if len(msg_type) != 5:
+        return False
+    if msg_type[-3:] not in KNOWN_NMEA_SENTENCE_TYPES:
+        return False
+    ok = nmea_checksum_ok(line)
+    return ok is not False
+
+
 def unicore_ascii_checksum_ok(line: bytes) -> bool | None:
     """Validate a Unicore ASCII CRC32 checksum.
 
@@ -221,6 +269,11 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
                     noise_start = pos
                 break
             raw = data[pos : end + 1]
+            if not is_plausible_nmea_line(raw):
+                if noise_start is None:
+                    noise_start = pos
+                pos += 1
+                continue
             flush_noise(pos)
             text = raw.decode("ascii", errors="replace").strip()
             ok = nmea_checksum_ok(raw)

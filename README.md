@@ -202,10 +202,28 @@ NMEA extraction writes:
   `--position-nmea best` keeps the best sentence per NMEA timestamp, preferring
   GGA/GNS over RMC because they carry fix quality or mode information. Fractional
   timestamps are preserved, so multi-Hz position streams keep every epoch.
-- `<basename>.solution.nmea`: compact proprietary `PUM980Q` solution summaries.
+- `<basename>.solution.nmea`: solution-track NMEA. For live NMEA-derived tracks
+  this remains compact proprietary `PUM980Q` summaries; for BESTNAV-derived
+  tracks it contains standard checksummed `GNGGA`, `GNRMC`, and `GNVTG`
+  sentences at the native BESTNAV epoch rate.
 
 Use `--position-nmea all` to keep every valid GGA/GNS/RMC position sentence, or
 `--position-nmea none` to skip the compact original-position file.
+
+Use internal UM980 BESTNAV receiver solutions as the normal solution track:
+
+```bash
+um980-ppk extract rover.unc \
+  --track-source bestnavb \
+  --solution all \
+  --position-nmea none \
+  -v
+```
+
+`--track-source auto` now falls back to decoded BESTNAV records when no valid
+live NMEA position records are present. `--track-source bestnavb` forces binary
+BESTNAVB only, while `--track-source bestnav` accepts decoded BESTNAVA and
+BESTNAVB. BESTNAV is still a receiver solution product, not an RTKLIB raw input.
 
 Generate standard app-readable NMEA from BESTNAV receiver-solution records:
 

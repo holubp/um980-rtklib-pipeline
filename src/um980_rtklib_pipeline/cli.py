@@ -74,6 +74,7 @@ from .rtklib_config_patch import patch_config_with_autoqc
 from .rtklib_summary import format_rtklib_solution_summary, summarize_rtklib_solution
 from .solution import (
     SolutionPoint,
+    bestnav_records_to_solution_extraction,
     extract_solutions,
     position_nmea_records,
     write_all_records_csv,
@@ -232,6 +233,17 @@ def _add_bestnav_nmea_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_track_source_arg(parser: argparse.ArgumentParser) -> None:
+    """Add solution-track source selection."""
+
+    parser.add_argument(
+        "--track-source",
+        choices=["auto", "nmea", "ppp", "adr", "gga", "bestnav", "bestnavb"],
+        default="auto",
+        help="Solution-track source. auto falls back to BESTNAV when live position NMEA is absent.",
+    )
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -326,6 +338,26 @@ def _extract_bundle(args: argparse.Namespace):
         len(bestnav.records),
         sum(bestnav.malformed.values()),
     )
+    track_source = getattr(args, "track_source", "auto")
+    if track_source in {"bestnav", "bestnavb"} or (
+        track_source == "auto" and not solutions.solution_points and bestnav.records
+    ):
+        bestnav_source = "binary" if track_source == "bestnavb" else "auto"
+        bestnav_solutions = bestnav_records_to_solution_extraction(
+            bestnav.records,
+            source=bestnav_source,
+            talk_id=getattr(args, "bestnav_nmea_talk_id", "GN"),
+        )
+        if bestnav_solutions.solution_points:
+            logging.info(
+                "using BESTNAV-derived solutions: points=%d nmea_records=%d source=%s",
+                len(bestnav_solutions.solution_points),
+                len(bestnav_solutions.solution_nmea),
+                bestnav_source,
+            )
+            solutions = bestnav_solutions
+        elif track_source in {"bestnav", "bestnavb"}:
+            raise ValueError(f"--track-source {track_source} was requested but no valid BESTNAV solution epochs exist")
     logging.info("scanning ION/UTC/TROPINFO diagnostics")
     diagnostics = extract_diagnostics(records)
     logging.info(
@@ -1825,7 +1857,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         write_lines(all_nmea, solutions.all_nmea)
         if position_nmea_mode != "none":
             write_lines(position_nmea, position_nmea_records(solutions.all_nmea, position_nmea_mode))
-        write_solution_nmea(solution_nmea, solutions.solution_points)
+        write_solution_nmea(solution_nmea, solutions.solution_points, solutions.solution_nmea)
         logging.info(
             "wrote NMEA outputs: %s%s, %s",
             all_nmea,
@@ -2298,7 +2330,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "best keeps GGA/GNS over RMC per timestamp; all keeps every usable GGA/GNS/RMC."
                 ),
             )
-            p.add_argument("--track-source", choices=["auto", "nmea", "ppp", "adr", "gga"], default="auto")
+            _add_track_source_arg(p)
             p.add_argument("--obs-csv", action="store_true")
             p.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="none")
             p.add_argument("--rinex-version", default="3.04")
@@ -2405,6 +2437,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auto_sat_qc_args(pipe)
     pipe.add_argument("--obs-csv", action="store_true", default=True)
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
+    _add_track_source_arg(pipe)
     pipe.add_argument(
         "--position-nmea",
         choices=["none", "all", "best"],
