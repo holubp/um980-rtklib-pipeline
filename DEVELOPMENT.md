@@ -112,3 +112,9 @@ BKG URL templates must be verified against public directory listings and sample
 files before being added. BKG high-rate downloads preflight the directory index
 so missing station/time combinations fall back with one clear warning rather
 than one failed download per 15-minute file and mirror.
+
+Base-resolution selection is part of the processing contract. High-rate
+requests must first plan and try high-rate 1 s products and must validate
+selected filenames before RTKLIB runs. Low-rate cached `01H_30S`/`_30S_`
+products must not satisfy the high-rate attempt; they are only valid after the
+high-rate group fails and fallback is enabled.

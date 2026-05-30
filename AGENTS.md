@@ -40,6 +40,10 @@
 - EUREF base-data selection must log unavailable high-rate or legacy RINEX 2
   products before falling back. Keep legacy test archives and downloaded base
   files local-only.
+- `--base-resolution high` must attempt and validate high-rate 1 s base files
+  before low-rate candidates. Low-rate `01H_30S`/`_30S_` files may only be used
+  after explicit fallback handling and must be logged as fallback, never as a
+  successful high-rate selection.
 - EUREF provider URL templates must be verified against real public directory
   listings and sample files before being added. For BKG high-rate products,
   preflight the directory index so missing station/rate combinations produce

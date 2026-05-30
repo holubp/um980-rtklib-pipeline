@@ -235,10 +235,18 @@ limits default to `--max-auto-exclude 4`, `--max-high-el-exclude 1`,
 blocked by caps or geometry protection are listed in the watch list instead of
 being excluded.
 
-`--base-resolution low` selects hourly 30 s EUREF data. `high` selects 1 s
-high-rate chunks and falls back to low-rate data with a warning when the
-high-rate files are unavailable. `--base-rinex-version 2` enables compact RINEX
+`--base-resolution low` selects hourly 30 s EUREF data, normally names
+containing `01H_30S_MO`. `--base-resolution high` selects 1 s high-rate chunks,
+normally names containing `15M_01S_MO`. High-rate requests try high-rate
+candidate groups first. Only after those fail may the downloader fall back to
+low-rate 30 s data, and only when fallback is enabled. Use
+`--no-base-fallback` when a high-rate comparison must fail instead of silently
+becoming a low-rate run. `--base-rinex-version 2` enables compact RINEX
 2/Hatanaka EUREF names, and `auto` tries v3 before v2.
+Verbose logs include `requested_base_resolution`, candidate groups, selected
+provider, selected nominal rate, fallback status, and selected file names. A log
+line containing `rate=30s`, `selected_rate=30s`, `_30S_`, or `01H_30S_MO` means
+the selected base data are low-rate.
 Base downloads are planned from the generated rover RINEX observation span and
 include every base product that overlaps or touches that span. The default
 `--time-margin 0` avoids fetching adjacent non-overlapping products; set a

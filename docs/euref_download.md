@@ -36,8 +36,9 @@ Hatanaka-compressed `.crx.gz` products.
 
 ## Rate and RINEX Version Selection
 
-Use `--base-resolution low` for hourly 30 s files and `--base-resolution high`
-for 15 minute 1 s files:
+Use `--base-resolution low` for hourly 30 s files, normally RINEX 3 names
+containing `01H_30S_MO`. Use `--base-resolution high` for 15 minute 1 s files,
+normally names containing `15M_01S_MO`:
 
 ```bash
 um980-ppk download-base rover.unc \
@@ -48,14 +49,28 @@ um980-ppk download-base rover.unc \
 ```
 
 High-rate EUREF files are not always published for every station and interval.
-When high-rate data is requested, the CLI logs the failed provider/URLs and
-falls back to low-rate data by default. Use `--no-base-fallback` when a missing
-high-rate file should be a hard failure.
+When high-rate data is requested, the CLI logs the high-rate candidate groups,
+tries them before low-rate products, and logs the failed provider/URLs before
+falling back to low-rate data by default. Use `--no-base-fallback` when a
+missing high-rate file should be a hard failure. This is recommended for
+experiments comparing high-rate and low-rate base data, because fallback makes
+the run a low-rate base run.
+
+To verify what actually ran, inspect verbose logs:
+
+- `requested_base_resolution=high` means the user requested high-rate data.
+- `selected_rate=1s`, `_01S_`, or `15M_01S_MO` means high-rate data were
+  selected.
+- `rate=30s`, `selected_rate=30s`, `_30S_`, or `01H_30S_MO` means low-rate
+  data were selected. If this appears after a high-rate request, the run used
+  fallback and is not a valid high-rate run.
 
 Downloads are cache-first. Existing source archives, decompressed files, and
 converted `.rnx`/`.YYo` products in `--base-dir` or `--cache-dir` are reused;
-only missing products are downloaded. Use `--force-download` to refresh planned
-source archives from the provider.
+only missing products are downloaded. Cached low-rate files are not accepted for
+a high-rate attempt; they are only considered during the explicit low-rate
+fallback attempt. Use `--force-download` to refresh planned source archives from
+the provider.
 
 By default, `--time-margin` is `0`: only base products overlapping or touching
 the recorded interval are requested. Set `--time-margin SECONDS` only when you

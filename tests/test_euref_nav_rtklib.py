@@ -1118,6 +1118,132 @@ def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatc
     assert "highrate" in attempts[0]
     assert "nrt" in attempts[1]
     assert any("trying provider=bev-nrt rate=30s rinex=3" in record.getMessage() for record in caplog.records)
+    assert any("This run is not a high-rate base run" in record.getMessage() for record in caplog.records)
+    assert any("falling back to low-rate 30s base data" in record.getMessage() for record in caplog.records)
+
+
+def test_high_resolution_prefers_1s_candidates(tmp_path: Path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    high_file = tmp_path / "CPAR00CZE_S_20261430530_15M_01S_MO.rnx"
+    high_file.write_text(
+        "     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n"
+        "                                                            END OF HEADER\n",
+        encoding="ascii",
+    )
+    calls: list[str] = []
+    args = argparse.Namespace(
+        station="CPAR",
+        station_long=None,
+        base_resolution="high",
+        base_rinex_version="3",
+        base_rate="1s",
+        base_provider="bev-nrt",
+        no_base_fallback=False,
+        whole_day=False,
+        offline=False,
+        dry_run=False,
+        cache_dir=str(tmp_path),
+        base_dir=None,
+        crx2rnx=None,
+        cleanup=False,
+        force_download=False,
+    )
+
+    def fake_download_urls(urls: list[str], cache_dir: Path, *, force: bool = False):
+        calls.append(urls[0])
+        if "highrate" not in urls[0]:
+            raise AssertionError("low-rate fallback should not run when high-rate data is available")
+        return [high_file]
+
+    monkeypatch.setattr(cli, "filter_urls_by_remote_listing", lambda urls, cache_dir, *, force=False: urls)
+    monkeypatch.setattr(cli, "download_urls", fake_download_urls)
+
+    paths = cli._download_base_files_for_window(
+        args,
+        datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+        datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+    )
+
+    assert paths == [high_file]
+    assert len(calls) == 1
+    assert any("requested_base_resolution=high" in record.getMessage() for record in caplog.records)
+    assert any("selected_rate=1s" in record.getMessage() for record in caplog.records)
+
+
+def test_high_resolution_does_not_use_30s_cache_without_fallback(tmp_path: Path, monkeypatch):
+    cached_low = tmp_path / "CPAR00CZE_R_20261430500_01H_30S_MO.rnx"
+    cached_low.write_text("cached low-rate\n", encoding="ascii")
+    attempted: list[str] = []
+    args = argparse.Namespace(
+        station="CPAR",
+        station_long=None,
+        base_resolution="high",
+        base_rinex_version="3",
+        base_rate="1s",
+        base_provider="bev-nrt",
+        no_base_fallback=True,
+        whole_day=False,
+        offline=False,
+        dry_run=False,
+        cache_dir=str(tmp_path),
+        base_dir=None,
+        crx2rnx=None,
+        cleanup=False,
+        force_download=False,
+    )
+
+    def fail_urlretrieve(url: str, target: Path):
+        attempted.append(url)
+        raise OSError("not available")
+
+    monkeypatch.setattr(cli, "filter_urls_by_remote_listing", lambda urls, cache_dir, *, force=False: urls)
+    monkeypatch.setattr("um980_rtklib_pipeline.euref.urlretrieve", fail_urlretrieve)
+
+    with pytest.raises(RuntimeError, match="no usable EUREF base observation files"):
+        cli._download_base_files_for_window(
+            args,
+            datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+            datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        )
+
+    assert attempted
+    assert all("highrate" in url for url in attempted)
+
+
+def test_low_resolution_accepts_30s(tmp_path: Path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    low_file = tmp_path / "CPAR00CZE_R_20261430500_01H_30S_MO.rnx"
+    low_file.write_text("low-rate\n", encoding="ascii")
+    args = argparse.Namespace(
+        station="CPAR",
+        station_long=None,
+        base_resolution="low",
+        base_rinex_version="3",
+        base_rate="30s",
+        base_provider="bev-nrt",
+        no_base_fallback=False,
+        whole_day=False,
+        offline=False,
+        dry_run=False,
+        cache_dir=str(tmp_path),
+        base_dir=None,
+        crx2rnx=None,
+        cleanup=False,
+        force_download=False,
+    )
+    monkeypatch.setattr(cli, "filter_urls_by_remote_listing", lambda urls, cache_dir, *, force=False: urls)
+    monkeypatch.setattr(cli, "download_urls", lambda urls, cache_dir, *, force=False: [low_file])
+
+    paths = cli._download_base_files_for_window(
+        args,
+        datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+        datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+    )
+
+    assert paths == [low_file]
+    assert any("requested_base_resolution=low" in record.getMessage() for record in caplog.records)
+    assert any("selected_rate=30s" in record.getMessage() for record in caplog.records)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
 def test_download_urls_reuses_normalised_cache_without_network(tmp_path: Path, monkeypatch):
@@ -1194,6 +1320,131 @@ def test_v2_download_allows_legacy_short_station_code():
         base_rinex_version="2",
     )
     assert cli._resolve_station_for_base_download(args) == "PFA2"
+
+
+def test_pipeline_passes_base_resolution_to_resolver(tmp_path: Path, monkeypatch):
+    out_dir = tmp_path / "out"
+    nav = tmp_path / "nav.rnx"
+    base = tmp_path / "CPAR00CZE_S_20261430530_15M_01S_MO.rnx"
+    nav.write_text("nav\n", encoding="ascii")
+    base.write_text("base\n", encoding="ascii")
+    captured: dict[str, object] = {}
+    args = cli.build_parser().parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "rover",
+            "--download-base",
+            "--station",
+            "CPAR",
+            "--base-resolution",
+            "high",
+            "--run-rtklib",
+            "--nav-file",
+            str(nav),
+            "--base-position-source",
+            "none",
+        ]
+    )
+
+    monkeypatch.setattr(cli, "cmd_extract", lambda _args: 0)
+    monkeypatch.setattr(cli, "cmd_rinex", lambda _args: 0)
+    monkeypatch.setattr(
+        cli,
+        "read_rinex_obs_time_span",
+        lambda _path: argparse.Namespace(
+            start=datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+            end=datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        ),
+    )
+
+    def fake_download(download_args, start, end):
+        captured["base_resolution"] = download_args.base_resolution
+        captured["no_base_fallback"] = download_args.no_base_fallback
+        return [base]
+
+    monkeypatch.setattr(cli, "_download_base_files_for_window", fake_download)
+    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs: (base_obs, []))
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
+
+    class Candidate:
+        path = nav
+
+    class Resolution:
+        warnings: list[str] = []
+        selected = [Candidate()]
+
+    monkeypatch.setattr(cli, "resolve_nav_sources", lambda **_kwargs: Resolution())
+    monkeypatch.setattr(cli, "_run_rtklib_output_formats", lambda **_kwargs: [])
+
+    assert cli.cmd_pipeline(args) == 0
+    assert captured == {"base_resolution": "high", "no_base_fallback": False}
+
+
+def test_no_base_fallback_is_honoured_by_pipeline(tmp_path: Path, monkeypatch):
+    out_dir = tmp_path / "out"
+    nav = tmp_path / "nav.rnx"
+    base = tmp_path / "CPAR00CZE_S_20261430530_15M_01S_MO.rnx"
+    nav.write_text("nav\n", encoding="ascii")
+    base.write_text("base\n", encoding="ascii")
+    captured: dict[str, object] = {}
+    args = cli.build_parser().parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "rover",
+            "--download-base",
+            "--station",
+            "CPAR",
+            "--base-resolution",
+            "high",
+            "--no-base-fallback",
+            "--run-rtklib",
+            "--nav-file",
+            str(nav),
+            "--base-position-source",
+            "none",
+        ]
+    )
+
+    monkeypatch.setattr(cli, "cmd_extract", lambda _args: 0)
+    monkeypatch.setattr(cli, "cmd_rinex", lambda _args: 0)
+    monkeypatch.setattr(
+        cli,
+        "read_rinex_obs_time_span",
+        lambda _path: argparse.Namespace(
+            start=datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+            end=datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        ),
+    )
+
+    def fake_download(download_args, start, end):
+        captured["base_resolution"] = download_args.base_resolution
+        captured["no_base_fallback"] = download_args.no_base_fallback
+        return [base]
+
+    monkeypatch.setattr(cli, "_download_base_files_for_window", fake_download)
+    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs: (base_obs, []))
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
+
+    class Candidate:
+        path = nav
+
+    class Resolution:
+        warnings: list[str] = []
+        selected = [Candidate()]
+
+    monkeypatch.setattr(cli, "resolve_nav_sources", lambda **_kwargs: Resolution())
+    monkeypatch.setattr(cli, "_run_rtklib_output_formats", lambda **_kwargs: [])
+
+    assert cli.cmd_pipeline(args) == 0
+    assert captured == {"base_resolution": "high", "no_base_fallback": True}
 
 
 def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monkeypatch):

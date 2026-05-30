@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import shutil
 import sys
 from datetime import timedelta
@@ -75,6 +76,8 @@ from .solution import (
 from .stream import parse_stream
 
 BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate")
+BASE_RATE_HIGH = "1s"
+BASE_RATE_LOW = "30s"
 RTK_POS_MODE_CODES = {
     "single": "0",
     "dgps": "1",
@@ -577,13 +580,13 @@ def _add_auto_sat_qc_args(parser: argparse.ArgumentParser) -> None:
 
 def _base_download_attempts(args: argparse.Namespace) -> list[tuple[str, str, str, str]]:
     requested_resolution = args.base_resolution
-    if args.base_rate == "1s" or args.base_provider in {"bkg-euref-highrate", "bkg-euref-highrate-v2"}:
+    if args.base_rate == BASE_RATE_HIGH or args.base_provider in {"bkg-euref-highrate", "bkg-euref-highrate-v2"}:
         requested_resolution = "high"
     versions = ["3", "2"] if args.base_rinex_version == "auto" else [args.base_rinex_version]
     attempts: list[tuple[str, str, str, str]] = []
     for version in versions:
         attempts.append(_base_download_attempt(args, requested_resolution, version))
-    if requested_resolution == "high" and not args.no_base_fallback:
+    if requested_resolution == "high" and _base_fallback_allowed(args):
         for version in versions:
             attempts.append(_base_download_attempt(args, "low", version))
     unique: list[tuple[str, str, str, str]] = []
@@ -602,11 +605,100 @@ def _base_download_attempt(
 ) -> tuple[str, str, str, str]:
     if resolution == "high":
         provider = "bkg-euref-highrate-v2" if rinex_version == "2" else "bkg-euref-highrate"
-        return resolution, rinex_version, provider, "1s"
+        return resolution, rinex_version, provider, BASE_RATE_HIGH
     provider = args.base_provider
     if provider == "bkg-euref-highrate":
         provider = "bkg-euref-nrt"
-    return resolution, rinex_version, provider, "30s"
+    return resolution, rinex_version, provider, BASE_RATE_LOW
+
+
+def _base_fallback_allowed(args: argparse.Namespace) -> bool:
+    """Return true when high-rate EUREF requests may fall back to low-rate data."""
+
+    return not bool(getattr(args, "no_base_fallback", False))
+
+
+def _base_rate_from_filename(path: Path) -> str:
+    """Classify a base observation file by known EUREF filename rate patterns.
+
+    Returns:
+        `1s`, `30s`, or `unknown`.
+    """
+
+    name = path.name.upper()
+    if "_01S_" in name or "15M_01S" in name:
+        return BASE_RATE_HIGH
+    if "_30S_" in name or "01H_30S" in name:
+        return BASE_RATE_LOW
+    # Compact RINEX 2 high-rate BKG names include two minute digits after the
+    # hour letter, e.g. TUBO143F15.26O; low-rate hourly names stop at the hour.
+    if re.fullmatch(r"[A-Z0-9]{4}\d{3}[A-X]\d{2}\.\d{2}[OD](?:\.(?:GZ|Z))?", name):
+        return BASE_RATE_HIGH
+    if re.fullmatch(r"[A-Z0-9]{4}\d{3}[A-X]\.\d{2}[OD](?:\.(?:GZ|Z))?", name):
+        return BASE_RATE_LOW
+    return "unknown"
+
+
+def _selected_base_rate(paths: list[Path], nominal_rate: str) -> str:
+    """Return the selected base rate, preferring explicit filename evidence."""
+
+    rates = {_base_rate_from_filename(path) for path in paths}
+    rates.discard("unknown")
+    if len(rates) == 1:
+        return rates.pop()
+    if len(rates) > 1:
+        return "mixed"
+    return nominal_rate
+
+
+def _validate_selected_base_resolution(
+    *,
+    paths: list[Path],
+    requested_resolution: str,
+    selected_resolution: str,
+    nominal_rate: str,
+    provider: str,
+    rinex_version: str,
+    station_long: str,
+    fallback_used: bool,
+    allow_fallback: bool,
+) -> str:
+    """Validate and log selected EUREF base files against the requested rate."""
+
+    selected_rate = _selected_base_rate(paths, nominal_rate)
+    low_selected = selected_rate in {BASE_RATE_LOW, "mixed"} or any(
+        _base_rate_from_filename(path) == BASE_RATE_LOW for path in paths
+    )
+    if requested_resolution == "high" and low_selected:
+        message = (
+            "requested high-rate base data but selected low-rate 30 s base observations: "
+            f"station={station_long} provider={provider} rinex={rinex_version}"
+        )
+        if fallback_used and allow_fallback:
+            logging.warning(
+                "%s; falling back because fallback is enabled. This run is not a high-rate base run.",
+                message,
+            )
+        else:
+            raise RuntimeError(
+                message
+                + "; rerun with fallback enabled or choose another station/provider with high-rate 1 s data"
+            )
+    for path in paths:
+        logging.info(
+            "selected base observation: station=%s provider=%s requested_resolution=%s "
+            "selected_resolution=%s selected_rate=%s nominal_rate=%s rinex=%s fallback=%s file=%s",
+            station_long,
+            provider,
+            requested_resolution,
+            selected_resolution,
+            selected_rate,
+            nominal_rate,
+            rinex_version,
+            fallback_used,
+            path,
+        )
+    return selected_rate
 
 
 def _download_base_files(args: argparse.Namespace) -> list[Path]:
@@ -623,6 +715,16 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
         raise ValueError("--station is required to download base observations")
     station_long = _resolve_station_for_base_download(args)
     attempts = _base_download_attempts(args)
+    requested_resolution = "high" if any(attempt[0] == "high" for attempt in attempts[:1]) else args.base_resolution
+    allow_fallback = _base_fallback_allowed(args)
+    logging.info(
+        "base resolution request: requested_base_resolution=%s requested_base_rinex_version=%s "
+        "station=%s allow_base_fallback=%s",
+        requested_resolution,
+        args.base_rinex_version,
+        station_long,
+        str(allow_fallback).lower(),
+    )
     planned_by_attempt: list[tuple[str, str, str, str, list[str]]] = []
     for resolution, version, provider, rate in attempts:
         urls = planned_urls(
@@ -634,6 +736,15 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
             base_rate=rate,
             whole_day=args.whole_day,
             rinex_version=version,
+        )
+        logging.info(
+            "base candidate group: resolution=%s provider=%s nominal_rate=%s rinex=%s fallback=%s candidates=%d",
+            resolution,
+            provider,
+            rate,
+            version,
+            str(resolution != requested_resolution).lower(),
+            len(urls),
         )
         planned_by_attempt.append((resolution, version, provider, rate, urls))
 
@@ -653,14 +764,17 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
     logging.info("EUREF base files will be stored in %s", cache_dir)
     last_error: Exception | None = None
     for index, (resolution, version, provider, rate, urls) in enumerate(planned_by_attempt):
+        fallback_attempt = resolution != requested_resolution
         try:
             logging.info(
-                "%s EUREF base observations: station=%s provider=%s rate=%s rinex=%s",
+                "%s EUREF base observations: station=%s provider=%s rate=%s rinex=%s resolution=%s fallback=%s",
                 "force-downloading" if args.force_download else "resolving cached/downloaded",
                 station_long,
                 provider,
                 rate,
                 version,
+                resolution,
+                str(fallback_attempt).lower(),
             )
             listed_urls = filter_urls_by_remote_listing(urls, cache_dir, force=args.force_download)
             if len(listed_urls) != len(urls):
@@ -683,7 +797,23 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
                 else:
                     logging.info("normalised EUREF base observation file: %s -> %s", source, normalised_path)
             if normalised:
-                if index > 0:
+                selected_rate = _validate_selected_base_resolution(
+                    paths=normalised,
+                    requested_resolution=requested_resolution,
+                    selected_resolution=resolution,
+                    nominal_rate=rate,
+                    provider=provider,
+                    rinex_version=version,
+                    station_long=station_long,
+                    fallback_used=fallback_attempt,
+                    allow_fallback=allow_fallback,
+                )
+                if fallback_attempt:
+                    logging.warning(
+                        "requested high-rate base data but no high-rate candidate was available; "
+                        "falling back to low-rate %s base data because fallback is enabled",
+                        selected_rate,
+                    )
                     logging.warning(
                         "using fallback EUREF base observations: provider=%s rate=%s rinex=%s",
                         provider,

@@ -357,13 +357,22 @@ um980-ppk pipeline rover.unc \
   --run-rtklib
 ```
 
-Use `--base-resolution low` for hourly 30 s EUREF data or
-`--base-resolution high` for 15 minute 1 s high-rate files. If high-rate data is
-requested but unavailable, the command warns with the failed URLs and falls back
-to low-rate data unless `--no-base-fallback` is set. `--base-rinex-version 2`
-selects compact RINEX 2/Hatanaka EUREF names, including BEV low-rate
-`.YYd.gz` names and BKG high-rate `.YYd.Z` names; `auto` plans RINEX 3 first,
-then RINEX 2 alternatives.
+Use `--base-resolution low` for hourly 30 s EUREF data, normally RINEX 3 names
+containing `01H_30S_MO`. Use `--base-resolution high` for high-rate 1 s data,
+normally 15 minute RINEX 3 names containing `15M_01S_MO`. If high-rate data is
+requested but unavailable, the command warns with the failed high-rate provider
+or candidate URLs and falls back to low-rate data unless `--no-base-fallback`
+is set. Use `--no-base-fallback` for experiments that compare high-rate and
+low-rate base data, because any fallback makes the run a low-rate base run.
+`--base-rinex-version 2` selects compact RINEX 2/Hatanaka EUREF names, including
+BEV low-rate `.YYd.gz` names and BKG high-rate `.YYd.Z` names; `auto` plans
+RINEX 3 first, then RINEX 2 alternatives.
+
+Verbose logs always show the requested base resolution, candidate groups,
+selected provider, selected nominal rate, fallback status, and selected file
+names. If logs show `rate=30s`, `selected_rate=30s`, `_30S_`, or `01H_30S_MO`,
+the run did not use high-rate base observations even if `--base-resolution high`
+was passed.
 
 Base downloads are cache-first. The downloader reuses existing archives,
 decompressed files, or already converted `.rnx`/`.YYo` products in `--base-dir`
