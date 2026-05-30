@@ -7,6 +7,7 @@ import logging
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 from statistics import mean, median
 from typing import Literal
@@ -379,7 +380,16 @@ def _bestnav_solution_point(record: BestNavRecord) -> SolutionPoint:
 
 
 def _bestnav_has_valid_position(record: BestNavRecord) -> bool:
-    return record.pos_sol_status.upper() not in {"NONE", "NO_SOLUTION", "SOL_INVALID", "INSUFFICIENT_OBS"}
+    if record.pos_sol_status.upper() != "SOL_COMPUTED":
+        return False
+    if record.pos_type.upper() in {"", "NONE", "NO_SOLUTION", "SOL_INVALID"}:
+        return False
+    return (
+        isfinite(record.lat_deg)
+        and isfinite(record.lon_deg)
+        and -90.0 <= record.lat_deg <= 90.0
+        and -180.0 <= record.lon_deg <= 180.0
+    )
 
 
 def _bestnav_fix_quality(record: BestNavRecord) -> int:

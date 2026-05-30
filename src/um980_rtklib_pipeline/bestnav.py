@@ -12,6 +12,7 @@ import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import isfinite
 from typing import Literal
 
 from .nmea import make_sentence
@@ -185,9 +186,7 @@ def parse_bestnavb(raw: bytes, *, raw_record_index: int | None = None) -> BestNa
     pos_type_id = _u32(payload, 4)
     vel_status_id = _u32(payload, 72)
     vel_type_id = _u32(payload, 76)
-    station_id = payload[52:56].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
-    if station_id in {"", "0", "0000"}:
-        station_id = None
+    station_id = _station_id_bytes(payload[52:56].split(b"\x00", 1)[0])
 
     return BestNavRecord(
         source="BESTNAVB",
@@ -251,9 +250,7 @@ def parse_bestnava(text: str, *, raw_record_index: int | None = None) -> BestNav
     lon = _required_float(payload, 3, "longitude")
     height_msl = _required_float(payload, 4, "height")
     undulation = _float_at(payload, 5) or 0.0
-    station_id = _string_at(payload, 10)
-    if station_id in {"0", "0000"}:
-        station_id = None
+    station_id = _station_id_text(_string_at(payload, 10) or "")
 
     return BestNavRecord(
         source="BESTNAVA",
@@ -425,6 +422,23 @@ def _string_at(fields: list[str], index: int) -> str | None:
     return value or None
 
 
+def _station_id_text(value: str) -> str | None:
+    """Return a safe ASCII NMEA station ID, or `None` when unavailable."""
+
+    text = "".join(char for char in value.strip() if char.isascii() and char.isprintable())
+    if text in {"", "0", "0000"}:
+        return None
+    return text if all(char.isalnum() for char in text) else None
+
+
+def _station_id_bytes(value: bytes) -> str | None:
+    """Return a safe binary BESTNAV station ID without partial garbage decode."""
+
+    if any(byte < 0x20 or byte > 0x7E for byte in value):
+        return None
+    return _station_id_text(value.decode("ascii"))
+
+
 def _float_text(value: str) -> float | None:
     try:
         return float(value.strip())
@@ -464,7 +478,16 @@ def _dedupe_timestamps(records: list[BestNavRecord]) -> list[BestNavRecord]:
 
 
 def _has_position(record: BestNavRecord) -> bool:
-    return record.pos_sol_status.upper() not in {"NONE", "NO_SOLUTION", "SOL_INVALID", "INSUFFICIENT_OBS"}
+    if record.pos_sol_status.upper() != "SOL_COMPUTED":
+        return False
+    if record.pos_type.upper() in {"", "NONE", "NO_SOLUTION", "SOL_INVALID"}:
+        return False
+    return (
+        isfinite(record.lat_deg)
+        and isfinite(record.lon_deg)
+        and -90.0 <= record.lat_deg <= 90.0
+        and -180.0 <= record.lon_deg <= 180.0
+    )
 
 
 def _gga(record: BestNavRecord, talk: str) -> str:

@@ -113,6 +113,36 @@ def test_parse_bestnavb_payload_and_generate_nmea() -> None:
     assert ",4,20," in lines[0]
 
 
+def test_bestnavb_invalid_station_id_does_not_break_generated_nmea() -> None:
+    payload = bytearray(120)
+    struct.pack_into("<II", payload, 0, 0, 50)
+    struct.pack_into("<ddd", payload, 8, 50.0, 14.0, 250.5)
+    struct.pack_into("<fIfff", payload, 32, 45.1, 61, 0.1, 0.1, 0.2)
+    payload[52:56] = b"\xfft\t\x80"
+    payload[64] = 30
+    payload[65] = 20
+    struct.pack_into("<II", payload, 72, 0, 8)
+    struct.pack_into("<ddd", payload, 88, 1.0, 90.0, 0.0)
+    header = bytearray(24)
+    header[0:3] = b"\xaa\x44\xb5"
+    struct.pack_into("<H", header, 4, 2118)
+    struct.pack_into("<H", header, 6, len(payload))
+    struct.pack_into("<H", header, 10, 2419)
+    struct.pack_into("<I", header, 12, 132572000)
+
+    record = parse_bestnavb(bytes(header) + bytes(payload) + b"\x00\x00\x00\x00")
+    lines = bestnav_records_to_nmea([record], sentences=("GGA",), talk_id="GN")
+
+    assert record.station_id is None
+    assert lines[0].startswith("$GNGGA,")
+
+
+def test_bestnav_nmea_skips_non_computed_records() -> None:
+    record = replace(parse_bestnava(BESTNAVA.strip()), pos_sol_status="INSUFFICIENT_OBS", pos_type="NONE")
+
+    assert bestnav_records_to_nmea([record], sentences=("GGA", "RMC", "VTG"), talk_id="GN") == []
+
+
 def test_parse_bestnav_sentences_rejects_unknown_names() -> None:
     with pytest.raises(ValueError, match="unsupported BESTNAV NMEA sentence"):
         parse_bestnav_sentences("GGA,GLL")

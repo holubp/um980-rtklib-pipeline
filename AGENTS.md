@@ -13,6 +13,9 @@
 - BESTNAV may be used as an explicit solution-track source for CSV/GPX/NMEA
   exports. Preserve native multi-Hz epochs by default and generate standard
   GGA/RMC/VTG when writing BESTNAV-derived `solution.nmea`.
+- BESTNAV-derived solution exports must skip non-`SOL_COMPUTED`/`NONE` epochs
+  and must sanitize optional text fields such as station IDs before generating
+  ASCII NMEA.
 - Mixed binary logs can contain arbitrary `$` bytes. NMEA extraction must
   validate ASCII sentence shape and checksum-bearing lines before accepting
   them as receiver NMEA.
