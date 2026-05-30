@@ -8,7 +8,7 @@ import pytest
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline.files import classify_rinex_file
 from um980_rtklib_pipeline.rinex_nav import extract_rover_nav, rover_nav_files
-from um980_rtklib_pipeline.stream import parse_stream
+from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
 
 
 GPS_LINE = (
@@ -40,7 +40,8 @@ def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int
     struct.pack_into("<H", header, 6, len(payload))
     struct.pack_into("<H", header, 10, week)
     struct.pack_into("<I", header, 12, tow_ms)
-    return bytes(header) + payload + b"\x00\x00\x00\x00"
+    body = bytes(header) + payload
+    return body + unicore_binary_crc32(body).to_bytes(4, "little")
 
 
 def _gps_like_payload(prn: int = 9, week: int = 2419, health: int = 0) -> bytes:

@@ -19,6 +19,9 @@
 - Mixed binary logs can contain arbitrary `$` bytes. NMEA extraction must
   validate ASCII sentence shape and checksum-bearing lines before accepting
   them as receiver NMEA.
+- Mixed binary logs can also contain arbitrary Unicore-looking sync or `#`
+  bytes. Binary frames must pass Unicore CRC before decoding, and ASCII records
+  must pass printable record-shape checks before downstream parsers see them.
 - ION/UTC/TROPINFO records must be counted and preserved in analysis output.
   Do not write them into RINEX NAV headers until the exact family mapping is
   verified against RINEX syntax and RTKLIB parser behavior.

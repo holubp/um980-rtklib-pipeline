@@ -3,7 +3,16 @@ from __future__ import annotations
 from argparse import Namespace
 
 from um980_rtklib_pipeline import cli
-from um980_rtklib_pipeline.stream import parse_stream
+from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
+
+
+def _binary_frame(message_id: int, payload: bytes) -> bytes:
+    header = bytearray(24)
+    header[0:3] = b"\xaa\x44\xb5"
+    header[4:6] = message_id.to_bytes(2, "little")
+    header[6:8] = len(payload).to_bytes(2, "little")
+    body = bytes(header) + payload
+    return body + unicore_binary_crc32(body).to_bytes(4, "little")
 
 
 def test_extract_writes_bestnav_nmea_and_analysis_stats(tmp_path):
@@ -99,21 +108,7 @@ def test_extract_auto_uses_bestnav_when_live_nmea_positions_are_absent(tmp_path)
 
 
 def test_binary_ion_utc_ids_are_named_for_statistics():
-    gpsion_header = bytearray(24)
-    gpsion_header[0:3] = b"\xaa\x44\xb5"
-    gpsion_header[4:6] = (8).to_bytes(2, "little")
-    gpsion_header[6:8] = (4).to_bytes(2, "little")
-    gpsutc_header = bytearray(24)
-    gpsutc_header[0:3] = b"\xaa\x44\xb5"
-    gpsutc_header[4:6] = (19).to_bytes(2, "little")
-    gpsutc_header[6:8] = (4).to_bytes(2, "little")
-
-    records, diagnostics = parse_stream(
-        bytes(gpsion_header)
-        + b"abcd\x00\x00\x00\x00"
-        + bytes(gpsutc_header)
-        + b"abcd\x00\x00\x00\x00"
-    )
+    records, diagnostics = parse_stream(_binary_frame(8, b"abcd") + _binary_frame(19, b"abcd"))
 
     assert [record.msg_type for record in records] == ["GPSIONB", "GPSUTCB"]
     assert diagnostics.unicore_types["GPSIONB"] == 1

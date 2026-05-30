@@ -3,7 +3,7 @@ from pathlib import Path
 
 from um980_rtklib_pipeline.obs_decode import Observation, decode_observations, write_observations_csv
 from um980_rtklib_pipeline.rinex_obs import _format_obs_value, observations_for_rinex, write_rinex_obs
-from um980_rtklib_pipeline.stream import parse_stream
+from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
 
 
 def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int = 132572000) -> bytes:
@@ -14,7 +14,8 @@ def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int
     struct.pack_into("<H", header, 6, len(payload))
     struct.pack_into("<H", header, 10, week)
     struct.pack_into("<I", header, 12, tow_ms)
-    return bytes(header) + payload + bytes(4)
+    body = bytes(header) + payload
+    return body + unicore_binary_crc32(body).to_bytes(4, "little")
 
 
 def _obsvmb_payload(entries: list[tuple[int, int, float, float, float, float, float, int]]) -> bytes:
@@ -205,11 +206,7 @@ def test_obsvma_rejects_non_fine_receiver_time():
 
 
 def test_binary_ephemeris_is_not_reported_as_undecoded_observation():
-    header = bytearray(24)
-    header[:3] = b"\xaa\x44\xb5"
-    header[4:6] = (106).to_bytes(2, "little")
-    header[6:8] = (224).to_bytes(2, "little")
-    records, _ = parse_stream(bytes(header) + bytes(224) + bytes(4))
+    records, _ = parse_stream(_binary_frame(106, bytes(224)))
     decoded = decode_observations(records)
     assert decoded.unsupported_records == {}
     assert decoded.warnings == ["no raw observations were decoded"]

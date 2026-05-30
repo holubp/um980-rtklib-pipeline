@@ -48,6 +48,8 @@ KNOWN_NMEA_SENTENCE_TYPES = {
 }
 KNOWN_PROPRIETARY_NMEA_TYPES = {"ADRNAVA", "PPPNAVA"}
 NMEA_LINE_RE = re.compile(rb"^\$([A-Z0-9]{5}|P[A-Z0-9]{3,}|ADRNAVA|PPPNAVA)(?:,[ -~]*)?(?:\*[0-9A-Fa-f]{2})?\r?\n?$")
+UNICORE_ASCII_LINE_RE = re.compile(rb"^#[A-Z0-9]+(?:,[ -~]*)?;[ -~]*(?:\*[0-9A-Fa-f]{8})?\r?\n?$")
+UNICORE_BINARY_CRC32_POLY = 0xEDB88320
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,55 @@ def unicore_ascii_checksum_ok(line: bytes) -> bool | None:
     return binascii.crc32(body) & 0xFFFFFFFF == expected
 
 
+def is_plausible_unicore_ascii_line(line: bytes) -> bool:
+    """Return true when a byte line looks like a Unicore ASCII record.
+
+    Mixed logs contain arbitrary ``#`` bytes inside binary payloads. A real
+    Unicore ASCII record is printable ASCII, starts with an uppercase message
+    name, has a header/payload ``;`` separator, and may end with an eight-digit
+    CRC. Checksum failures are left to downstream diagnostics because captures
+    and tests may intentionally contain placeholder CRC values.
+    """
+
+    if not line.startswith(b"#") or len(line) > 65536 or not UNICORE_ASCII_LINE_RE.match(line):
+        return False
+    try:
+        line.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def unicore_binary_crc32(data: bytes) -> int:
+    """Return the CRC32 used by Unicore binary receiver frames.
+
+    Unicore binary messages use the same little-endian CRC implementation as
+    RTKLIB's ``rtk_crc32`` helper: initial value zero, reflected polynomial
+    ``0xEDB88320``, and no final XOR. The checksum is calculated over the sync
+    bytes, fixed header, and payload, excluding the trailing four-byte CRC
+    field.
+    """
+
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = ((crc >> 1) ^ UNICORE_BINARY_CRC32_POLY) & 0xFFFFFFFF
+            else:
+                crc = (crc >> 1) & 0xFFFFFFFF
+    return crc
+
+
+def unicore_binary_checksum_ok(frame: bytes) -> bool:
+    """Return true when a complete Unicore binary frame has a valid CRC."""
+
+    if len(frame) < 28 or frame[:3] != b"\xaa\x44\xb5":
+        return False
+    expected = int.from_bytes(frame[-4:], "little", signed=False)
+    return unicore_binary_crc32(frame[:-4]) == expected
+
+
 def record_message_type(text: str, prefix: str) -> str | None:
     """Extract a message type from NMEA or Unicore ASCII text.
 
@@ -295,6 +346,11 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
                     noise_start = pos
                 break
             raw = data[pos : end + 1]
+            if not is_plausible_unicore_ascii_line(raw):
+                if noise_start is None:
+                    noise_start = pos
+                pos += 1
+                continue
             flush_noise(pos)
             text = raw.decode("ascii", errors="replace").strip()
             msg_type = record_message_type(text, "#")
@@ -309,8 +365,14 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
         if data[pos : pos + 3] == b"\xaa\x44\xb5":
             frame_len = _binary_frame_length(data, pos)
             if frame_len is not None:
-                flush_noise(pos)
                 raw = data[pos : pos + frame_len]
+                if not unicore_binary_checksum_ok(raw):
+                    diagnostics.invalid_unicore_binary_records += 1
+                    if noise_start is None:
+                        noise_start = pos
+                    pos += 1
+                    continue
+                flush_noise(pos)
                 msg_id = int.from_bytes(raw[4:6], "little", signed=False) if len(raw) >= 6 else 0
                 msg_type = BINARY_MESSAGE_TYPES.get(msg_id, f"binary:{msg_id}")
                 diagnostics.unicore_binary_records += 1
