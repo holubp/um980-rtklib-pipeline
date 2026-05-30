@@ -25,6 +25,9 @@
 - RTKLIB-facing RINEX OBS must contain only standard RINEX 3 system codes. Do
   not emit unknown-system `U` rows or satellites; keep those observations in
   CSV/analysis instead.
+- Rover/base RINEX OBS capability diagnostics must be directional. Warn when
+  the base lacks rover constellations or frequency bands; do not warn when the
+  base has additional constellations, bands, or observation codes.
 - Cygwin support must preserve the distinction between local Unix paths and
   Windows paths passed to Windows RTKLIB executables. Windows RTKLIB binaries
   on Cygwin may be PE files without an `.exe` suffix; do not rely only on file

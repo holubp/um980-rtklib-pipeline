@@ -23,6 +23,42 @@ class RinexObsTimeSpan:
     end: datetime | None
 
 
+@dataclass(frozen=True)
+class RinexObsCapabilities:
+    """Observation capabilities advertised by a RINEX OBS header.
+
+    Attributes:
+        path: Source RINEX observation file.
+        observation_types: Mapping from RINEX system code to observation type
+            strings, for example ``{"G": ("C1C", "L1C")}``.
+        rinex_version: Header RINEX version when parsed.
+        rinex_file_system: Header file-system code, such as ``M`` or ``G``.
+    """
+
+    path: Path
+    observation_types: dict[str, tuple[str, ...]]
+    rinex_version: str | None = None
+    rinex_file_system: str | None = None
+
+    @property
+    def systems(self) -> set[str]:
+        """Return RINEX systems with advertised observation types."""
+
+        return set(self.observation_types)
+
+    def bands_by_system(self) -> dict[str, set[str]]:
+        """Return frequency-band digits advertised for each system."""
+
+        return {
+            system: {
+                obs_type[1]
+                for obs_type in obs_types
+                if len(obs_type) >= 2 and obs_type[0] in {"C", "L", "D", "S"} and obs_type[1].isdigit()
+            }
+            for system, obs_types in self.observation_types.items()
+        }
+
+
 def ensure_out_dir(path: str | Path | None) -> Path:
     """Create and return an output directory.
 
@@ -169,6 +205,63 @@ def read_rinex_obs_time_span(path: str | Path) -> RinexObsTimeSpan:
     except OSError:
         return RinexObsTimeSpan(None, None)
     return RinexObsTimeSpan(start or epoch_start, end or epoch_end)
+
+
+def read_rinex_obs_capabilities(path: str | Path) -> RinexObsCapabilities:
+    """Read systems, observation codes, and bands from a RINEX OBS header.
+
+    RINEX 3 ``SYS / # / OBS TYPES`` records are parsed per constellation.
+    RINEX 2 ``# / TYPES OF OBSERV`` records are exposed under the header file
+    system when it is specific, or ``G`` for the common GPS-only case. Mixed
+    RINEX 2 files cannot describe per-constellation capabilities precisely, so
+    they are reported under ``M`` and should be treated as informational.
+
+    Args:
+        path: RINEX observation file to inspect.
+
+    Returns:
+        Parsed observation capability metadata. Missing or unreadable headers
+        return an empty capability object instead of raising.
+    """
+
+    p = Path(path)
+    observation_types: dict[str, list[str]] = {}
+    rinex_version: str | None = None
+    rinex_file_system: str | None = None
+    rinex2_types: list[str] = []
+    try:
+        with p.open("r", encoding="ascii", errors="ignore") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                label = line[60:].strip() if len(line) >= 60 else ""
+                if label == "RINEX VERSION / TYPE":
+                    rinex_version = line[:9].strip() or None
+                    rinex_file_system = line[40:41].strip() or None
+                elif label == "SYS / # / OBS TYPES":
+                    system = line[:1].strip()
+                    if system:
+                        observation_types.setdefault(system, []).extend(_parse_obs_type_tokens(line[7:60]))
+                elif label == "# / TYPES OF OBSERV":
+                    rinex2_types.extend(_parse_obs_type_tokens(line[:60]))
+                elif "END OF HEADER" in line:
+                    break
+    except OSError:
+        return RinexObsCapabilities(path=p, observation_types={})
+    if rinex2_types and not observation_types:
+        system = rinex_file_system if rinex_file_system and rinex_file_system != " " else "G"
+        observation_types[system or "G"] = rinex2_types
+    return RinexObsCapabilities(
+        path=p,
+        observation_types={system: tuple(types) for system, types in observation_types.items()},
+        rinex_version=rinex_version,
+        rinex_file_system=rinex_file_system,
+    )
+
+
+def _parse_obs_type_tokens(text: str) -> list[str]:
+    """Return RINEX observation-code tokens from a header payload segment."""
+
+    return [token for token in text.split() if len(token) == 3 and token[0] in {"C", "L", "D", "S"}]
 
 
 def _parse_rinex_epoch_line(line: str) -> datetime | None:

@@ -18,7 +18,11 @@ from um980_rtklib_pipeline.euref import (
     requires_crx2rnx,
     resolve_station,
 )
-from um980_rtklib_pipeline.files import filter_rinex_obs_by_overlap, read_rinex_obs_time_span
+from um980_rtklib_pipeline.files import (
+    filter_rinex_obs_by_overlap,
+    read_rinex_obs_capabilities,
+    read_rinex_obs_time_span,
+)
 from um980_rtklib_pipeline.nav_resolver import resolve_nav_sources
 from um980_rtklib_pipeline import rtklib
 from um980_rtklib_pipeline.rtklib import (
@@ -583,12 +587,92 @@ def _write_obs_with_span(path: Path, start: str, end: str) -> None:
     )
 
 
+def _rinex_header_line(payload: str, label: str) -> str:
+    return f"{payload:<60}{label}\n"
+
+
+def _write_obs_with_types(path: Path, type_lines: list[str]) -> None:
+    path.write_text(
+        _rinex_header_line("     3.04           OBSERVATION DATA    M", "RINEX VERSION / TYPE")
+        + "".join(_rinex_header_line(line, "SYS / # / OBS TYPES") for line in type_lines)
+        + _rinex_header_line("", "END OF HEADER"),
+        encoding="ascii",
+    )
+
+
 def test_rinex_obs_time_span_parses_header(tmp_path: Path):
     obs = tmp_path / "rover.obs"
     _write_obs_with_span(obs, "2026 05 22 21 01 33.2000000", "2026 05 22 21 18 24.2000000")
     span = read_rinex_obs_time_span(obs)
     assert span.start == datetime(2026, 5, 22, 21, 1, 33, 200000)
     assert span.end == datetime(2026, 5, 22, 21, 18, 24, 200000)
+
+
+def test_rinex_obs_capabilities_parse_system_types(tmp_path: Path):
+    obs = tmp_path / "rover.obs"
+    _write_obs_with_types(
+        obs,
+        [
+            "G    8 C1C L1C D1C S1C C2W L2W D2W S2W",
+            "E    4 C1C L1C D1C S1C",
+        ],
+    )
+
+    capability = read_rinex_obs_capabilities(obs)
+
+    assert capability.systems == {"G", "E"}
+    assert capability.observation_types["G"] == ("C1C", "L1C", "D1C", "S1C", "C2W", "L2W", "D2W", "S2W")
+    assert capability.bands_by_system() == {"G": {"1", "2"}, "E": {"1"}}
+
+
+def test_rover_base_capability_report_warns_when_base_lacks_rover_bands(tmp_path: Path, caplog):
+    rover = tmp_path / "rover.obs"
+    base = tmp_path / "base.obs"
+    _write_obs_with_types(
+        rover,
+        [
+            "G   12 C1C L1C D1C S1C C2W L2W D2W S2W C5Q L5Q D5Q S5Q",
+            "E    4 C1C L1C D1C S1C",
+        ],
+    )
+    _write_obs_with_types(
+        base,
+        [
+            "G    8 C1C L1C D1C S1C C2W L2W D2W S2W",
+            "R    4 C1C L1C D1C S1C",
+        ],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        cli._log_rover_base_capability_report(rover, [base])
+
+    text = caplog.text
+    assert "rover RINEX OBS capabilities" in text
+    assert "base RINEX OBS aggregate capabilities" in text
+    assert "base is missing rover constellation(s): E" in text
+    assert "base is missing rover frequency band(s): E:1; G:5" in text
+    assert "1 base file(s) are missing rover capability" in text
+    assert "base provides additional constellation(s) not present in rover RINEX; this is not a mismatch: R" in text
+    assert "base lacks exact rover RINEX observation code(s)" in text
+
+
+def test_rover_base_capability_report_accepts_base_superset(tmp_path: Path, caplog):
+    rover = tmp_path / "rover.obs"
+    base = tmp_path / "base.obs"
+    _write_obs_with_types(rover, ["G    4 C1C L1C D1C S1C"])
+    _write_obs_with_types(
+        base,
+        [
+            "G    8 C1C L1C D1C S1C C2W L2W D2W S2W",
+            "E    4 C1C L1C D1C S1C",
+        ],
+    )
+
+    with caplog.at_level(logging.INFO):
+        cli._log_rover_base_capability_report(rover, [base])
+
+    assert "capability mismatch" not in caplog.text
+    assert "base provides additional constellation(s) not present in rover RINEX; this is not a mismatch: E" in caplog.text
 
 
 def test_base_obs_without_rover_overlap_is_filtered(tmp_path: Path):

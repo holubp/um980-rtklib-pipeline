@@ -89,6 +89,11 @@ Keep generated `rnx2rtkp` options as a portable fallback. Quality-sensitive
 work should use explicit config files such as `um980.conf` or
 `um980-autoqc-baseline.conf`.
 
+Before invoking RTKLIB, log the rover/base RINEX OBS capability comparison in
+the directional form that matters for RTK: rover constellations and frequency
+bands must be covered by the base, while extra base capability is acceptable.
+Keep exact observation-code gaps at debug level so verbose logs stay readable.
+
 The optional two-pass satellite QC path is split into reusable modules:
 
 - `badsat.py` parses RTKLIB `.stat` `$SAT` rows and selects conservative

@@ -300,6 +300,13 @@ log paths.
 For solution-quality debugging, add `--rtklib-trace-level 4
 --rtklib-stat-level 2`; these pass `rnx2rtkp -x 4 -y 2` and work with or
 without `--rtkconf`.
+In `-v` or `-d` mode, `postprocess` and `pipeline` also log rover/base RINEX
+OBS capabilities before invoking RTKLIB. The summary lists advertised
+constellations, frequency bands, and observation codes for the rover and the
+aggregate base files. Extra base constellations or bands are logged as
+available capability, not as a mismatch. Warnings are emitted only when the
+base is missing a rover constellation or rover frequency band; `-d` additionally
+shows per-base-file capabilities and exact missing observation codes.
 When RTKLIB finishes successfully in `-v` or `-d` mode, the CLI prints a
 solution-quality summary from the requested output file. The summary reports
 epoch counts and percentages for each `Q=` value in standard `.pos`/`.llh`

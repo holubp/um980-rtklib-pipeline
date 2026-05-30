@@ -34,7 +34,14 @@ from .euref import (
     requires_crx2rnx,
     resolve_station,
 )
-from .files import basename_for, ensure_out_dir, filter_rinex_obs_by_overlap, read_rinex_obs_time_span
+from .files import (
+    RinexObsCapabilities,
+    basename_for,
+    ensure_out_dir,
+    filter_rinex_obs_by_overlap,
+    read_rinex_obs_capabilities,
+    read_rinex_obs_time_span,
+)
 from .initgen import (
     InitProfile,
     ION_MESSAGES,
@@ -1357,6 +1364,149 @@ def _prepare_rtklib_base_obs_argument(base_obs: list[Path], out_dir: Path, basen
     return pattern
 
 
+def _merge_rinex_obs_capabilities(capabilities: list[RinexObsCapabilities]) -> dict[str, set[str]]:
+    """Return a union of RINEX observation types advertised by several files."""
+
+    merged: dict[str, set[str]] = {}
+    for capability in capabilities:
+        for system, obs_types in capability.observation_types.items():
+            merged.setdefault(system, set()).update(obs_types)
+    return merged
+
+
+def _bands_from_observation_types(observation_types: dict[str, set[str]]) -> dict[str, set[str]]:
+    """Return frequency-band digits per RINEX system from observation types."""
+
+    return {
+        system: {
+            obs_type[1]
+            for obs_type in obs_types
+            if len(obs_type) >= 2 and obs_type[0] in {"C", "L", "D", "S"} and obs_type[1].isdigit()
+        }
+        for system, obs_types in observation_types.items()
+    }
+
+
+def _format_observation_capability_summary(observation_types: dict[str, set[str]]) -> str:
+    """Format a compact RINEX OBS capability summary for logs."""
+
+    parts: list[str] = []
+    bands_by_system = _bands_from_observation_types(observation_types)
+    for system in sorted(observation_types):
+        obs_codes = ",".join(sorted(observation_types[system])) or "-"
+        bands = ",".join(sorted(bands_by_system.get(system, set()))) or "-"
+        parts.append(f"{system}:bands={bands}:obs={obs_codes}")
+    return "; ".join(parts) if parts else "none"
+
+
+def _rinex_obs_capability_gaps(
+    rover_types: dict[str, set[str]], base_types: dict[str, set[str]]
+) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]]]:
+    """Return rover capabilities that are not advertised by a base source."""
+
+    missing_systems = sorted(set(rover_types) - set(base_types))
+    rover_bands = _bands_from_observation_types(rover_types)
+    base_bands = _bands_from_observation_types(base_types)
+    missing_bands = {
+        system: sorted(bands - base_bands.get(system, set()))
+        for system, bands in rover_bands.items()
+        if bands - base_bands.get(system, set())
+    }
+    missing_codes = {
+        system: sorted(obs_types - base_types.get(system, set()))
+        for system, obs_types in rover_types.items()
+        if obs_types - base_types.get(system, set())
+    }
+    return missing_systems, missing_bands, missing_codes
+
+
+def _format_missing_bands(missing_bands: dict[str, list[str]]) -> str:
+    """Format missing RINEX frequency bands for logs."""
+
+    return "; ".join(f"{system}:{','.join(bands)}" for system, bands in sorted(missing_bands.items()))
+
+
+def _log_rover_base_capability_report(rover_obs: Path, base_obs: list[Path]) -> None:
+    """Log rover/base RINEX OBS constellation and frequency compatibility.
+
+    The comparison is directional: the base must advertise every rover
+    constellation and frequency band needed for differential processing. Extra
+    base constellations or bands are logged as available capability and are not
+    treated as a mismatch.
+    """
+
+    rover_capability = read_rinex_obs_capabilities(rover_obs)
+    base_capabilities = [read_rinex_obs_capabilities(path) for path in base_obs]
+    rover_types = {system: set(obs_types) for system, obs_types in rover_capability.observation_types.items()}
+    base_types = _merge_rinex_obs_capabilities(base_capabilities)
+    logging.info("rover RINEX OBS capabilities: %s", _format_observation_capability_summary(rover_types))
+    logging.info(
+        "base RINEX OBS aggregate capabilities: files=%d %s",
+        len(base_obs),
+        _format_observation_capability_summary(base_types),
+    )
+    for capability in base_capabilities:
+        logging.debug(
+            "base RINEX OBS capabilities: file=%s %s",
+            capability.path,
+            _format_observation_capability_summary(
+                {system: set(obs_types) for system, obs_types in capability.observation_types.items()}
+            ),
+        )
+    if not rover_types:
+        logging.warning("could not read rover RINEX OBS capability header from %s", rover_obs)
+        return
+    if not base_types:
+        logging.warning("could not read base RINEX OBS capability headers from %d file(s)", len(base_obs))
+        return
+
+    missing_systems, missing_bands, missing_codes = _rinex_obs_capability_gaps(rover_types, base_types)
+    if missing_systems:
+        logging.warning(
+            "rover/base RINEX capability mismatch: base is missing rover constellation(s): %s",
+            ",".join(missing_systems),
+        )
+
+    if missing_bands:
+        logging.warning(
+            "rover/base RINEX capability mismatch: base is missing rover frequency band(s): %s",
+            _format_missing_bands(missing_bands),
+        )
+
+    if missing_codes:
+        formatted = "; ".join(f"{system}:{','.join(codes)}" for system, codes in sorted(missing_codes.items()))
+        logging.debug("base lacks exact rover RINEX observation code(s): %s", formatted)
+
+    file_gaps: list[str] = []
+    for capability in base_capabilities:
+        capability_types = {system: set(obs_types) for system, obs_types in capability.observation_types.items()}
+        file_missing_systems, file_missing_bands, _ = _rinex_obs_capability_gaps(rover_types, capability_types)
+        if not file_missing_systems and not file_missing_bands:
+            continue
+        details: list[str] = []
+        if file_missing_systems:
+            details.append(f"missing_constellations={','.join(file_missing_systems)}")
+        if file_missing_bands:
+            details.append(f"missing_bands={_format_missing_bands(file_missing_bands)}")
+        file_gaps.append(f"{capability.path} ({'; '.join(details)})")
+    if file_gaps:
+        examples = "; ".join(file_gaps[:5])
+        omitted = "" if len(file_gaps) <= 5 else f"; {len(file_gaps) - 5} more"
+        logging.warning(
+            "rover/base RINEX capability mismatch: %d base file(s) are missing rover capability: %s%s",
+            len(file_gaps),
+            examples,
+            omitted,
+        )
+
+    extra_systems = sorted(set(base_types) - set(rover_types))
+    if extra_systems:
+        logging.info(
+            "base provides additional constellation(s) not present in rover RINEX; this is not a mismatch: %s",
+            ",".join(extra_systems),
+        )
+
+
 def _resolve_station_for_base_download(args: argparse.Namespace) -> str:
     try:
         return resolve_station(args.station, args.station_long)
@@ -1772,6 +1922,7 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     for warning in overlap_warnings:
         logging.warning("%s", warning)
     logging.info("retained %d base observation files after overlap filtering", len(base_obs))
+    _log_rover_base_capability_report(rover_obs, base_obs)
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
@@ -1845,6 +1996,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     for warning in overlap_warnings:
         logging.warning("%s", warning)
     logging.info("retained %d base observation files after overlap filtering", len(base_obs))
+    _log_rover_base_capability_report(rover_obs, base_obs)
     generated_rover_nav = rover_nav_files(out_dir / f"{base}.rover-gps.nav")
     logging.info("found %d generated rover navigation sidecar files", len(generated_rover_nav))
     nav_resolution = resolve_nav_sources(

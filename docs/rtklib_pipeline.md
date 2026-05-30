@@ -174,6 +174,13 @@ solution data is treated as a runtime error.
 Use `--rtklib-trace-level 4 --rtklib-stat-level 2` to produce the usual
 debugging equivalent of `rnx2rtkp -x 4 -y 2`. These named options are passed as
 command-line overrides in both generated-option mode and `--rtkconf` mode.
+In `-v` or `-d` mode, `postprocess` and `pipeline` log a rover/base RINEX OBS
+capability check before RTKLIB runs. It reports rover constellations, frequency
+bands, and observation codes, then the aggregate base capability from retained
+base files. Extra base capability is fine and is not a mismatch. The warning
+case is directional: if the rover advertises a constellation or frequency band
+that the base does not, the log says so explicitly. Debug mode also logs each
+base file separately and lists exact missing observation codes.
 In `-v` or `-d` mode, successful RTKLIB runs also print a compact solution
 summary. It includes epoch counts and percentages per `Q=` value, plus
 cumulative time and track length for segments ending in each quality for normal
