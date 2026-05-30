@@ -119,7 +119,9 @@ so missing station/time combinations fall back with one clear warning rather
 than one failed download per 15-minute file and mirror.
 
 Base-resolution selection is part of the processing contract. High-rate
-requests must first plan and try high-rate 1 s products and must validate
-selected filenames before RTKLIB runs. Low-rate cached `01H_30S`/`_30S_`
-products must not satisfy the high-rate attempt; they are only valid after the
-high-rate group fails and fallback is enabled.
+requests must first plan and try generic high-rate 1 s archive products and
+must validate selected filenames before RTKLIB runs. Low-rate cached
+`01H_30S`/`_30S_` products must not satisfy the high-rate attempt; they are only
+valid after the high-rate group fails and fallback is enabled. Recorded
+real-time base RTCM is a separate source: convert it with `convbin -r rtcm3`
+and reject ambiguous `--base-rtcm` plus `--download-base` combinations.

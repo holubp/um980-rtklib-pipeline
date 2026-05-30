@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import subprocess
 from datetime import UTC, datetime
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from um980_rtklib_pipeline import cli
+from um980_rtklib_pipeline import base_rt
 from um980_rtklib_pipeline.euref import (
     _run_crx2rnx,
     download_urls,
@@ -50,6 +52,19 @@ def test_station_alias_and_bev_url():
         end=datetime(2026, 5, 20, 12, 20, tzinfo=UTC),
     )
     assert "CPAR00CZE_R_20261401200_01H_30S_MO.crx.gz" in urls[0]
+
+
+def test_bkg_igs_highrate_urls_are_generic_by_station():
+    urls = planned_urls(
+        station="GOPE",
+        start=datetime(2026, 5, 20, 12, 10, tzinfo=UTC),
+        end=datetime(2026, 5, 20, 12, 20, tzinfo=UTC),
+        provider_name="bkg-igs-highrate",
+        base_rate="1s",
+    )
+
+    assert any("/IGS/highrate/" in url for url in urls)
+    assert any("GOPE00CZE_R_20261401200_15M_01S_MO.crx.gz" in url for url in urls)
 
 
 def test_pipeline_defaults_to_rtklib_compatible_rinex():
@@ -1200,7 +1215,7 @@ def test_base_download_highrate_falls_back_to_lowrate(tmp_path: Path, monkeypatc
     paths = cli._download_base_files(args)
     assert paths == [low_file]
     assert "highrate" in attempts[0]
-    assert "nrt" in attempts[1]
+    assert "nrt" in attempts[-1]
     assert any("trying provider=bev-nrt rate=30s rinex=3" in record.getMessage() for record in caplog.records)
     assert any("This run is not a high-rate base run" in record.getMessage() for record in caplog.records)
     assert any("falling back to low-rate 30s base data" in record.getMessage() for record in caplog.records)
@@ -1292,6 +1307,59 @@ def test_high_resolution_does_not_use_30s_cache_without_fallback(tmp_path: Path,
 
     assert attempted
     assert all("highrate" in url for url in attempted)
+
+
+def test_high_resolution_rejects_30s_without_fallback(tmp_path: Path):
+    low_file = tmp_path / "CPAR00CZE_R_20261430500_01H_30S_MO.rnx"
+    low_file.write_text("low-rate\n", encoding="ascii")
+
+    with pytest.raises(RuntimeError, match="selected low-rate 30 s"):
+        cli._validate_selected_base_resolution(
+            paths=[low_file],
+            requested_resolution="high",
+            selected_resolution="low",
+            nominal_rate="30s",
+            provider="bev-nrt",
+            rinex_version="3",
+            station_long="CPAR00CZE",
+            fallback_used=False,
+            allow_fallback=False,
+        )
+
+
+def test_cached_30s_does_not_preempt_high_resolution(tmp_path: Path, monkeypatch):
+    cached_low = tmp_path / "CPAR00CZE_R_20261430500_01H_30S_MO.rnx"
+    cached_low.write_text("cached low-rate\n", encoding="ascii")
+    high_file = tmp_path / "CPAR00CZE_S_20261430530_15M_01S_MO.rnx"
+    high_file.write_text("high-rate\n", encoding="ascii")
+    args = argparse.Namespace(
+        station="CPAR",
+        station_long=None,
+        base_resolution="high",
+        base_rinex_version="3",
+        base_rate="1s",
+        base_provider="bev-nrt",
+        no_base_fallback=False,
+        whole_day=False,
+        offline=False,
+        dry_run=False,
+        cache_dir=str(tmp_path),
+        base_dir=None,
+        crx2rnx=None,
+        cleanup=False,
+        force_download=False,
+    )
+
+    monkeypatch.setattr(cli, "filter_urls_by_remote_listing", lambda urls, cache_dir, *, force=False: urls)
+    monkeypatch.setattr(cli, "download_urls", lambda urls, cache_dir, *, force=False: [high_file])
+
+    paths = cli._download_base_files_for_window(
+        args,
+        datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+        datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+    )
+
+    assert paths == [high_file]
 
 
 def test_low_resolution_accepts_30s(tmp_path: Path, monkeypatch, caplog):
@@ -1391,9 +1459,11 @@ def test_v2_highrate_fallback_uses_bev_lowrate_provider():
         base_provider="bev-nrt",
         no_base_fallback=False,
     )
-    assert cli._base_download_attempts(args) == [
-        ("high", "2", "bkg-euref-highrate-v2", "1s"),
-        ("low", "2", "bev-nrt", "30s"),
+    attempts = cli._base_download_attempts(args)
+    assert [(item.resolution, item.rinex_version, item.provider, item.nominal_rate, item.is_fallback) for item in attempts] == [
+        ("high", "2", "bkg-euref-highrate-v2", "1s", False),
+        ("high", "2", "bkg-igs-highrate-v2", "1s", False),
+        ("low", "2", "bev-nrt", "30s", True),
     ]
 
 
@@ -1529,6 +1599,222 @@ def test_no_base_fallback_is_honoured_by_pipeline(tmp_path: Path, monkeypatch):
 
     assert cli.cmd_pipeline(args) == 0
     assert captured == {"base_resolution": "high", "no_base_fallback": True}
+
+
+def test_record_base_rt_invokes_str2str_with_redacted_log(tmp_path: Path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(base_rt, "executable_exists", lambda _tool: True)
+
+    class FakeProcess:
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            raise AssertionError("terminate should not be needed")
+
+        def kill(self):
+            raise AssertionError("kill should not be needed")
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        out_arg = command[command.index("-out") + 1]
+        Path(out_arg.removeprefix("file://")).write_bytes(b"rtcm")
+        return FakeProcess()
+
+    result = base_rt.record_ntrip_base(
+        caster="example.net",
+        port=2101,
+        mountpoint="TUBO00CZE0",
+        out_dir=tmp_path,
+        station="TUBO",
+        user="alice",
+        password="secret",
+        str2str="str2str",
+        popen_factory=fake_popen,
+    )
+
+    assert commands
+    assert "ntrip://alice:secret@example.net:2101/TUBO00CZE0" in commands[0]
+    assert result.bytes_written == 4
+    assert "secret" not in caplog.text
+    assert "***:***@example.net" in caplog.text
+
+
+def test_record_base_rt_writes_metadata(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(base_rt, "executable_exists", lambda _tool: True)
+
+    class FakeProcess:
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        out_arg = command[command.index("-out") + 1]
+        Path(out_arg.removeprefix("file://")).write_bytes(b"rtcm-data")
+        return FakeProcess()
+
+    result = base_rt.record_ntrip_base(
+        caster="caster",
+        port=2101,
+        mountpoint="MOUNT",
+        out_dir=tmp_path,
+        user="user",
+        password="pw",
+        popen_factory=fake_popen,
+    )
+    metadata = json.loads(Path(result.metadata_json).read_text(encoding="utf-8"))
+
+    assert metadata["source_kind"] == "ntrip-realtime-recording"
+    assert metadata["output_rtcm3"] == result.output_rtcm3
+    assert metadata["bytes_written"] == len(b"rtcm-data")
+    assert metadata["credential_user_present"] is True
+    assert metadata["password_redacted"] is True
+    assert "pw" not in json.dumps(metadata)
+
+
+def test_record_base_rt_ctrl_c_terminates_process(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(base_rt, "executable_exists", lambda _tool: True)
+    events: list[str] = []
+
+    class FakeProcess:
+        def wait(self, timeout=None):
+            if timeout is None:
+                raise KeyboardInterrupt
+            events.append("wait-after-terminate")
+            return 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    def fake_popen(command, **kwargs):
+        out_arg = command[command.index("-out") + 1]
+        Path(out_arg.removeprefix("file://")).write_bytes(b"rtcm")
+        return FakeProcess()
+
+    result = base_rt.record_ntrip_base(
+        caster="caster",
+        port=2101,
+        mountpoint="MOUNT",
+        out_dir=tmp_path,
+        popen_factory=fake_popen,
+    )
+
+    assert Path(result.output_rtcm3).exists()
+    assert events == ["terminate", "wait-after-terminate"]
+
+
+def test_record_base_rt_empty_file_fails(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(base_rt, "executable_exists", lambda _tool: True)
+
+    class FakeProcess:
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        return FakeProcess()
+
+    with pytest.raises(RuntimeError, match="produced no RTCM data"):
+        base_rt.record_ntrip_base(
+            caster="caster",
+            port=2101,
+            mountpoint="MOUNT",
+            out_dir=tmp_path,
+            popen_factory=fake_popen,
+        )
+
+
+def test_convert_base_rtcm_invokes_convbin(tmp_path: Path, monkeypatch):
+    rtcm = tmp_path / "base.rtcm3"
+    rtcm.write_bytes(b"rtcm")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(base_rt, "executable_exists", lambda _tool: True)
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        obs = Path(command[command.index("-o") + 1])
+        nav = Path(command[command.index("-n") + 1])
+        obs.write_text("     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n", encoding="ascii")
+        nav.write_text("     3.04           NAVIGATION DATA     G                   RINEX VERSION / TYPE\nBODY\n", encoding="ascii")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(base_rt.subprocess, "run", fake_run)
+
+    obs, nav_files = base_rt.convert_rtcm_to_rinex(
+        rtcm_path=rtcm,
+        out_dir=tmp_path,
+        basename="run",
+        convbin="convbin",
+    )
+
+    assert obs == tmp_path / "run.base.obs"
+    assert nav_files == [tmp_path / "run.base.nav"]
+    assert commands[0][commands[0].index("-r") + 1] == "rtcm3"
+
+
+def test_pipeline_base_rtcm_conflicts_with_download_base(tmp_path: Path):
+    args = cli.build_parser().parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--base-rtcm",
+            str(tmp_path / "base.rtcm3"),
+            "--download-base",
+            "--station",
+            "CPAR",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cli.cmd_pipeline(args)
+
+
+def test_pipeline_base_rtcm_skips_archive_download(tmp_path: Path, monkeypatch):
+    out_dir = tmp_path / "out"
+    nav = tmp_path / "nav.rnx"
+    base_rtcm = tmp_path / "base.rtcm3"
+    base_obs = tmp_path / "base.obs"
+    nav.write_text("nav\n", encoding="ascii")
+    base_rtcm.write_bytes(b"rtcm")
+    base_obs.write_text("base\n", encoding="ascii")
+    args = cli.build_parser().parse_args(
+        [
+            "pipeline",
+            "rover.unc",
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "rover",
+            "--base-rtcm",
+            str(base_rtcm),
+            "--run-rtklib",
+            "--nav-file",
+            str(nav),
+            "--base-position-source",
+            "none",
+        ]
+    )
+
+    monkeypatch.setattr(cli, "cmd_extract", lambda _args: 0)
+    monkeypatch.setattr(cli, "cmd_rinex", lambda _args: 0)
+    monkeypatch.setattr(cli, "_download_base_files_for_window", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("download should not run")))
+    monkeypatch.setattr(cli, "_convert_base_rtcm_if_requested", lambda *_args: ([base_obs], []))
+    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs_arg: (base_obs_arg, []))
+    monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
+
+    class Candidate:
+        path = nav
+
+    class Resolution:
+        warnings: list[str] = []
+        selected = [Candidate()]
+
+    monkeypatch.setattr(cli, "resolve_nav_sources", lambda **_kwargs: Resolution())
+    monkeypatch.setattr(cli, "_run_rtklib_output_formats", lambda **_kwargs: [])
+
+    assert cli.cmd_pipeline(args) == 0
 
 
 def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monkeypatch):

@@ -183,6 +183,7 @@ def build_candidate(path: str | Path, source: NavSource) -> NavCandidate:
 
 def resolve_nav_sources(
     explicit: list[str | Path] | None = None,
+    base_rtcm: list[str | Path] | None = None,
     downloaded: list[str | Path] | None = None,
     rover: list[str | Path] | None = None,
     observed_systems: set[str] | None = None,
@@ -192,6 +193,7 @@ def resolve_nav_sources(
 
     Args:
         explicit: User-provided NAV/SP3/CLK/SBS files.
+        base_rtcm: NAV files converted from a recorded base RTCM stream.
         downloaded: Downloaded broadcast or station navigation files.
         rover: Navigation files extracted from the rover receiver log.
         observed_systems: Systems present in rover observations.
@@ -204,6 +206,7 @@ def resolve_nav_sources(
 
     candidates: list[NavCandidate] = []
     candidates.extend(build_candidate(path, "explicit") for path in explicit or [])
+    candidates.extend(build_candidate(path, "base_rtcm") for path in base_rtcm or [])
     candidates.extend(build_candidate(path, "downloaded_brdc") for path in downloaded or [])
     candidates.extend(build_candidate(path, "rover") for path in rover or [])
     usable = [candidate for candidate in candidates if candidate.usable]

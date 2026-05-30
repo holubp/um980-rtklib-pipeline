@@ -94,6 +94,20 @@ PROVIDERS = {
             "{station_long}_S_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
         ),
     ),
+    "bkg-igs-highrate": Provider(
+        "bkg_igs_highrate_v3",
+        "obs",
+        (
+            "https://igs.bkg.bund.de/root_ftp/IGS/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station_long}_R_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
+            "https://igs.bkg.bund.de/root_ftp/IGS/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station_long}_S_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
+            "ftp://igs-ftp.bkg.bund.de/IGS/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station_long}_R_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
+            "ftp://igs-ftp.bkg.bund.de/IGS/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station_long}_S_{yyyy}{doy}{hh}{minute}_15M_01S_MO.crx.gz",
+        ),
+    ),
     "bev-nrt-v2": Provider(
         "bev_nrt_v2_hourly",
         "obs",
@@ -116,6 +130,16 @@ PROVIDERS = {
             "https://igs.bkg.bund.de/root_ftp/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
             "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
             "ftp://igs-ftp.bkg.bund.de/EUREF/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
+        ),
+    ),
+    "bkg-igs-highrate-v2": Provider(
+        "bkg_igs_highrate_v2",
+        "obs",
+        (
+            "https://igs.bkg.bund.de/root_ftp/IGS/highrate/{yyyy}/{doy}/{hour_letter}/"
+            "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
+            "ftp://igs-ftp.bkg.bund.de/IGS/highrate/{yyyy}/{doy}/{hour_letter}/"
             "{station4}{doy}{hour_letter}{minute}.{yy}d.Z",
         ),
     ),
@@ -232,7 +256,12 @@ def planned_urls(
     provider_name = _provider_for_version(provider_name, base_rate, rinex_version)
     provider = PROVIDERS[provider_name]
     urls: list[str] = []
-    if provider_name in {"bkg-euref-highrate", "bkg-euref-highrate-v2"} or base_rate == "1s":
+    if provider_name in {
+        "bkg-euref-highrate",
+        "bkg-euref-highrate-v2",
+        "bkg-igs-highrate",
+        "bkg-igs-highrate-v2",
+    } or base_rate == "1s":
         for hour in overlapping_hours(start, end, whole_day):
             for minute in (0, 15, 30, 45):
                 chunk_start = hour.replace(minute=minute)
@@ -266,6 +295,8 @@ def _provider_for_version(provider_name: str, base_rate: str, rinex_version: str
         raise ValueError(f"unsupported EUREF RINEX source version: {rinex_version}")
     if rinex_version == "3":
         return provider_name
+    if provider_name in {"bkg-igs-highrate", "bkg-igs-highrate-v2"}:
+        return "bkg-igs-highrate-v2"
     if provider_name in {"bkg-euref-highrate", "bkg-euref-highrate-v2"} or base_rate == "1s":
         return "bkg-euref-highrate-v2"
     if provider_name == "bev-nrt":

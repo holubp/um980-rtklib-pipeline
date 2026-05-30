@@ -243,10 +243,11 @@ blocked by caps or geometry protection are listed in the watch list instead of
 being excluded.
 
 `--base-resolution low` selects hourly 30 s EUREF data, normally names
-containing `01H_30S_MO`. `--base-resolution high` selects 1 s high-rate chunks,
-normally names containing `15M_01S_MO`. High-rate requests try high-rate
-candidate groups first. Only after those fail may the downloader fall back to
-low-rate 30 s data, and only when fallback is enabled. Use
+containing `01H_30S_MO`. `--base-resolution high` selects generic BKG high-rate
+1 s chunks, normally names containing `15M_01S_MO` or `_01S_`. High-rate
+requests try BKG EUREF high-rate and BKG IGS high-rate candidate groups first.
+Only after those fail may the downloader fall back to low-rate 30 s data, and
+only when fallback is enabled. Use
 `--no-base-fallback` when a high-rate comparison must fail instead of silently
 becoming a low-rate run. `--base-rinex-version 2` enables compact RINEX
 2/Hatanaka EUREF names, and `auto` tries v3 before v2.
@@ -257,7 +258,9 @@ the selected base data are low-rate.
 Base downloads are planned from the generated rover RINEX observation span and
 include every base product that overlaps or touches that span. The default
 `--time-margin 0` avoids fetching adjacent non-overlapping products; set a
-positive margin only when that extra coverage is intentional.
+positive margin only when that extra coverage is intentional. High-rate archive
+planning adds an internal 5 minute margin around the rover window to avoid
+missing edge 15 minute chunks.
 Downloads reuse cached archives, decompressed files, and converted RINEX
 products by default. Use `--force-download` only when the source archive should
 be fetched again.
@@ -269,6 +272,57 @@ argv, so the shell does not expand it; RTKLIB expands it internally as the
 single base observation input. On Cygwin, wildcard conversion preserves `*` by
 converting only the directory part through `cygpath` and appending the wildcard
 filename unchanged.
+
+## Real-Time Base Recording
+
+Use `record-base-rt` when high-rate archive data are unavailable but an NTRIP
+mountpoint is available. The command launches RTKLIB `str2str`, records raw
+RTCM3 in the foreground, writes metadata JSON and a recorder log, and stops
+cleanly on `Ctrl+C`.
+
+```bash
+um980-ppk record-base-rt \
+  --caster HOST \
+  --port 2101 \
+  --mountpoint MOUNT \
+  --user "$NTRIP_USER" \
+  --password "$NTRIP_PASSWORD" \
+  --out-dir base-recordings \
+  --station CPAR \
+  --rtklib-dir RTKLIB_EX_2.5.0 \
+  -v
+```
+
+After returning from rover mapping, process with the recorded stream:
+
+```bash
+um980-ppk pipeline rover.ubx \
+  --base-rtcm base-recordings/MOUNT_YYYYMMDDTHHMMSSZ.rtcm3 \
+  --rtklib-dir RTKLIB_EX_2.5.0 \
+  --run-rtklib \
+  --nav-merge all \
+  --rtkconf um980-onepass-gps-gal-bds-el28.conf
+```
+
+The pipeline rejects `--base-rtcm` together with `--download-base` to avoid
+ambiguous base-source selection. Recorded RTCM is converted with RTKLIB
+`convbin -r rtcm3`; the converted base OBS is used as the base observation
+input and any converted NAV is included in normal `--nav-merge` selection.
+
+RTK2Go is handled as a generic NTRIP caster. Use `ntrip-sourcetable` to fetch a
+grep-friendly raw sourcetable:
+
+```bash
+um980-ppk ntrip-sourcetable \
+  --caster rtk2go.com \
+  --port 2101 \
+  --out rtk2go-sourcetable.txt \
+  --contains TUBO
+```
+
+Public mountpoint quality is not assumed. Verify base coordinates, RTCM
+1005/1006, multi-GNSS MSM messages, receiver/antenna metadata when available,
+distance to the rover route, and converted RINEX observation types.
 
 The integrated pipeline defaults to `--rinex-compat convbin` for the rover OBS
 file passed to RTKLIB. Standalone `rinex` keeps the broader native ordering by

@@ -365,12 +365,14 @@ um980-ppk pipeline rover.unc \
 ```
 
 Use `--base-resolution low` for hourly 30 s EUREF data, normally RINEX 3 names
-containing `01H_30S_MO`. Use `--base-resolution high` for high-rate 1 s data,
-normally 15 minute RINEX 3 names containing `15M_01S_MO`. If high-rate data is
-requested but unavailable, the command warns with the failed high-rate provider
-or candidate URLs and falls back to low-rate data unless `--no-base-fallback`
-is set. Use `--no-base-fallback` for experiments that compare high-rate and
-low-rate base data, because any fallback makes the run a low-rate base run.
+containing `01H_30S_MO`. Use `--base-resolution high` for generic BKG high-rate
+archives, normally 15 minute 1 s RINEX 3 names containing `15M_01S_MO` or
+`_01S_`. High-rate requests try BKG EUREF high-rate and BKG IGS high-rate
+candidate groups before low-rate fallback. If high-rate data is requested but
+unavailable, the command warns with the failed high-rate provider or candidate
+URLs and falls back to low-rate data unless `--no-base-fallback` is set. Use
+`--no-base-fallback` for experiments that compare high-rate and low-rate base
+data, because any fallback makes the run a low-rate base run.
 `--base-rinex-version 2` selects compact RINEX 2/Hatanaka EUREF names, including
 BEV low-rate `.YYd.gz` names and BKG high-rate `.YYd.Z` names; `auto` plans
 RINEX 3 first, then RINEX 2 alternatives.
@@ -395,8 +397,66 @@ characters to private-use Unicode code points.
 
 Base download planning uses the recorded rover observation time span and
 requests every hourly or 15 minute product that overlaps or touches that span.
-`--time-margin SECONDS` deliberately expands the span; the default is `0` so
-adjacent non-overlapping products are not fetched or passed to RTKLIB.
+High-rate archive planning adds a small internal 5 minute margin so the first
+and last 15 minute chunks are not missed. `--time-margin SECONDS` deliberately
+expands the rover span for all archive products; the default is `0` so adjacent
+low-rate non-overlapping products are not fetched or passed to RTKLIB.
+
+## Real-Time Base Recording
+
+When no suitable high-rate archive exists for a station, record the base stream
+before leaving and stop it after returning. The recorder uses RTKLIB `str2str`
+as the NTRIP client and writes raw RTCM3 plus metadata; passwords are used only
+in the subprocess URL and are redacted from logs and JSON.
+
+```bash
+um980-ppk record-base-rt \
+  --caster HOST \
+  --port 2101 \
+  --mountpoint MOUNT \
+  --user "$NTRIP_USER" \
+  --password "$NTRIP_PASSWORD" \
+  --out-dir base-recordings \
+  --station CPAR \
+  --rtklib-dir RTKLIB_EX_2.5.0 \
+  -v
+```
+
+Leave the command running while mapping, then stop it with `Ctrl+C`. It prints
+the `.rtcm3` path and writes `<mount>_<time>.meta.json` and
+`<mount>_<time>.record.log` next to the raw stream.
+
+Process the rover with that recorded base stream:
+
+```bash
+um980-ppk pipeline rover.ubx \
+  --base-rtcm base-recordings/MOUNT_YYYYMMDDTHHMMSSZ.rtcm3 \
+  --rtklib-dir RTKLIB_EX_2.5.0 \
+  --run-rtklib \
+  --nav-merge all \
+  --rtkconf um980-onepass-gps-gal-bds-el28.conf
+```
+
+`--base-rtcm` and `--download-base` are mutually exclusive. The RTCM stream is
+converted with RTKLIB `convbin -r rtcm3` into a base OBS/NAV pair and then fed
+to the existing RTKLIB pipeline. If both converted base NAV and rover/downloaded
+NAV are available, normal `--nav-merge` selection applies.
+
+RTK2Go and other public casters are treated as generic NTRIP casters. To inspect
+a caster without adding RTK2Go-specific assumptions:
+
+```bash
+um980-ppk ntrip-sourcetable \
+  --caster rtk2go.com \
+  --port 2101 \
+  --out rtk2go-sourcetable.txt \
+  --contains CPAR
+```
+
+The tool does not guarantee mountpoint quality. Before relying on a stream,
+verify the base coordinates, distance to the rover route, RTCM 1005/1006
+presence, multi-GNSS MSM content, receiver/antenna metadata where available,
+and converted RINEX observation types.
 
 `postprocess` passes a base reference position to RTKLIB when one is available.
 Use `--base-ecef X Y Z` or `--base-llh LAT LON HEIGHT` for an explicit

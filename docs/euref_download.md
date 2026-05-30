@@ -37,8 +37,9 @@ Hatanaka-compressed `.crx.gz` products.
 ## Rate and RINEX Version Selection
 
 Use `--base-resolution low` for hourly 30 s files, normally RINEX 3 names
-containing `01H_30S_MO`. Use `--base-resolution high` for 15 minute 1 s files,
-normally names containing `15M_01S_MO`:
+containing `01H_30S_MO`. Use `--base-resolution high` for generic BKG high-rate
+archives, normally 15 minute 1 s files with names containing `15M_01S_MO` or
+`_01S_`:
 
 ```bash
 um980-ppk download-base rover.unc \
@@ -48,13 +49,13 @@ um980-ppk download-base rover.unc \
   --crx2rnx ./crx2rnx.exe
 ```
 
-High-rate EUREF files are not always published for every station and interval.
-When high-rate data is requested, the CLI logs the high-rate candidate groups,
-tries them before low-rate products, and logs the failed provider/URLs before
-falling back to low-rate data by default. Use `--no-base-fallback` when a
-missing high-rate file should be a hard failure. This is recommended for
-experiments comparing high-rate and low-rate base data, because fallback makes
-the run a low-rate base run.
+High-rate archive files are not always published for every station and
+interval. When high-rate data is requested, the CLI logs the BKG EUREF
+high-rate and BKG IGS high-rate candidate groups, tries them before low-rate
+products, and logs the failed provider/URLs before falling back to low-rate data
+by default. Use `--no-base-fallback` when a missing high-rate file should be a
+hard failure. This is recommended for experiments comparing high-rate and
+low-rate base data, because fallback makes the run a low-rate base run.
 
 To verify what actually ran, inspect verbose logs:
 
@@ -72,7 +73,9 @@ a high-rate attempt; they are only considered during the explicit low-rate
 fallback attempt. Use `--force-download` to refresh planned source archives from
 the provider.
 
-By default, `--time-margin` is `0`: only base products overlapping or touching
+High-rate archive planning adds an internal 5 minute margin around the rover
+window so edge 15 minute chunks are not missed. By default, `--time-margin` is
+`0`: only base products overlapping or touching
 the recorded interval are requested. Set `--time-margin SECONDS` only when you
 intentionally want neighboring products included for troubleshooting or
 receiver-clock uncertainty.

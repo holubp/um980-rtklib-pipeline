@@ -47,6 +47,9 @@
   before low-rate candidates. Low-rate `01H_30S`/`_30S_` files may only be used
   after explicit fallback handling and must be logged as fallback, never as a
   successful high-rate selection.
+- Recorded real-time base RTCM is an alternative base source, not an archive
+  fallback. `--base-rtcm` must be converted with RTKLIB `convbin -r rtcm3` and
+  must not be combined silently with `--download-base`.
 - EUREF provider URL templates must be verified against real public directory
   listings and sample files before being added. For BKG high-rate products,
   preflight the directory index so missing station/rate combinations produce

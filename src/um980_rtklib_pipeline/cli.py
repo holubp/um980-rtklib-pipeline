@@ -9,11 +9,13 @@ import math
 import re
 import shutil
 import sys
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
 from .badsat import BadSatConfig, choose_bad_sats, compute_sat_metrics, parse_rtklib_stat
 from .badsat_report import write_badsat_json_report, write_badsat_markdown_report
+from .base_rt import convert_rtcm_to_rinex, fetch_ntrip_sourcetable, record_ntrip_base
 from .bestnav import (
     bestnav_records_to_nmea,
     extract_bestnav_records,
@@ -82,9 +84,10 @@ from .solution import (
 )
 from .stream import parse_stream
 
-BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate")
+BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate", "bkg-igs-highrate")
 BASE_RATE_HIGH = "1s"
 BASE_RATE_LOW = "30s"
+HIGH_RATE_ARCHIVE_MARGIN_S = 300
 RTK_POS_MODE_CODES = {
     "single": "0",
     "dgps": "1",
@@ -117,6 +120,18 @@ RTK_NAVSYS_PRESETS = {
     "gps-glo-gal-bds": "G,R,E,C",
     "all": "G,R,E,C,J",
 }
+
+
+@dataclass(frozen=True)
+class BaseArchiveCandidateGroup:
+    """Planned archive candidates for one base-observation provider group."""
+
+    source_kind: str
+    resolution: str
+    rinex_version: str
+    provider: str
+    nominal_rate: str
+    is_fallback: bool = False
 
 
 def _csv_items(value: object) -> list[str]:
@@ -509,6 +524,10 @@ def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base
     )
     parser.add_argument("--base-obs", action="append", required=require_base_obs)
     parser.add_argument(
+        "--base-rtcm",
+        help="Recorded real-time base RTCM3 stream; converted with convbin and used as the RTKLIB base observation input.",
+    )
+    parser.add_argument(
         "--rtk-pos-mode",
         choices=sorted(RTK_POS_MODE_CODES),
         default="kinematic",
@@ -585,38 +604,85 @@ def _add_auto_sat_qc_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-remaining-constellations", type=int, default=2)
 
 
-def _base_download_attempts(args: argparse.Namespace) -> list[tuple[str, str, str, str]]:
+def _base_download_attempts(args: argparse.Namespace) -> list[BaseArchiveCandidateGroup]:
     requested_resolution = args.base_resolution
-    if args.base_rate == BASE_RATE_HIGH or args.base_provider in {"bkg-euref-highrate", "bkg-euref-highrate-v2"}:
+    if args.base_rate == BASE_RATE_HIGH or args.base_provider in {
+        "bkg-euref-highrate",
+        "bkg-euref-highrate-v2",
+        "bkg-igs-highrate",
+        "bkg-igs-highrate-v2",
+    }:
         requested_resolution = "high"
     versions = ["3", "2"] if args.base_rinex_version == "auto" else [args.base_rinex_version]
-    attempts: list[tuple[str, str, str, str]] = []
+    attempts: list[BaseArchiveCandidateGroup] = []
     for version in versions:
-        attempts.append(_base_download_attempt(args, requested_resolution, version))
+        attempts.extend(_base_download_attempts_for_resolution(args, requested_resolution, version, is_fallback=False))
     if requested_resolution == "high" and _base_fallback_allowed(args):
         for version in versions:
-            attempts.append(_base_download_attempt(args, "low", version))
-    unique: list[tuple[str, str, str, str]] = []
-    seen: set[tuple[str, str, str, str]] = set()
+            attempts.extend(_base_download_attempts_for_resolution(args, "low", version, is_fallback=True))
+    unique: list[BaseArchiveCandidateGroup] = []
+    seen: set[tuple[str, str, str, str, str, bool]] = set()
     for attempt in attempts:
-        if attempt not in seen:
+        key = (
+            attempt.source_kind,
+            attempt.resolution,
+            attempt.rinex_version,
+            attempt.provider,
+            attempt.nominal_rate,
+            attempt.is_fallback,
+        )
+        if key not in seen:
             unique.append(attempt)
-            seen.add(attempt)
+            seen.add(key)
     return unique
 
 
-def _base_download_attempt(
+def _base_download_attempts_for_resolution(
     args: argparse.Namespace,
     resolution: str,
     rinex_version: str,
-) -> tuple[str, str, str, str]:
+    *,
+    is_fallback: bool,
+) -> list[BaseArchiveCandidateGroup]:
     if resolution == "high":
-        provider = "bkg-euref-highrate-v2" if rinex_version == "2" else "bkg-euref-highrate"
-        return resolution, rinex_version, provider, BASE_RATE_HIGH
+        providers = _high_rate_archive_providers(args.base_provider, rinex_version)
+        return [
+            BaseArchiveCandidateGroup(
+                source_kind="archive",
+                resolution=resolution,
+                rinex_version=rinex_version,
+                provider=provider,
+                nominal_rate=BASE_RATE_HIGH,
+                is_fallback=is_fallback,
+            )
+            for provider in providers
+        ]
     provider = args.base_provider
-    if provider == "bkg-euref-highrate":
+    if provider in {"bkg-euref-highrate", "bkg-igs-highrate"}:
         provider = "bkg-euref-nrt"
-    return resolution, rinex_version, provider, BASE_RATE_LOW
+    return [
+        BaseArchiveCandidateGroup(
+            source_kind="archive",
+            resolution=resolution,
+            rinex_version=rinex_version,
+            provider=provider,
+            nominal_rate=BASE_RATE_LOW,
+            is_fallback=is_fallback,
+        )
+    ]
+
+
+def _high_rate_archive_providers(base_provider: str, rinex_version: str) -> list[str]:
+    """Return generic high-rate archive providers to try for a station."""
+
+    suffix = "-v2" if rinex_version == "2" else ""
+    euref = f"bkg-euref-highrate{suffix}"
+    igs = f"bkg-igs-highrate{suffix}"
+    if base_provider in {"bkg-igs-highrate", "bkg-igs-highrate-v2"}:
+        return [igs, euref]
+    if base_provider in {"bkg-euref-highrate", "bkg-euref-highrate-v2"}:
+        return [euref, igs]
+    return [euref, igs]
 
 
 def _base_fallback_allowed(args: argparse.Namespace) -> bool:
@@ -722,7 +788,7 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
         raise ValueError("--station is required to download base observations")
     station_long = _resolve_station_for_base_download(args)
     attempts = _base_download_attempts(args)
-    requested_resolution = "high" if any(attempt[0] == "high" for attempt in attempts[:1]) else args.base_resolution
+    requested_resolution = "high" if attempts and attempts[0].resolution == "high" else args.base_resolution
     allow_fallback = _base_fallback_allowed(args)
     logging.info(
         "base resolution request: requested_base_resolution=%s requested_base_rinex_version=%s "
@@ -732,28 +798,37 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
         station_long,
         str(allow_fallback).lower(),
     )
-    planned_by_attempt: list[tuple[str, str, str, str, list[str]]] = []
-    for resolution, version, provider, rate in attempts:
+    planned_by_attempt: list[tuple[BaseArchiveCandidateGroup, list[str]]] = []
+    for attempt in attempts:
+        plan_start = start
+        plan_end = end
+        if attempt.nominal_rate == BASE_RATE_HIGH:
+            plan_start = start - timedelta(seconds=HIGH_RATE_ARCHIVE_MARGIN_S)
+            plan_end = end + timedelta(seconds=HIGH_RATE_ARCHIVE_MARGIN_S)
         urls = planned_urls(
             station=args.station,
             station_long=station_long,
-            start=start,
-            end=end,
-            provider_name=provider,
-            base_rate=rate,
+            start=plan_start,
+            end=plan_end,
+            provider_name=attempt.provider,
+            base_rate=attempt.nominal_rate,
             whole_day=args.whole_day,
-            rinex_version=version,
+            rinex_version=attempt.rinex_version,
         )
         logging.info(
-            "base candidate group: resolution=%s provider=%s nominal_rate=%s rinex=%s fallback=%s candidates=%d",
-            resolution,
-            provider,
-            rate,
-            version,
-            str(resolution != requested_resolution).lower(),
+            "base candidate group: source=%s provider=%s resolution=%s nominal_interval=%s rinex=%s fallback=%s "
+            "window=%s..%s candidates=%d",
+            attempt.source_kind,
+            attempt.provider,
+            attempt.resolution,
+            attempt.nominal_rate,
+            attempt.rinex_version,
+            str(attempt.is_fallback).lower(),
+            plan_start,
+            plan_end,
             len(urls),
         )
-        planned_by_attempt.append((resolution, version, provider, rate, urls))
+        planned_by_attempt.append((attempt, urls))
 
     if args.offline or args.dry_run:
         target_dir = Path(args.cache_dir or args.base_dir or "euref-cache")
@@ -763,24 +838,24 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
             mode,
             target_dir,
         )
-        for _, _, _, _, urls in planned_by_attempt:
+        for _, urls in planned_by_attempt:
             print("\n".join(urls))
         return []
 
     cache_dir = Path(args.cache_dir or args.base_dir or "euref-cache")
     logging.info("EUREF base files will be stored in %s", cache_dir)
     last_error: Exception | None = None
-    for index, (resolution, version, provider, rate, urls) in enumerate(planned_by_attempt):
-        fallback_attempt = resolution != requested_resolution
+    for index, (attempt, urls) in enumerate(planned_by_attempt):
+        fallback_attempt = attempt.is_fallback
         try:
             logging.info(
                 "%s EUREF base observations: station=%s provider=%s rate=%s rinex=%s resolution=%s fallback=%s",
                 "force-downloading" if args.force_download else "resolving cached/downloaded",
                 station_long,
-                provider,
-                rate,
-                version,
-                resolution,
+                attempt.provider,
+                attempt.nominal_rate,
+                attempt.rinex_version,
+                attempt.resolution,
                 str(fallback_attempt).lower(),
             )
             listed_urls = filter_urls_by_remote_listing(urls, cache_dir, force=args.force_download)
@@ -807,44 +882,44 @@ def _download_base_files_for_window(args: argparse.Namespace, start, end) -> lis
                 selected_rate = _validate_selected_base_resolution(
                     paths=normalised,
                     requested_resolution=requested_resolution,
-                    selected_resolution=resolution,
-                    nominal_rate=rate,
-                    provider=provider,
-                    rinex_version=version,
+                    selected_resolution=attempt.resolution,
+                    nominal_rate=attempt.nominal_rate,
+                    provider=attempt.provider,
+                    rinex_version=attempt.rinex_version,
                     station_long=station_long,
                     fallback_used=fallback_attempt,
                     allow_fallback=allow_fallback,
                 )
                 if fallback_attempt:
                     logging.warning(
-                        "requested high-rate base data but no high-rate candidate was available; "
+                        "requested high-rate base data but no high-rate archive candidate was available; "
                         "falling back to low-rate %s base data because fallback is enabled",
                         selected_rate,
                     )
                     logging.warning(
                         "using fallback EUREF base observations: provider=%s rate=%s rinex=%s",
-                        provider,
-                        rate,
-                        version,
+                        attempt.provider,
+                        attempt.nominal_rate,
+                        attempt.rinex_version,
                     )
                 return normalised
             last_error = RuntimeError("downloaded EUREF base observation list was empty")
         except Exception as exc:
             last_error = exc
             if index + 1 < len(planned_by_attempt):
-                _, next_version, next_provider, next_rate, _ = planned_by_attempt[index + 1]
+                next_attempt, _ = planned_by_attempt[index + 1]
                 logging.warning(
                     "EUREF base observations unavailable for provider=%s rate=%s rinex=%s: %s; "
                     "trying provider=%s rate=%s rinex=%s",
-                    provider,
-                    rate,
-                    version,
+                    attempt.provider,
+                    attempt.nominal_rate,
+                    attempt.rinex_version,
                     exc,
-                    next_provider,
-                    next_rate,
-                    next_version,
+                    next_attempt.provider,
+                    next_attempt.nominal_rate,
+                    next_attempt.rinex_version,
                 )
-            elif resolution == "high":
+            elif attempt.resolution == "high":
                 logging.warning("high-rate EUREF base observations unavailable and fallback is disabled: %s", exc)
     if last_error:
         raise RuntimeError(f"no usable EUREF base observation files were available: {last_error}") from last_error
@@ -1881,6 +1956,75 @@ def cmd_download_base(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_base_rt(args: argparse.Namespace) -> int:
+    """Handle `record-base-rt` for NTRIP base RTCM recording."""
+
+    _configure_cli_logging(args)
+    result = record_ntrip_base(
+        caster=args.caster,
+        port=args.port,
+        mountpoint=args.mountpoint,
+        out_dir=Path(args.out_dir),
+        station=args.station,
+        user=args.user,
+        password=args.password,
+        str2str=args.str2str,
+        rtklib_dir=args.rtklib_dir,
+        path_style=args.rtklib_path_style,
+    )
+    logging.info(
+        "real-time base recording stopped: output=%s duration=%.1fs bytes=%d metadata=%s",
+        result.output_rtcm3,
+        result.duration_s,
+        result.bytes_written,
+        result.metadata_json,
+    )
+    print(result.output_rtcm3)
+    return 0
+
+
+def cmd_ntrip_sourcetable(args: argparse.Namespace) -> int:
+    """Handle `ntrip-sourcetable` raw caster listing fetches."""
+
+    _configure_cli_logging(args)
+    text = fetch_ntrip_sourcetable(
+        caster=args.caster,
+        port=args.port,
+        out=Path(args.out),
+        contains=args.contains,
+        user=args.user,
+        password=args.password,
+    )
+    logging.info("wrote NTRIP sourcetable output: %s (%d bytes)", args.out, len(text.encode("utf-8")))
+    return 0
+
+
+def _convert_base_rtcm_if_requested(args: argparse.Namespace, out_dir: Path, basename: str) -> tuple[list[Path], list[Path]]:
+    """Convert a user-recorded base RTCM stream to RTKLIB-ready RINEX inputs."""
+
+    base_rtcm = getattr(args, "base_rtcm", None)
+    if not base_rtcm:
+        return [], []
+    if getattr(args, "download_base", False):
+        raise ValueError("--base-rtcm and --download-base are mutually exclusive; choose one base source")
+    rtcm_path = Path(base_rtcm)
+    obs, nav_files = convert_rtcm_to_rinex(
+        rtcm_path=rtcm_path,
+        out_dir=out_dir,
+        basename=f"{basename}.base-rtcm",
+        convbin=getattr(args, "convbin", None) or "convbin",
+        rtklib_dir=getattr(args, "rtklib_dir", None),
+        path_style=getattr(args, "rtklib_path_style", "auto"),
+    )
+    logging.info(
+        "base_source=realtime-recording base_rtcm=%s converted_base_obs=%s converted_base_nav=%s",
+        rtcm_path,
+        obs,
+        ",".join(str(path) for path in nav_files) or "none",
+    )
+    return [obs], nav_files
+
+
 def cmd_postprocess(args: argparse.Namespace) -> int:
     """Handle `postprocess`.
 
@@ -1904,9 +2048,16 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
             logging.warning("%s", warning)
         rover_nav = rover_nav_files(rover_nav_path)
         logging.info("using %d rover navigation sidecar files", len(rover_nav))
+    rover_obs = Path(args.rover_obs)
+    base_obs = [Path(item) for item in args.base_obs or []]
+    converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
+    base_obs.extend(converted_base_obs)
+    if not base_obs:
+        raise ValueError("--base-obs or --base-rtcm is required for postprocess")
     logging.info("resolving navigation inputs for RTKLIB")
     nav_resolution = resolve_nav_sources(
         explicit=args.nav_file,
+        base_rtcm=base_rtcm_nav,
         rover=rover_nav,
         observed_systems=set(),
         merge_policy=args.nav_merge,
@@ -1915,8 +2066,6 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         raise ValueError(nav_resolution.warnings[0])
     rnx2rtkp = resolve_rtklib_tool(args.rnx2rtkp, rtklib_dir=args.rtklib_dir)
     logging.info("resolved rnx2rtkp executable: %s", rnx2rtkp)
-    rover_obs = Path(args.rover_obs)
-    base_obs = [Path(item) for item in args.base_obs]
     logging.info("checking rover/base observation time overlap: rover=%s base_files=%d", rover_obs, len(base_obs))
     base_obs, overlap_warnings = filter_rinex_obs_by_overlap(rover_obs, base_obs)
     for warning in overlap_warnings:
@@ -1954,6 +2103,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
+    if getattr(args, "base_rtcm", None) and args.download_base:
+        raise ValueError("--base-rtcm and --download-base are mutually exclusive; choose one base source")
     logging.info("pipeline step 1/3: extract receiver products")
     cmd_extract(args)
     logging.info("pipeline step 2/3: generate rover RINEX and navigation files")
@@ -1962,6 +2113,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     base = basename_for(args.rover_log, args.basename)
     rover_obs = out_dir / f"{base}.direct.obs"
     base_obs = [Path(item) for item in args.base_obs or []]
+    converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
+    base_obs.extend(converted_base_obs)
     if args.station and args.download_base:
         logging.info("pipeline base download: deriving time span from %s", rover_obs)
         rover_span = read_rinex_obs_time_span(rover_obs)
@@ -2001,6 +2154,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     logging.info("found %d generated rover navigation sidecar files", len(generated_rover_nav))
     nav_resolution = resolve_nav_sources(
         explicit=args.nav_file,
+        base_rtcm=base_rtcm_nav,
         rover=generated_rover_nav,
         observed_systems=set(),
         merge_policy=args.nav_merge,
@@ -2159,6 +2313,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(dl)
     dl.set_defaults(func=cmd_download_base)
 
+    rec = sub.add_parser("record-base-rt")
+    rec.add_argument("--caster", required=True)
+    rec.add_argument("--port", type=int, default=2101)
+    rec.add_argument("--mountpoint", required=True)
+    rec.add_argument("--user")
+    rec.add_argument("--password")
+    rec.add_argument("--station")
+    rec.add_argument("--rtklib-dir")
+    rec.add_argument("--str2str", default="str2str")
+    rec.add_argument("--rtklib-path-style", choices=["auto", "unix", "windows"], default="auto")
+    _add_common(rec)
+    rec.set_defaults(func=cmd_record_base_rt, out_dir="base-recordings")
+
+    sourcetable = sub.add_parser("ntrip-sourcetable")
+    sourcetable.add_argument("--caster", required=True)
+    sourcetable.add_argument("--port", type=int, default=2101)
+    sourcetable.add_argument("--out", required=True)
+    sourcetable.add_argument("--contains", action="append")
+    sourcetable.add_argument("--user")
+    sourcetable.add_argument("--password")
+    _add_common(sourcetable)
+    sourcetable.set_defaults(func=cmd_ntrip_sourcetable)
+
     post = sub.add_parser("postprocess")
     post.add_argument("rover_log")
     post.add_argument("--rover-obs", required=True)
@@ -2170,7 +2347,7 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--use-rover-nav", action="store_true")
     post.add_argument("--no-use-rover-nav", action="store_true")
     post.add_argument("--nav-merge", choices=["best-per-system", "all"], default="best-per-system")
-    _add_rtklib_processing_args(post, require_base_obs=True)
+    _add_rtklib_processing_args(post, require_base_obs=False)
     _add_base_position_args(post)
     _add_common(post)
     post.set_defaults(func=cmd_postprocess)
@@ -2179,6 +2356,10 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("rover_log")
     pipe.add_argument("--download-base", action="store_true")
     pipe.add_argument("--base-obs", action="append")
+    pipe.add_argument(
+        "--base-rtcm",
+        help="Recorded real-time base RTCM3 stream; converted with convbin and used as the RTKLIB base observation input.",
+    )
     pipe.add_argument("--nav-file", action="append")
     pipe.add_argument("--nav-merge", choices=["best-per-system", "all"], default="best-per-system")
     pipe.add_argument("--run-rtklib", action="store_true")
