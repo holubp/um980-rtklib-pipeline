@@ -197,7 +197,7 @@ def test_raw_rnx2rtkp_options_can_override_generated_output_format():
     assert cli._generated_rtk_options(args)[-2:] == ["-n", "-e"]
 
 
-def test_rtklib_trace_and_stat_levels_are_named_options():
+def test_rtklib_stat_level_is_named_option_and_trace_requires_quality_mode():
     parser = cli.build_parser()
     args = parser.parse_args(
         [
@@ -210,10 +210,12 @@ def test_rtklib_trace_and_stat_levels_are_named_options():
         ]
     )
 
-    assert cli._generated_rtk_options(args)[-4:] == ["-x", "4", "-y", "2"]
+    assert cli._generated_rtk_options(args)[-2:] == ["-y", "2"]
+    with pytest.raises(ValueError, match="requires --quality-trace"):
+        cli._validate_quality_trace_args(args)
 
 
-def test_rtkconf_keeps_trace_and_stat_command_line_overrides():
+def test_rtkconf_keeps_stat_command_line_override_and_trace_requires_quality_mode():
     parser = cli.build_parser()
     args = parser.parse_args(
         [
@@ -235,7 +237,9 @@ def test_rtkconf_keeps_trace_and_stat_command_line_overrides():
     rtkconf, rtk_options = cli._rtklib_config_and_options(args)
 
     assert rtkconf == Path("um980.conf")
-    assert rtk_options == ["-x", "4", "-y", "2"]
+    assert rtk_options == ["-y", "2"]
+    with pytest.raises(ValueError, match="requires --quality-trace"):
+        cli._validate_quality_trace_args(args)
 
 
 def test_rinex_v2_url_planning():

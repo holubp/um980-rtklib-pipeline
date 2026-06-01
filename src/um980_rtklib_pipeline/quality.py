@@ -108,6 +108,8 @@ class QualityAnalysis:
     transition_jumps: dict[str, object]
     false_fix_suspicion: dict[str, object]
     warnings: list[str]
+    trace: dict[str, object] | None = None
+    cleanup: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return stable JSON-friendly analysis data."""
@@ -123,6 +125,15 @@ class QualityAnalysis:
             "rejections": self.rejections,
             "transition_jumps": self.transition_jumps,
             "false_fix_suspicion": self.false_fix_suspicion,
+            "trace": self.trace or {"available": False},
+            "cleanup": self.cleanup
+            or {
+                "trace_cleanup_requested": False,
+                "trace_deleted": False,
+                "stat_cleanup_requested": False,
+                "stat_files_deleted": [],
+                "stat_files_kept": [],
+            },
             "warnings": self.warnings,
         }
 
@@ -205,6 +216,8 @@ def analyze_rtk_quality(
     solution_path: Path,
     stat_path: Path | None = None,
     thresholds: QualityThresholds | None = None,
+    trace_summary: dict[str, object] | None = None,
+    cleanup: dict[str, object] | None = None,
 ) -> QualityAnalysis:
     """Analyse RTKLIB solution quality from `.nmea`/`.pos` and optional `.stat`.
 
@@ -262,6 +275,8 @@ def analyze_rtk_quality(
         transition_jumps=transitions,
         false_fix_suspicion=suspicion,
         warnings=list(dict.fromkeys(warnings)),
+        trace=trace_summary,
+        cleanup=cleanup,
     )
 
 
@@ -856,10 +871,50 @@ def format_quality_markdown(analysis: QualityAnalysis) -> str:
             "",
             json.dumps({"slips": data["slips"], "rejections": data["rejections"]}, indent=2, sort_keys=True),
             "",
-            "## 7. Top Warnings And Interpretation",
+            "## 7. RTKLIB Trace Diagnostics",
             "",
         ]
     )
+    trace = data.get("trace", {"available": False})
+    if isinstance(trace, dict) and trace.get("available"):
+        counters = trace.get("counters", {})
+        lines.extend(
+            [
+                f"- Trace mode: `{trace.get('source')}`",
+                f"- Effective trace level: `{trace.get('effective_level')}`",
+                f"- Trace retained: {'yes' if trace.get('retained') else 'no'}",
+                f"- Bytes parsed: {trace.get('bytes_read')}",
+                f"- Lines parsed: {trace.get('lines_read')}",
+                "",
+                "| Event category | Count |",
+                "| --- | ---: |",
+            ]
+        )
+        for key, label in (
+            ("ar_ratio_lines", "AR ratio lines"),
+            ("ambiguity_reset_lines", "Ambiguity reset lines"),
+            ("cycle_slip_lines", "Cycle slip lines"),
+            ("observation_rejection_lines", "Observation rejection lines"),
+            ("residual_outlier_lines", "Residual outlier lines"),
+            ("missing_ephemeris_lines", "Missing ephemeris lines"),
+            ("base_rover_time_issue_lines", "Base/rover time issues"),
+        ):
+            count = counters.get(key, 0) if isinstance(counters, dict) else 0
+            lines.append(f"| {label} | {count} |")
+        lines.extend(["", "Trace evidence can indicate marginal or suspect fixes, but does not prove false fixes."])
+    else:
+        lines.append("- Trace diagnostics were not requested or no trace file was available.")
+    cleanup = data.get("cleanup", {})
+    if isinstance(cleanup, dict):
+        deleted = cleanup.get("stat_files_deleted", [])
+        lines.extend(
+            [
+                "",
+                f"- `.stat` cleanup requested: {'yes' if cleanup.get('stat_cleanup_requested') else 'no'}",
+                f"- `.stat` files deleted after successful analysis: {len(deleted) if isinstance(deleted, list) else 0}",
+            ]
+        )
+    lines.extend(["", "## 8. Top Warnings And Interpretation", ""])
     warnings = data.get("warnings", [])
     if warnings:
         lines.extend(f"- WARNING: {warning}" for warning in warnings)  # type: ignore[union-attr]
@@ -868,7 +923,7 @@ def format_quality_markdown(analysis: QualityAnalysis) -> str:
     lines.extend(
         [
             "",
-            "## 8. Suggested Next Actions",
+            "## 9. Suggested Next Actions",
             "",
             "- Optimise on trusted fixed time and trusted fixed distance, not raw fixed percentage alone.",
             "- Inspect missing/no-output time before comparing configurations.",

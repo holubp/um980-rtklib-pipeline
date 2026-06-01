@@ -9,7 +9,7 @@ import math
 import re
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from glob import glob
 from pathlib import Path
@@ -107,6 +107,7 @@ from .solution import (
 )
 from .stations import default_station_catalog_cache, load_station_catalog
 from .stream import parse_stream
+from .trace_quality import analyze_rtklib_trace
 from .time_window import ProcessingWindow, processing_window_from_values
 from .timeutil import gps_week_tow_to_datetime
 
@@ -336,12 +337,40 @@ def _add_quality_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stationary-speed-threshold-mps", type=float, default=0.3)
 
 
+def _add_quality_trace_args(parser: argparse.ArgumentParser, *, standalone: bool = False) -> None:
+    """Add optional RTKLIB trace and cleanup diagnostics arguments."""
+
+    parser.add_argument("--quality-trace", choices=["off", "temporary", "keep", "existing"], default="off")
+    parser.add_argument("--trace", help="Existing RTKLIB trace path for --quality-trace existing.")
+    parser.add_argument("--rtklib-trace-file", help="Retained RTKLIB trace destination for --quality-trace keep.")
+    if standalone:
+        parser.add_argument("--rtklib-trace-level", type=int, choices=range(0, 6), metavar="0..5")
+    parser.add_argument("--rtklib-trace-max-bytes", type=int, help="Reserved cap for future trace parsing safeguards.")
+    parser.add_argument(
+        "--rtklib-trace-cleanup",
+        choices=["always", "on-success", "never"],
+        default="always",
+        help="Temporary trace cleanup policy.",
+    )
+    parser.add_argument(
+        "--quality-clean-stat",
+        action="store_true",
+        help=(
+            "Delete generated RTKLIB .stat files after successful quality analysis. "
+            "Standalone quality-analyze refuses this to avoid deleting archived .stat files."
+            if standalone
+            else "Delete generated RTKLIB .stat files after successful quality analysis."
+        ),
+    )
+
+
 def _add_quality_pipeline_args(parser: argparse.ArgumentParser) -> None:
     """Add optional pipeline RTK quality-analysis outputs."""
 
     parser.add_argument("--quality-analyze", action="store_true", help="Analyse generated RTKLIB solution quality after post-processing.")
     parser.add_argument("--quality-out-md", help="Markdown RTK quality report path.")
     parser.add_argument("--quality-out-json", help="JSON RTK quality report path.")
+    _add_quality_trace_args(parser)
     _add_quality_analyze_args(parser)
 
 
@@ -1382,13 +1411,45 @@ def _rtklib_debug_output_options(args: argparse.Namespace) -> list[str]:
     """Return `rnx2rtkp` trace/stat options requested for solution debugging."""
 
     options: list[str] = []
-    trace_level = getattr(args, "rtklib_trace_level", None)
-    if trace_level is not None:
-        options.extend(["-x", str(trace_level)])
     stat_level = getattr(args, "rtklib_stat_level", None)
     if stat_level is not None:
         options.extend(["-y", str(stat_level)])
     return options
+
+
+def _validate_quality_trace_args(args: argparse.Namespace, *, standalone: bool = False) -> int | None:
+    """Validate quality trace options and return the effective generation level."""
+
+    mode = getattr(args, "quality_trace", "off")
+    trace_level = getattr(args, "rtklib_trace_level", None)
+    if mode == "off":
+        if trace_level is not None and trace_level > 0:
+            raise ValueError("--rtklib-trace-level requires --quality-trace temporary or --quality-trace keep")
+        return None
+    if mode == "existing":
+        if not getattr(args, "trace", None):
+            raise ValueError("--quality-trace existing requires --trace PATH")
+        if trace_level is not None:
+            logging.warning("--rtklib-trace-level is ignored with --quality-trace existing")
+        return None
+    if standalone:
+        raise ValueError("--quality-trace temporary/keep is only supported by pipeline/postprocess RTKLIB runs")
+    if not getattr(args, "quality_analyze", False):
+        raise ValueError("--quality-trace temporary/keep requires --quality-analyze")
+    level = 3 if trace_level is None else trace_level
+    if level <= 0:
+        raise ValueError("--rtklib-trace-level must be greater than 0 when trace generation is requested")
+    if level == 1:
+        logging.warning("RTKLIB trace level 1 is likely too sparse for useful quality diagnostics")
+    if level >= 4:
+        logging.warning("RTKLIB trace level %d may create very large trace files", level)
+    logging.info(
+        "quality_trace=%s requested_rtklib_trace_level=%s effective_rtklib_trace_level=%s",
+        mode,
+        trace_level if trace_level is not None else "<unset>",
+        level,
+    )
+    return level
 
 
 def _rtk_navsys_arg(args: argparse.Namespace) -> str:
@@ -1447,6 +1508,8 @@ def _run_rtklib_with_optional_auto_qc(
 ):
     """Run one-pass RTKLIB or explicit two-pass auto-satellite-QC."""
 
+    effective_trace_level = _validate_quality_trace_args(args)
+    trace_mode = getattr(args, "quality_trace", "off")
     if not getattr(args, "auto_sat_qc", False):
         return run_rnx2rtkp(
             rnx2rtkp=rnx2rtkp,
@@ -1462,7 +1525,13 @@ def _run_rtklib_with_optional_auto_qc(
             path_style=args.rtklib_path_style,
             dry_run=args.dry_run,
             debug=_debug_enabled(args),
+            trace_mode=trace_mode if trace_mode in {"temporary", "keep"} else "off",
+            trace_level=effective_trace_level,
+            trace_file=Path(args.rtklib_trace_file) if getattr(args, "rtklib_trace_file", None) else None,
+            trace_cleanup=getattr(args, "rtklib_trace_cleanup", "always"),
         )
+    if trace_mode != "off":
+        raise ValueError("--quality-trace temporary/keep is not supported with --auto-sat-qc")
     return _run_auto_sat_qc(
         args=args,
         rnx2rtkp=rnx2rtkp,
@@ -1662,11 +1731,13 @@ def _run_rtklib_output_formats(
     return commands
 
 
-def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, basename: str) -> None:
+def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, basename: str, commands: list | None = None) -> None:
     """Run optional quality analysis for the first generated RTKLIB output."""
 
     if not getattr(args, "quality_analyze", False):
         return
+    if getattr(args, "quality_trace", "off") in {"off", "existing"}:
+        _validate_quality_trace_args(args)
     solution = _select_quality_solution_file(out_dir, basename, _rtklib_output_formats(args))
     if solution is None:
         logging.warning("quality analysis requested, but no RTKLIB solution output was found")
@@ -1676,14 +1747,54 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
         logging.warning("quality analysis running without .stat evidence: %s", solution)
     md_path = Path(args.quality_out_md) if getattr(args, "quality_out_md", None) else out_dir / f"{basename}-rtk.quality.md"
     json_path = Path(args.quality_out_json) if getattr(args, "quality_out_json", None) else out_dir / f"{basename}-rtk.quality.json"
+    trace_summary = _trace_summary_for_quality(args, commands or [])
+    cleanup = {
+        "trace_cleanup_requested": getattr(args, "quality_trace", "off") == "temporary",
+        "trace_deleted": bool(trace_summary and trace_summary.get("generated_temporarily") and not trace_summary.get("retained")),
+        "stat_cleanup_requested": bool(getattr(args, "quality_clean_stat", False)),
+        "stat_files_deleted": [],
+        "stat_files_kept": [str(stat)] if stat else [],
+    }
     analysis = analyze_rtk_quality(
         solution_path=solution,
         stat_path=stat,
         thresholds=_quality_thresholds_from_args(args),
+        trace_summary=trace_summary,
+        cleanup=cleanup,
     )
     md_path.write_text(format_quality_markdown(analysis), encoding="utf-8")
     write_quality_json(json_path, analysis)
+    deleted_stats: list[str] = []
+    if getattr(args, "quality_clean_stat", False) and stat is not None:
+        stat.unlink()
+        deleted_stats.append(str(stat))
+        logging.info("deleted generated RTKLIB .stat after successful quality analysis: %s", stat)
+        analysis = replace(
+            analysis,
+            cleanup={
+                **cleanup,
+                "stat_files_deleted": deleted_stats,
+                "stat_files_kept": [],
+            },
+        )
+        md_path.write_text(format_quality_markdown(analysis), encoding="utf-8")
+        write_quality_json(json_path, analysis)
     logging.info("wrote RTK quality analysis: markdown=%s json=%s", md_path, json_path)
+
+
+def _trace_summary_for_quality(args: argparse.Namespace, commands: list) -> dict[str, object] | None:
+    """Return trace diagnostics requested for quality analysis."""
+
+    mode = getattr(args, "quality_trace", "off")
+    if mode == "existing":
+        summary = analyze_rtklib_trace(Path(args.trace))
+        summary.update({"source": "existing", "generated_temporarily": False, "retained": True, "effective_level": None})
+        return summary
+    for command in commands:
+        summary = getattr(command, "trace_summary", None)
+        if summary:
+            return summary
+    return None
 
 
 def _select_quality_solution_file(out_dir: Path, basename: str, formats: list[str]) -> Path | None:
@@ -2374,10 +2485,25 @@ def cmd_quality_analyze(args: argparse.Namespace) -> int:
     """Handle standalone RTK solution quality analysis."""
 
     _configure_cli_logging(args)
+    if getattr(args, "quality_clean_stat", False):
+        raise ValueError(
+            "--quality-clean-stat is only supported for .stat files generated by the current pipeline/postprocess run"
+        )
+    _validate_quality_trace_args(args, standalone=True)
+    trace_summary = _trace_summary_for_quality(args, [])
+    cleanup = {
+        "trace_cleanup_requested": False,
+        "trace_deleted": False,
+        "stat_cleanup_requested": False,
+        "stat_files_deleted": [],
+        "stat_files_kept": [str(args.stat)] if args.stat else [],
+    }
     analysis = analyze_rtk_quality(
         solution_path=Path(args.solution),
         stat_path=Path(args.stat) if args.stat else None,
         thresholds=_quality_thresholds_from_args(args),
+        trace_summary=trace_summary,
+        cleanup=cleanup,
     )
     if args.out_json:
         write_quality_json(Path(args.out_json), analysis)
@@ -2717,7 +2843,7 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
-    _run_quality_analysis_if_requested(args, out_dir, base)
+    _run_quality_analysis_if_requested(args, out_dir, base, commands)
     for command in commands:
         print(format_command(command.args))
     return 0
@@ -2839,7 +2965,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
-    _run_quality_analysis_if_requested(args, out_dir, base)
+    _run_quality_analysis_if_requested(args, out_dir, base, commands)
     for command in commands:
         print(format_command(command.args))
     return 0
@@ -3067,6 +3193,7 @@ def build_parser() -> argparse.ArgumentParser:
     quality.add_argument("--out-md", help="Markdown report output path.")
     quality.add_argument("--out-json", help="JSON report output path.")
     quality.add_argument("--format", choices=["text", "markdown", "json"], default="text")
+    _add_quality_trace_args(quality, standalone=True)
     _add_quality_analyze_args(quality)
     _add_common(quality)
     quality.set_defaults(func=cmd_quality_analyze)

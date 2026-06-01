@@ -5,7 +5,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from hashlib import sha256
 import logging
 import shlex
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 from .files import classify_rinex_file, has_unresolved_wildcard
+from .trace_quality import analyze_rtklib_trace
 
 RtklibPathStyle = Literal["auto", "unix", "windows"]
 
@@ -38,6 +40,13 @@ class RtklibCommand:
     stdout_log: Path
     stderr_log: Path
     wrapper_file: Path
+    trace_file: Path | None = None
+    trace_generated_temporarily: bool = False
+    trace_retained: bool = False
+    trace_effective_level: int | None = None
+    trace_summary: dict[str, object] | None = None
+    generated_stat_files: list[Path] = field(default_factory=list)
+    deleted_stat_files: list[Path] = field(default_factory=list)
 
 
 def is_cygwin() -> bool:
@@ -444,6 +453,43 @@ def _raise_missing_rtklib_output(output_file: Path, stdout_log: Path, stderr_log
     )
 
 
+def _resolve_wildcard_parent(path: Path) -> Path:
+    """Return an absolute wildcard path while preserving literal wildcard name."""
+
+    if has_unresolved_wildcard(path):
+        return path.parent.resolve() / path.name
+    return path.resolve()
+
+
+def _effective_trace_level(trace_mode: str, trace_level: int | None) -> int | None:
+    if trace_mode not in {"off", "temporary", "keep"}:
+        raise ValueError(f"unsupported RTKLIB trace mode for execution: {trace_mode}")
+    if trace_mode == "off":
+        return None
+    if trace_level is None:
+        return 3
+    if trace_level <= 0:
+        raise ValueError("--rtklib-trace-level must be greater than 0 when trace generation is requested")
+    if trace_level == 1:
+        logging.warning("RTKLIB trace level 1 is likely too sparse for useful quality diagnostics")
+    if trace_level >= 4:
+        logging.warning("RTKLIB trace level %d may create very large trace files", trace_level)
+    return trace_level
+
+
+def _find_trace_candidate(directory: Path) -> Path | None:
+    """Find the most likely RTKLIB trace file in an isolated run directory."""
+
+    candidates: dict[Path, None] = {}
+    for pattern in ("rnx2rtkp.trace", "*.trace", "trace*"):
+        for path in directory.glob(pattern):
+            if path.is_file() and path.stat().st_size > 0:
+                candidates[path] = None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime, path.stat().st_size))
+
+
 def run_rnx2rtkp(
     *,
     rnx2rtkp: str,
@@ -459,6 +505,10 @@ def run_rnx2rtkp(
     path_style: RtklibPathStyle = "auto",
     dry_run: bool = False,
     debug: bool = False,
+    trace_mode: Literal["off", "temporary", "keep"] = "off",
+    trace_level: int | None = None,
+    trace_file: Path | None = None,
+    trace_cleanup: Literal["always", "on-success", "never"] = "always",
 ) -> RtklibCommand:
     """Validate, prepare, and optionally run `rnx2rtkp`.
 
@@ -493,6 +543,33 @@ def run_rnx2rtkp(
         raise FileNotFoundError(f"RTKLIB configuration file does not exist: {rtkconf}")
     if rtkconf is None and not rtk_options:
         raise ValueError("RTKLIB requires either --rtkconf or generated command-line RTK options")
+    effective_trace_level = _effective_trace_level(trace_mode, trace_level)
+    run_cwd: Path | None = None
+    cleanup_trace_dir = False
+    trace_dir: Path | None = None
+    if trace_mode in {"temporary", "keep"}:
+        trace_dir = Path(tempfile.mkdtemp(prefix="um980-rtklib-trace-"))
+        run_cwd = trace_dir
+        cleanup_trace_dir = trace_mode == "temporary" and trace_cleanup == "always"
+        rtk_options = ["-x", str(effective_trace_level), *(rtk_options or [])]
+        rnx2rtkp_path = Path(rnx2rtkp)
+        if rnx2rtkp_path.exists() and not rnx2rtkp_path.is_absolute():
+            rnx2rtkp = str(rnx2rtkp_path.resolve())
+        output_file = output_file.resolve()
+        rover_obs = rover_obs.resolve()
+        base_obs = [path.resolve() for path in base_obs]
+        nav_files = [path.resolve() for path in nav_files]
+        if rtkconf is not None:
+            rtkconf = rtkconf.resolve()
+        if base_obs_arg is not None:
+            base_obs_arg = _resolve_wildcard_parent(base_obs_arg)
+        logging.info(
+            "quality_trace=%s requested_rtklib_trace_level=%s effective_rtklib_trace_level=%s",
+            trace_mode,
+            trace_level if trace_level is not None else "<unset>",
+            effective_trace_level,
+        )
+
     args = build_rnx2rtkp_command(
         rnx2rtkp=rnx2rtkp,
         rtkconf=rtkconf,
@@ -517,7 +594,7 @@ def run_rnx2rtkp(
         logging.info("RTKLIB stderr log: %s", stderr_log)
     if not dry_run:
         logging.debug("executing RTKLIB argv: %r", args)
-        result = subprocess.run(args, check=False, capture_output=True, text=True)
+        result = subprocess.run(args, check=False, capture_output=True, text=True, cwd=run_cwd)
         stdout_log.write_text(result.stdout, encoding="utf-8")
         stderr_log.write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:
@@ -535,4 +612,55 @@ def run_rnx2rtkp(
         _warn_about_rtklib_result(output_file, result.stderr)
         if not output_file.exists():
             _raise_missing_rtklib_output(output_file, stdout_log, stderr_log, wrapper_file, args)
-    return RtklibCommand(args, output_file, stdout_log, stderr_log, wrapper_file)
+    trace_summary: dict[str, object] | None = None
+    selected_trace: Path | None = None
+    trace_retained = False
+    if trace_dir is not None and not dry_run:
+        selected_trace = _find_trace_candidate(trace_dir)
+        if selected_trace is not None:
+            retained_path: Path | None = None
+            if trace_mode == "keep":
+                retained_path = trace_file or output_file.with_suffix(".trace")
+                retained_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(selected_trace), retained_path)
+                selected_trace = retained_path
+                trace_retained = True
+            trace_summary = analyze_rtklib_trace(selected_trace)
+            trace_summary.update(
+                {
+                    "source": trace_mode,
+                    "generated_temporarily": trace_mode == "temporary",
+                    "retained": trace_retained,
+                    "path": str(selected_trace) if trace_retained else None,
+                    "effective_level": effective_trace_level,
+                }
+            )
+            logging.info(
+                "parsed RTKLIB trace diagnostics: mode=%s level=%s retained=%s file=%s",
+                trace_mode,
+                effective_trace_level,
+                trace_retained,
+                selected_trace if trace_retained else "<temporary>",
+            )
+        else:
+            logging.warning("RTKLIB trace mode %s was requested, but no trace file was found in %s", trace_mode, trace_dir)
+        if trace_mode == "temporary" and trace_cleanup == "on-success":
+            cleanup_trace_dir = output_file.exists()
+        if trace_mode == "temporary" and trace_cleanup == "never":
+            cleanup_trace_dir = False
+            logging.info("temporary RTKLIB trace directory retained by policy: %s", trace_dir)
+        if cleanup_trace_dir:
+            shutil.rmtree(trace_dir, ignore_errors=True)
+    return RtklibCommand(
+        args,
+        output_file,
+        stdout_log,
+        stderr_log,
+        wrapper_file,
+        trace_file=selected_trace if trace_retained else None,
+        trace_generated_temporarily=trace_mode == "temporary",
+        trace_retained=trace_retained,
+        trace_effective_level=effective_trace_level,
+        trace_summary=trace_summary,
+        generated_stat_files=[candidate for candidate in (Path(str(output_file) + ".stat"), output_file.with_suffix(".stat")) if candidate.exists()],
+    )
