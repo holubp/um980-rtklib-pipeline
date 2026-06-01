@@ -1,10 +1,9 @@
-import binascii
 import struct
 from pathlib import Path
 
 from um980_rtklib_pipeline.obs_decode import Observation, decode_observations, write_observations_csv
 from um980_rtklib_pipeline.rinex_obs import _format_obs_value, observations_for_rinex, write_rinex_obs
-from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
+from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32, unicore_crc32
 
 
 def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int = 132572000, time_status: int = 0) -> bytes:
@@ -20,7 +19,7 @@ def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int
 
 
 def _ascii_record(body: bytes) -> bytes:
-    crc = binascii.crc32(body) & 0xFFFFFFFF
+    crc = unicore_crc32(body)
     return b"#" + body + f"*{crc:08X}\r\n".encode("ascii")
 
 

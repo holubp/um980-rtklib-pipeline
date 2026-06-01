@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import binascii
 import struct
 from dataclasses import replace
 
@@ -15,7 +14,7 @@ from um980_rtklib_pipeline.bestnav import (
     parse_bestnav_sentences,
 )
 from um980_rtklib_pipeline.nmea import parse_sentence
-from um980_rtklib_pipeline.stream import parse_stream
+from um980_rtklib_pipeline.stream import parse_stream, unicore_crc32
 
 
 BESTNAVA = (
@@ -26,7 +25,7 @@ BESTNAVA = (
 
 
 def _ascii_record(body: str) -> str:
-    crc = binascii.crc32(body.encode("ascii")) & 0xFFFFFFFF
+    crc = unicore_crc32(body.encode("ascii"))
     return f"#{body}*{crc:08X}\n"
 
 

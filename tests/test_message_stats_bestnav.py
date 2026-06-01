@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import binascii
 from argparse import Namespace
 
 import pytest
 
 from um980_rtklib_pipeline import cli
-from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
+from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32, unicore_crc32
 from um980_rtklib_pipeline.timeutil import gps_week_tow_to_utc_datetime
 
 
@@ -20,7 +19,7 @@ def _binary_frame(message_id: int, payload: bytes) -> bytes:
 
 
 def _ascii_record(body: str) -> str:
-    crc = binascii.crc32(body.encode("ascii")) & 0xFFFFFFFF
+    crc = unicore_crc32(body.encode("ascii"))
     return f"#{body}*{crc:08X}\n"
 
 

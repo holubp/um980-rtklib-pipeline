@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import binascii
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline.archive_probe import probe_station_archives
+from um980_rtklib_pipeline.stream import unicore_crc32
 from um980_rtklib_pipeline.stations import StationCatalog, ecef_to_geodetic, parse_ssc, write_station_catalog_cache
 
 
 def _ascii_record(body: str) -> str:
-    crc = binascii.crc32(body.encode("ascii")) & 0xFFFFFFFF
+    crc = unicore_crc32(body.encode("ascii"))
     return f"#{body}*{crc:08X}\n"
 
 

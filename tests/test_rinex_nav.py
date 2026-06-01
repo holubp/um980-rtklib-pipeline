@@ -1,5 +1,4 @@
 import argparse
-import binascii
 import math
 import struct
 from pathlib import Path
@@ -9,11 +8,11 @@ import pytest
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline.files import classify_rinex_file
 from um980_rtklib_pipeline.rinex_nav import extract_rover_nav, rover_nav_files
-from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
+from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32, unicore_crc32
 
 
 def _ascii_record(body: bytes) -> bytes:
-    crc = binascii.crc32(body) & 0xFFFFFFFF
+    crc = unicore_crc32(body)
     return b"#" + body + f"*{crc:08X}\r\n".encode("ascii")
 
 

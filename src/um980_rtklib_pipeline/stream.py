@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import binascii
 import logging
 import re
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Literal
@@ -100,6 +100,7 @@ class StreamDiagnostics:
     invalid_nmea_by_reason: Counter[str] = field(default_factory=Counter)
     invalid_unicore_ascii_records: int = 0
     invalid_unicore_ascii_by_reason: Counter[str] = field(default_factory=Counter)
+    invalid_unicore_ascii_types: Counter[str] = field(default_factory=Counter)
     invalid_unicore_binary_by_reason: Counter[str] = field(default_factory=Counter)
     binary_resynchronisation_events: int = 0
     unknown_binary_message_ids: Counter[int] = field(default_factory=Counter)
@@ -126,6 +127,7 @@ class StreamDiagnostics:
             "unicore_ascii_records": self.unicore_ascii_records,
             "invalid_unicore_ascii_records": self.invalid_unicore_ascii_records,
             "invalid_unicore_ascii_by_reason": dict(self.invalid_unicore_ascii_by_reason),
+            "invalid_unicore_ascii_types": dict(self.invalid_unicore_ascii_types),
             "unicore_binary_records": self.unicore_binary_records,
             "invalid_unicore_binary_records": self.invalid_unicore_binary_records,
             "invalid_unicore_binary_by_reason": dict(self.invalid_unicore_binary_by_reason),
@@ -137,7 +139,7 @@ class StreamDiagnostics:
             "rejection_examples": self.rejection_examples,
         }
 
-    def note_rejection(self, family: str, reason: str, offset: int, sample: bytes) -> None:
+    def note_rejection(self, family: str, reason: str, offset: int, sample: bytes, msg_type: str | None = None) -> None:
         """Record a parser rejection without changing stream semantics."""
 
         if family == "nmea":
@@ -146,6 +148,8 @@ class StreamDiagnostics:
         elif family == "unicore_ascii":
             self.invalid_unicore_ascii_records += 1
             self.invalid_unicore_ascii_by_reason[reason] += 1
+            if msg_type:
+                self.invalid_unicore_ascii_types[msg_type] += 1
         elif family == "unicore_binary":
             self.invalid_unicore_binary_records += 1
             self.invalid_unicore_binary_by_reason[reason] += 1
@@ -235,7 +239,17 @@ def unicore_ascii_checksum_ok(line: bytes) -> bool | None:
         expected = int(checksum.decode("ascii"), 16)
     except ValueError:
         return False
-    return binascii.crc32(body) & 0xFFFFFFFF == expected
+    return unicore_crc32(body) == expected
+
+
+def unicore_crc32(body: bytes) -> int:
+    """Return the CRC32 used by Unicore/NovAtel-style ASCII records.
+
+    The checksum is computed over the bytes after the leading ``#`` and before
+    the ``*`` marker, with an all-ones initial value and final XOR.
+    """
+
+    return (zlib.crc32(body, 0xFFFFFFFF) ^ 0xFFFFFFFF) & 0xFFFFFFFF
 
 
 def is_plausible_unicore_ascii_line(line: bytes) -> bool:
@@ -319,6 +333,20 @@ def _binary_frame_length(data: bytes, pos: int) -> int | None:
     return total
 
 
+def _line_end(data: bytes, pos: int) -> int | None:
+    """Return the inclusive end offset for a CR, LF, or CRLF text line."""
+
+    cr = data.find(b"\r", pos)
+    lf = data.find(b"\n", pos)
+    candidates = [index for index in (cr, lf) if index != -1]
+    if not candidates:
+        return None
+    end = min(candidates)
+    if data[end : end + 2] == b"\r\n":
+        return end + 1
+    return end
+
+
 def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRecord], StreamDiagnostics]:
     """Parse a mixed UM980 serial stream into record objects.
 
@@ -351,8 +379,8 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
             next_progress += progress_step
         byte = data[pos : pos + 1]
         if byte == b"$":
-            end = data.find(b"\n", pos)
-            if end == -1:
+            end = _line_end(data, pos)
+            if end is None:
                 diagnostics.note_rejection("nmea", "truncated_line", pos, data[pos : pos + 80])
                 if noise_start is None:
                     noise_start = pos
@@ -379,8 +407,8 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
             continue
 
         if byte == b"#":
-            end = data.find(b"\n", pos)
-            if end == -1:
+            end = _line_end(data, pos)
+            if end is None:
                 diagnostics.note_rejection("unicore_ascii", "truncated_line", pos, data[pos : pos + 80])
                 if noise_start is None:
                     noise_start = pos
@@ -393,16 +421,16 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
                 pos += 1
                 continue
             ok = unicore_ascii_checksum_ok(raw)
+            text = raw.decode("ascii", errors="replace").strip()
+            msg_type = record_message_type(text, "#")
             if ok is not True:
                 reason = "missing_checksum" if ok is None else "checksum_failure"
-                diagnostics.note_rejection("unicore_ascii", reason, pos, raw)
+                diagnostics.note_rejection("unicore_ascii", reason, pos, raw, msg_type)
                 if noise_start is None:
                     noise_start = pos
                 pos = end + 1
                 continue
             flush_noise(pos)
-            text = raw.decode("ascii", errors="replace").strip()
-            msg_type = record_message_type(text, "#")
             diagnostics.unicore_ascii_records += 1
             if msg_type:
                 diagnostics.unicore_types[msg_type] += 1
@@ -439,4 +467,19 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
         pos += 1
 
     flush_noise(len(data))
+    _warn_if_all_epha_ascii_failed(diagnostics)
     return records, diagnostics
+
+
+def _warn_if_all_epha_ascii_failed(diagnostics: StreamDiagnostics) -> None:
+    """Warn when EPHA-looking ASCII candidates were found but none survived."""
+
+    epha_types = {"GPSEPHA", "GLOEPHA", "GALEPHA", "BDSEPHA", "BD3EPHA"}
+    invalid = sum(diagnostics.invalid_unicore_ascii_types.get(msg_type, 0) for msg_type in epha_types)
+    valid = sum(diagnostics.unicore_types.get(msg_type, 0) for msg_type in epha_types)
+    if invalid and not valid:
+        logging.warning(
+            "All Unicore ASCII candidates failed checksum; check CRC implementation or stream corruption. "
+            "invalid_epha_candidates=%d",
+            invalid,
+        )

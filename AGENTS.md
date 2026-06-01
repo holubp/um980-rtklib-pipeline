@@ -22,6 +22,9 @@
 - Mixed binary logs can also contain arbitrary Unicore-looking sync or `#`
   bytes. Binary frames must pass Unicore CRC before decoding, and ASCII records
   must pass printable record-shape checks before downstream parsers see them.
+- Unicore ASCII record checksums use the receiver/NovAtel-style CRC32:
+  `zlib.crc32(body, 0xFFFFFFFF) ^ 0xFFFFFFFF` over bytes after `#` and before
+  `*`. Do not replace it with Python's default `binascii.crc32(body)`.
 - ION/UTC/TROPINFO records must be counted and preserved in analysis output.
   Do not write them into RINEX NAV headers until the exact family mapping is
   verified against RINEX syntax and RTKLIB parser behavior.
