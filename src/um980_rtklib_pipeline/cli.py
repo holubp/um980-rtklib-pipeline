@@ -72,7 +72,15 @@ from .optimizer import (
     load_base_list,
     parse_duration_seconds,
 )
-from .quality import build_analysis, write_analysis_json
+from .quality import (
+    QualityThresholds,
+    analyze_rtk_quality,
+    build_analysis,
+    format_quality_markdown,
+    format_quality_text,
+    write_analysis_json,
+    write_quality_json,
+)
 from .rinex_nav import extract_rover_nav, rover_nav_files
 from .rinex_obs import observations_for_rinex, write_rinex_obs
 from .rtklib import (
@@ -308,6 +316,35 @@ def _add_time_window_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_quality_analyze_args(parser: argparse.ArgumentParser) -> None:
+    """Add RTK quality-analysis threshold options."""
+
+    parser.add_argument("--trusted-fixed-min-duration-s", type=float, default=10.0)
+    parser.add_argument("--trusted-fixed-min-distance-m", type=float, default=20.0)
+    parser.add_argument("--provisional-fixed-min-duration-s", type=float, default=3.0)
+    parser.add_argument("--recent-slip-window-s", type=float, default=10.0)
+    parser.add_argument("--transition-jump-warning-m", type=float, default=1.0)
+    parser.add_argument("--transition-jump-severe-m", type=float, default=3.0)
+    parser.add_argument("--vertical-jump-warning-m", type=float, default=1.5)
+    parser.add_argument("--carrier-residual-warning-m", type=float, default=0.20)
+    parser.add_argument("--carrier-residual-severe-m", type=float, default=0.50)
+    parser.add_argument("--code-residual-warning-m", type=float, default=5.0)
+    parser.add_argument("--code-residual-severe-m", type=float, default=10.0)
+    parser.add_argument("--low-used-signals-warning", type=int, default=12)
+    parser.add_argument("--low-snr-warning-dbHz", dest="low_snr_warning_dbhz", type=float, default=35.0)
+    parser.add_argument("--gap-split-s", type=float, default=2.0)
+    parser.add_argument("--stationary-speed-threshold-mps", type=float, default=0.3)
+
+
+def _add_quality_pipeline_args(parser: argparse.ArgumentParser) -> None:
+    """Add optional pipeline RTK quality-analysis outputs."""
+
+    parser.add_argument("--quality-analyze", action="store_true", help="Analyse generated RTKLIB solution quality after post-processing.")
+    parser.add_argument("--quality-out-md", help="Markdown RTK quality report path.")
+    parser.add_argument("--quality-out-json", help="JSON RTK quality report path.")
+    _add_quality_analyze_args(parser)
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -328,6 +365,28 @@ def _debug_enabled(args: argparse.Namespace) -> bool:
     """Return true when debug diagnostics were requested."""
 
     return bool(getattr(args, "debug", False))
+
+
+def _quality_thresholds_from_args(args: argparse.Namespace) -> QualityThresholds:
+    """Build RTK quality-analysis thresholds from CLI arguments."""
+
+    return QualityThresholds(
+        trusted_fixed_min_duration_s=args.trusted_fixed_min_duration_s,
+        trusted_fixed_min_distance_m=args.trusted_fixed_min_distance_m,
+        provisional_fixed_min_duration_s=args.provisional_fixed_min_duration_s,
+        recent_slip_window_s=args.recent_slip_window_s,
+        transition_jump_warning_m=args.transition_jump_warning_m,
+        transition_jump_severe_m=args.transition_jump_severe_m,
+        vertical_jump_warning_m=args.vertical_jump_warning_m,
+        carrier_residual_warning_m=args.carrier_residual_warning_m,
+        carrier_residual_severe_m=args.carrier_residual_severe_m,
+        code_residual_warning_m=args.code_residual_warning_m,
+        code_residual_severe_m=args.code_residual_severe_m,
+        low_used_signals_warning=args.low_used_signals_warning,
+        low_snr_warning_dbhz=args.low_snr_warning_dbhz,
+        gap_split_s=args.gap_split_s,
+        stationary_speed_threshold_mps=args.stationary_speed_threshold_mps,
+    )
 
 
 def _verbose_enabled(args: argparse.Namespace) -> bool:
@@ -1603,6 +1662,52 @@ def _run_rtklib_output_formats(
     return commands
 
 
+def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, basename: str) -> None:
+    """Run optional quality analysis for the first generated RTKLIB output."""
+
+    if not getattr(args, "quality_analyze", False):
+        return
+    solution = _select_quality_solution_file(out_dir, basename, _rtklib_output_formats(args))
+    if solution is None:
+        logging.warning("quality analysis requested, but no RTKLIB solution output was found")
+        return
+    stat = _stat_file_for_solution(solution)
+    if stat is None:
+        logging.warning("quality analysis running without .stat evidence: %s", solution)
+    md_path = Path(args.quality_out_md) if getattr(args, "quality_out_md", None) else out_dir / f"{basename}-rtk.quality.md"
+    json_path = Path(args.quality_out_json) if getattr(args, "quality_out_json", None) else out_dir / f"{basename}-rtk.quality.json"
+    analysis = analyze_rtk_quality(
+        solution_path=solution,
+        stat_path=stat,
+        thresholds=_quality_thresholds_from_args(args),
+    )
+    md_path.write_text(format_quality_markdown(analysis), encoding="utf-8")
+    write_quality_json(json_path, analysis)
+    logging.info("wrote RTK quality analysis: markdown=%s json=%s", md_path, json_path)
+
+
+def _select_quality_solution_file(out_dir: Path, basename: str, formats: list[str]) -> Path | None:
+    for output_format in ("nmea", "pos", "llh"):
+        if output_format not in formats:
+            continue
+        candidate = _rtklib_output_file(out_dir, basename, output_format)
+        if candidate.exists():
+            return candidate
+    for output_format in formats:
+        candidate = _rtklib_output_file(out_dir, basename, output_format)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _stat_file_for_solution(solution: Path) -> Path | None:
+    candidates = [Path(str(solution) + ".stat"), solution.with_suffix(".stat")]
+    for candidate in candidates:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
 def _log_auto_qc_decision(decision) -> None:
     if decision.exclude_sats or decision.recommended_elmask is not None:
         elmask = (
@@ -2265,6 +2370,33 @@ def cmd_optimize_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quality_analyze(args: argparse.Namespace) -> int:
+    """Handle standalone RTK solution quality analysis."""
+
+    _configure_cli_logging(args)
+    analysis = analyze_rtk_quality(
+        solution_path=Path(args.solution),
+        stat_path=Path(args.stat) if args.stat else None,
+        thresholds=_quality_thresholds_from_args(args),
+    )
+    if args.out_json:
+        write_quality_json(Path(args.out_json), analysis)
+        logging.info("wrote quality JSON: %s", args.out_json)
+    if args.out_md:
+        Path(args.out_md).write_text(format_quality_markdown(analysis), encoding="utf-8")
+        logging.info("wrote quality Markdown: %s", args.out_md)
+    rendered = (
+        json.dumps(analysis.as_dict(), indent=2, sort_keys=True, default=str)
+        if args.format == "json"
+        else format_quality_markdown(analysis)
+        if args.format == "markdown"
+        else format_quality_text(analysis)
+    )
+    if not args.out_json or not args.out_md or args.format != "text":
+        print(rendered)
+    return 0
+
+
 def _time_window_from_solutions(args: argparse.Namespace, margin_s: int):
     rover, _, _, solutions, _, _, _, _, _ = _extract_bundle(args)
     if not solutions.solution_points:
@@ -2585,6 +2717,7 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
+    _run_quality_analysis_if_requested(args, out_dir, base)
     for command in commands:
         print(format_command(command.args))
     return 0
@@ -2706,6 +2839,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         base_ecef=base_ecef,
         base_llh=base_llh,
     )
+    _run_quality_analysis_if_requested(args, out_dir, base)
     for command in commands:
         print(format_command(command.args))
     return 0
@@ -2927,6 +3061,16 @@ def build_parser() -> argparse.ArgumentParser:
         rinex_compat="native",
     )
 
+    quality = sub.add_parser("quality-analyze")
+    quality.add_argument("--solution", required=True, help="RTKLIB NMEA/POS/LLH solution output.")
+    quality.add_argument("--stat", help="Optional RTKLIB .stat file.")
+    quality.add_argument("--out-md", help="Markdown report output path.")
+    quality.add_argument("--out-json", help="JSON report output path.")
+    quality.add_argument("--format", choices=["text", "markdown", "json"], default="text")
+    _add_quality_analyze_args(quality)
+    _add_common(quality)
+    quality.set_defaults(func=cmd_quality_analyze)
+
     opt = sub.add_parser("optimize-settings")
     opt.add_argument("rover_log", nargs="+")
     opt.add_argument("--base", help="Primary base station or base file for the baseline variant.")
@@ -3007,6 +3151,7 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--no-use-rover-nav", action="store_true")
     post.add_argument("--nav-merge", choices=["off", "best-per-system", "all"], default="best-per-system")
     _add_rtklib_processing_args(post, require_base_obs=False)
+    _add_quality_pipeline_args(post)
     _add_base_position_args(post)
     _add_common(post)
     post.set_defaults(func=cmd_postprocess)
@@ -3093,6 +3238,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_sbas_source_args(pipe)
     _add_bestnav_nmea_args(pipe)
     _add_base_download_args(pipe, require_station=False, include_rtklib_dir=False)
+    _add_quality_pipeline_args(pipe)
     _add_base_position_args(pipe)
     _add_common(pipe)
     pipe.set_defaults(func=cmd_pipeline)

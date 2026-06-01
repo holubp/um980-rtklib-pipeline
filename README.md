@@ -570,6 +570,51 @@ continues recording failed variants instead of claiming success. It does not
 mutate arbitrary RTKLIB options or run high RTKLIB trace unless the underlying
 pipeline command is extended to do so.
 
+## RTK Quality Analysis
+
+Use `quality-analyze` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
+solution together with an optional `.stat` file. The analyser reports raw
+fixed/float/DGPS/single percentages, but also segment duration, segment
+distance, missing/no-output time, fixed-entry jumps, and a heuristic
+trusted/provisional/suspect fixed split. Suspect fixed is not proof of a false
+fix; it highlights fixed islands that deserve inspection because they are very
+short, near a transition jump, close to a slip, or have high residuals when
+`.stat` evidence is available.
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \
+  --solution rover_20260531095025-base-rtk.nmea \
+  --stat rover_20260531095025-base-rtk.nmea.stat \
+  --out-md rover_20260531095025-quality.md \
+  --out-json rover_20260531095025-quality.json
+```
+
+Distance and time are both reported because they answer different questions.
+Time-based segment length is always relevant. Distance-based segment length is
+mainly useful while moving; a long stationary fixed segment can have near-zero
+distance and still be valid, so the analyser does not mark low-distance fixed
+segments suspect unless median speed exceeds the stationary threshold.
+
+Optimise processing on trusted fixed time/distance and missing/no-output time,
+not raw fixed percentage alone. Some RTKLIB settings can look better by simply
+suppressing bad epochs; the report therefore estimates expected epoch interval,
+missing epochs, missing time, longest output gap, and quality percentages both
+over elapsed time and emitted time.
+
+The integrated pipeline can run the same analysis after RTKLIB finishes:
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli pipeline rover.ubx \
+  --download-base \
+  --station CPAR \
+  --rtkconf um980-onepass-gps-gal-bds-el28.conf \
+  --run-rtklib \
+  --quality-analyze
+```
+
+If the `.stat` file is missing, the analyser still writes solution and segment
+metrics and warns that residual, slip, and rejection evidence is unavailable.
+
 `postprocess` passes a base reference position to RTKLIB when one is available.
 Use `--base-ecef X Y Z` or `--base-llh LAT LON HEIGHT` for an explicit
 position. Otherwise `--base-station CPAR` resolves current EPN/EUREF ETRF2000
