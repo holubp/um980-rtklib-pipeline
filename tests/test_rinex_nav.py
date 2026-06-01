@@ -1,4 +1,5 @@
 import argparse
+import binascii
 import math
 import struct
 from pathlib import Path
@@ -11,25 +12,40 @@ from um980_rtklib_pipeline.rinex_nav import extract_rover_nav, rover_nav_files
 from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
 
 
-GPS_LINE = (
-    b"#GPSEPHA,40,GPS,UNKNOWN,1,1000,0,0,18,8;"
+def _ascii_record(body: bytes) -> bytes:
+    crc = binascii.crc32(body) & 0xFFFFFFFF
+    return b"#" + body + f"*{crc:08X}\r\n".encode("ascii")
+
+
+GPS_LINE = _ascii_record(
+    b"GPSEPHA,40,GPS,UNKNOWN,1,1000,0,0,18,8;"
     b"9,57600.0,0,102,102,2419,2419,64800.0,2.656100068e+07,4.199103481e-09,"
     b"-6.360265004e-01,3.4293958452e-03,2.0365883709e+00,-1.421198249e-06,"
     b"1.144409180e-05,1.60781250e+02,-2.62812500e+01,-1.341104507e-07,"
     b"2.793967724e-08,9.6581392822e-01,6.178828802e-10,-2.530286309e+00,"
     b"-7.69210612e-09,102,64800.0,4.656612873e-10,7.4896030e-04,"
     b"-4.4337867e-12,0.0000000e+00,TRUE,1.458528010e-04,4.00000000e+00"
-    b"*8b4da1f0\r\n"
 )
 
-GLO_LINE = (
-    b"#GLOEPHA,85,GPS,FINE,2419,113218100,0,0,18,9;"
+GLO_LINE = _ascii_record(
+    b"GLOEPHA,85,GPS,FINE,2419,113218100,0,0,18,9;"
     b"51,0,1,0,2419,112518000,10782,869,0,0,41,0,2.301446044921875e+07,"
     b"8.457608886718750e+06,7.004804199218750e+06,9.020080566406250e+02,"
     b"3.420991897583008e+02,-3.387286186218262e+03,-0.000002793967724,"
     b"2.793967723846436e-06,9.313225746154785e-07,-3.252550959587097e-05,"
     b"5.587935448e-09,0.000000000000000e+00,37590,2,2,0,12"
-    b"*8a329a80\r\n"
+)
+
+BD3_LINE = _ascii_record(
+    b"BD3EPHA,77,GPS,FINE,2211,180091000,0,0,18,4;"
+    b"44,0,3,15,21,21,2211,2211,176400.0,176400.0,-1.423828125e+01,"
+    b"1.108884811e-02,3.726583799e-09,-1.069685670e-13,1.309681137e+00,"
+    b"8.019023808e-04,6.109550176e-01,2.244487405e-07,8.259899914e-06,"
+    b"1.940156250e+02,6.187500000e+00,1.210719347e-08,7.450580597e-09,"
+    b"9.593903595e-01,-4.500187451e-11,1.952617584e+00,6.803497679e-09,"
+    b"176400.0,-2.153683454e-09,-1.199077815e-08,0.000000000e+00,"
+    b"0.000000000e+00,0.000000000e+00,-2.910383046e-10,6.693656906e-04,"
+    b"1.219113699e-11,0.000000000e+00,588,0,27,0,7,0,0,1"
 )
 
 
@@ -257,9 +273,22 @@ def test_ascii_ephemeris_reports_convertible_records_without_writing():
     assert not any("no valid GPS RINEX NAV records" in warning for warning in report.warnings)
 
 
+def test_ascii_bd3ephemeris_writes_cnav_sidecar(tmp_path: Path):
+    output = tmp_path / "rover.rover-gps.nav"
+    records, _ = parse_stream(BD3_LINE)
+    report = extract_rover_nav(records, output)
+    cnav = tmp_path / "rover.rover-bds.cnav"
+
+    assert report.found["BD3EPHA"] == 1
+    assert report.converted["BD3EPHA"] == 1
+    assert cnav.exists()
+    assert "C44 2022 05 24 01 00 00" in cnav.read_text(encoding="ascii")
+    assert not any("BD3EPHA records found; conversion not yet implemented" in warning for warning in report.warnings)
+
+
 def test_malformed_gpsepha_does_not_write_empty_nav_file(tmp_path: Path):
     nav_path = tmp_path / "rover.rover-gps.nav"
-    records, _ = parse_stream(b"#GPSEPHA,COM1,0,0;dummy*00000000\r\n")
+    records, _ = parse_stream(_ascii_record(b"GPSEPHA,COM1,0,0;dummy"))
     report = extract_rover_nav(records, nav_path)
     assert report.found["GPSEPHA"] == 1
     assert report.converted["GPSEPHA"] == 0
@@ -269,7 +298,9 @@ def test_malformed_gpsepha_does_not_write_empty_nav_file(tmp_path: Path):
 
 def test_rtklib_sbs_message_shape_writes_sbs_file(tmp_path: Path):
     nav_path = tmp_path / "rover.rover-gps.nav"
-    raw = b"#SBSMSGA,GPS,FINE,2419,0;2419,64800,123,0000000000000000000000000000000000000000000000000000000000*00000000\r\n"
+    raw = _ascii_record(
+        b"SBSMSGA,GPS,FINE,2419,0;2419,64800,123,0000000000000000000000000000000000000000000000000000000000"
+    )
     records, _ = parse_stream(raw)
     report = extract_rover_nav(records, nav_path)
     sbs = tmp_path / "rover.rover-sbas.sbs"
@@ -277,6 +308,29 @@ def test_rtklib_sbs_message_shape_writes_sbs_file(tmp_path: Path):
     assert report.converted["SBSMSG"] == 1
     assert sbs.exists()
     assert classify_rinex_file(sbs) == "sbs"
+
+
+def test_sbas_source_off_filters_sbs_sidecars(tmp_path: Path):
+    nav = tmp_path / "rover.nav"
+    sbs = tmp_path / "rover.sbs"
+    nav.write_text("     3.04           NAVIGATION DATA     G                   RINEX VERSION / TYPE\n", encoding="ascii")
+    sbs.write_text("2419  64800 123  0 : 0000000000000000000000000000000000000000000000000000000000\n", encoding="ascii")
+
+    filtered = cli._apply_sbas_source_policy(argparse.Namespace(sbas_source="off", sbas_file=None), [nav, sbs])
+    assert filtered == [nav]
+
+
+def test_sbas_source_external_adds_explicit_sbs_file(tmp_path: Path):
+    nav = tmp_path / "rover.nav"
+    sbs = tmp_path / "external.sbs"
+    nav.write_text("     3.04           NAVIGATION DATA     G                   RINEX VERSION / TYPE\n", encoding="ascii")
+    sbs.write_text("2419  64800 123  0 : 0000000000000000000000000000000000000000000000000000000000\n", encoding="ascii")
+
+    selected = cli._apply_sbas_source_policy(
+        argparse.Namespace(sbas_source="external", sbas_file=[str(sbs)]),
+        [nav],
+    )
+    assert selected == [nav, sbs]
 
 
 def test_binary_gpsephb_writes_nav_file(tmp_path: Path):

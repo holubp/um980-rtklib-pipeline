@@ -6,7 +6,7 @@ import binascii
 import logging
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -97,8 +97,15 @@ class StreamDiagnostics:
     unicore_binary_records: int = 0
     invalid_unicore_binary_records: int = 0
     noise_bytes: int = 0
-    nmea_types: Counter[str] = None  # type: ignore[assignment]
-    unicore_types: Counter[str] = None  # type: ignore[assignment]
+    invalid_nmea_by_reason: Counter[str] = field(default_factory=Counter)
+    invalid_unicore_ascii_records: int = 0
+    invalid_unicore_ascii_by_reason: Counter[str] = field(default_factory=Counter)
+    invalid_unicore_binary_by_reason: Counter[str] = field(default_factory=Counter)
+    binary_resynchronisation_events: int = 0
+    unknown_binary_message_ids: Counter[int] = field(default_factory=Counter)
+    rejection_examples: list[dict[str, object]] = field(default_factory=list)
+    nmea_types: Counter[str] = field(default_factory=Counter)
+    unicore_types: Counter[str] = field(default_factory=Counter)
 
     def __post_init__(self) -> None:
         """Initialise mutable counters omitted by the caller."""
@@ -115,13 +122,43 @@ class StreamDiagnostics:
             "input_bytes": self.input_bytes,
             "valid_nmea_records": self.valid_nmea_records,
             "invalid_nmea_records": self.invalid_nmea_records,
+            "invalid_nmea_by_reason": dict(self.invalid_nmea_by_reason),
             "unicore_ascii_records": self.unicore_ascii_records,
+            "invalid_unicore_ascii_records": self.invalid_unicore_ascii_records,
+            "invalid_unicore_ascii_by_reason": dict(self.invalid_unicore_ascii_by_reason),
             "unicore_binary_records": self.unicore_binary_records,
             "invalid_unicore_binary_records": self.invalid_unicore_binary_records,
+            "invalid_unicore_binary_by_reason": dict(self.invalid_unicore_binary_by_reason),
+            "binary_resynchronisation_events": self.binary_resynchronisation_events,
+            "unknown_binary_message_ids": {str(key): value for key, value in self.unknown_binary_message_ids.items()},
             "noise_bytes": self.noise_bytes,
             "nmea_types": dict(self.nmea_types),
             "unicore_types": dict(self.unicore_types),
+            "rejection_examples": self.rejection_examples,
         }
+
+    def note_rejection(self, family: str, reason: str, offset: int, sample: bytes) -> None:
+        """Record a parser rejection without changing stream semantics."""
+
+        if family == "nmea":
+            self.invalid_nmea_records += 1
+            self.invalid_nmea_by_reason[reason] += 1
+        elif family == "unicore_ascii":
+            self.invalid_unicore_ascii_records += 1
+            self.invalid_unicore_ascii_by_reason[reason] += 1
+        elif family == "unicore_binary":
+            self.invalid_unicore_binary_records += 1
+            self.invalid_unicore_binary_by_reason[reason] += 1
+        if len(self.rejection_examples) < 20:
+            self.rejection_examples.append(
+                {
+                    "family": family,
+                    "reason": reason,
+                    "offset": offset,
+                    "sample_hex": sample[:32].hex(),
+                    "sample_text": sample[:80].decode("ascii", errors="replace"),
+                }
+            )
 
 
 def nmea_checksum_ok(line: bytes) -> bool | None:
@@ -207,8 +244,8 @@ def is_plausible_unicore_ascii_line(line: bytes) -> bool:
     Mixed logs contain arbitrary ``#`` bytes inside binary payloads. A real
     Unicore ASCII record is printable ASCII, starts with an uppercase message
     name, has a header/payload ``;`` separator, and may end with an eight-digit
-    CRC. Checksum failures are left to downstream diagnostics because captures
-    and tests may intentionally contain placeholder CRC values.
+    CRC. The caller validates the CRC before exposing the record to semantic
+    decoders.
     """
 
     if not line.startswith(b"#") or len(line) > 65536 or not UNICORE_ASCII_LINE_RE.match(line):
@@ -316,11 +353,13 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
         if byte == b"$":
             end = data.find(b"\n", pos)
             if end == -1:
+                diagnostics.note_rejection("nmea", "truncated_line", pos, data[pos : pos + 80])
                 if noise_start is None:
                     noise_start = pos
                 break
             raw = data[pos : end + 1]
             if not is_plausible_nmea_line(raw):
+                diagnostics.note_rejection("nmea", "invalid_structure_or_checksum", pos, raw)
                 if noise_start is None:
                     noise_start = pos
                 pos += 1
@@ -330,7 +369,7 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
             ok = nmea_checksum_ok(raw)
             msg_type = record_message_type(text, "$")
             if ok is False:
-                diagnostics.invalid_nmea_records += 1
+                diagnostics.note_rejection("nmea", "checksum_failure", pos, raw)
             else:
                 diagnostics.valid_nmea_records += 1
                 if msg_type:
@@ -342,19 +381,28 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
         if byte == b"#":
             end = data.find(b"\n", pos)
             if end == -1:
+                diagnostics.note_rejection("unicore_ascii", "truncated_line", pos, data[pos : pos + 80])
                 if noise_start is None:
                     noise_start = pos
                 break
             raw = data[pos : end + 1]
             if not is_plausible_unicore_ascii_line(raw):
+                diagnostics.note_rejection("unicore_ascii", "invalid_structure", pos, raw)
                 if noise_start is None:
                     noise_start = pos
                 pos += 1
                 continue
+            ok = unicore_ascii_checksum_ok(raw)
+            if ok is not True:
+                reason = "missing_checksum" if ok is None else "checksum_failure"
+                diagnostics.note_rejection("unicore_ascii", reason, pos, raw)
+                if noise_start is None:
+                    noise_start = pos
+                pos = end + 1
+                continue
             flush_noise(pos)
             text = raw.decode("ascii", errors="replace").strip()
             msg_type = record_message_type(text, "#")
-            ok = unicore_ascii_checksum_ok(raw)
             diagnostics.unicore_ascii_records += 1
             if msg_type:
                 diagnostics.unicore_types[msg_type] += 1
@@ -367,7 +415,8 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
             if frame_len is not None:
                 raw = data[pos : pos + frame_len]
                 if not unicore_binary_checksum_ok(raw):
-                    diagnostics.invalid_unicore_binary_records += 1
+                    diagnostics.note_rejection("unicore_binary", "crc_failure", pos, raw)
+                    diagnostics.binary_resynchronisation_events += 1
                     if noise_start is None:
                         noise_start = pos
                     pos += 1
@@ -375,12 +424,15 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
                 flush_noise(pos)
                 msg_id = int.from_bytes(raw[4:6], "little", signed=False) if len(raw) >= 6 else 0
                 msg_type = BINARY_MESSAGE_TYPES.get(msg_id, f"binary:{msg_id}")
+                if msg_type.startswith("binary:"):
+                    diagnostics.unknown_binary_message_ids[msg_id] += 1
                 diagnostics.unicore_binary_records += 1
                 diagnostics.unicore_types[msg_type] += 1
                 records.append(StreamRecord("unicore_binary", pos, raw, None, msg_type, None))
                 pos += frame_len
                 continue
-            diagnostics.invalid_unicore_binary_records += 1
+            diagnostics.note_rejection("unicore_binary", "invalid_length_or_truncated", pos, data[pos : pos + 32])
+            diagnostics.binary_resynchronisation_events += 1
 
         if noise_start is None:
             noise_start = pos

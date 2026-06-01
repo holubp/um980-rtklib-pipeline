@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import binascii
 import struct
 from dataclasses import replace
 
@@ -22,6 +23,11 @@ BESTNAVA = (
     "SOL_COMPUTED,NARROW_INT,50.0,14.0,250.5,45.1,WGS84,0.1,0.1,0.2,"
     "0001,1.5,0.0,30,20,0,0,0,SOL_COMPUTED,NARROW_INT,5.144444,90.0,0.0,0.1,0.1,0.2\n"
 )
+
+
+def _ascii_record(body: str) -> str:
+    crc = binascii.crc32(body.encode("ascii")) & 0xFFFFFFFF
+    return f"#{body}*{crc:08X}\n"
 
 
 def test_parse_bestnava_and_generate_checksummed_nmea() -> None:
@@ -75,13 +81,30 @@ def test_bestnav_rate_decimation_uses_timestamps() -> None:
 
 
 def test_extract_bestnav_counts_malformed_without_crashing() -> None:
-    records, _ = parse_stream((BESTNAVA + "#BESTNAVA,COM1;BROKEN\n").encode("ascii"))
+    bestnav_body = BESTNAVA.strip()[1:]
+    records, _ = parse_stream((_ascii_record(bestnav_body) + _ascii_record("BESTNAVA,COM1;BROKEN")).encode("ascii"))
 
     extracted = extract_bestnav_records(records)
 
     assert len(extracted.records) == 1
     assert extracted.present["BESTNAVA"] == 2
     assert extracted.malformed["BESTNAVA"] == 1
+
+
+def test_bestnav_analysis_accounts_native_emission_and_drops() -> None:
+    base = parse_bestnava(BESTNAVA.strip())
+    invalid = replace(base, tow_s=base.tow_s + 0.05, pos_sol_status="INSUFFICIENT_OBS", pos_type="NONE")
+    duplicate = replace(base, tow_s=base.tow_s)
+    extracted = extract_bestnav_records([])
+    extracted.records.extend([base, invalid, duplicate])
+
+    summary = extracted.as_dict()
+
+    assert summary["decoded"] == 3
+    assert summary["valid_position"] == 2
+    assert summary["emitted_solution_points_native"] == 1
+    assert summary["dropped_by_reason"]["dropped_bad_status"] == 1
+    assert summary["dropped_by_reason"]["dropped_duplicate_time"] == 1
 
 
 def test_parse_bestnavb_payload_and_generate_nmea() -> None:

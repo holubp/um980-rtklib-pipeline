@@ -125,3 +125,19 @@ must validate selected filenames before RTKLIB runs. Low-rate cached
 valid after the high-rate group fails and fallback is enabled. Recorded
 real-time base RTCM is a separate source: convert it with `convbin -r rtcm3`
 and reject ambiguous `--base-rtcm` plus `--download-base` combinations.
+
+## Advisory And Optimizer Modes
+
+`base-candidates` is advisory-only. It can use BESTNAV/live NMEA solution
+points, cached or refreshed EPN SSC station catalogues, and lightweight archive
+probes to rank stations, but it must not mutate normal pipeline defaults or
+auto-select a base. Keep catalogue and archive probe caches explicit in JSON so
+recommendations are reproducible. Header/probe logic should use small metadata
+requests such as HTTP `HEAD`; do not fetch full observation bodies for an
+advisory run.
+
+`optimize-settings` must stay resource-bounded. The default path is dry-run
+planning; execution requires `--execute`, caps variants/runs, stores per-run
+commands/logs, and parses compact metrics from RTKLIB outputs. Do not introduce
+unbounded RTKLIB setting mutation or high trace output as a default optimiser
+behavior.

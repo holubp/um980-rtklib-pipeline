@@ -138,6 +138,81 @@ def classify_rinex_file(path: str | Path) -> str:
     return "unknown"
 
 
+RINEX_SYSTEM_CODES = {"G", "R", "E", "C", "J", "I", "S"}
+
+
+def detect_rinex_nav_systems(path: str | Path) -> set[str]:
+    """Return RINEX system codes present in a navigation-like file.
+
+    The helper is intentionally lightweight: it recognises common RINEX 3 mixed
+    NAV records by the first body-line character and falls back to extension and
+    broadcast-product filename hints for older or sidecar files.
+
+    Args:
+        path: Candidate RINEX NAV, SBAS, or constellation-specific sidecar.
+
+    Returns:
+        RINEX constellation codes such as ``{"G", "E", "C"}``.
+    """
+
+    p = Path(path)
+    name = p.name.upper()
+    suffix = p.suffix.lower()
+    if suffix == ".gnav":
+        return {"R"}
+    if suffix == ".lnav":
+        return {"E"}
+    if suffix == ".cnav":
+        return {"C"}
+    if suffix == ".qnav":
+        return {"J"}
+    if suffix == ".inav":
+        return {"I"}
+    if suffix == ".sbs":
+        return {"S"}
+    if any(token in name for token in ("BRDC", "BRDM", "BRD4")) or "_MN" in name:
+        return {"G", "R", "E", "C", "J"}
+
+    systems: set[str] = set()
+    in_body = False
+    try:
+        with p.open("r", encoding="ascii", errors="ignore") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not in_body:
+                    if "RINEX VERSION / TYPE" in line:
+                        header_system = line[40:41].strip()
+                        if header_system in RINEX_SYSTEM_CODES:
+                            systems.add(header_system)
+                    if "END OF HEADER" in line:
+                        in_body = True
+                    continue
+                if line and line[0] in RINEX_SYSTEM_CODES:
+                    systems.add(line[0])
+    except OSError:
+        return set()
+    if systems:
+        return systems
+    if suffix in {".nav", ".rnx"}:
+        return {"G"}
+    return set()
+
+
+def detect_rinex_obs_systems(path: str | Path) -> set[str]:
+    """Return RINEX system codes advertised by an observation file.
+
+    Args:
+        path: RINEX OBS file.
+
+    Returns:
+        RINEX constellation codes. Ambiguous RINEX 2 mixed ``M`` headers are not
+        expanded because the exact per-system coverage is not known.
+    """
+
+    systems = read_rinex_obs_capabilities(path).systems
+    return {system for system in systems if system in RINEX_SYSTEM_CODES}
+
+
 def _parse_rinex_datetime(parts: list[str]) -> datetime | None:
     if len(parts) < 6:
         return None

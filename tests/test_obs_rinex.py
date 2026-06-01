@@ -1,3 +1,4 @@
+import binascii
 import struct
 from pathlib import Path
 
@@ -6,16 +7,21 @@ from um980_rtklib_pipeline.rinex_obs import _format_obs_value, observations_for_
 from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32
 
 
-def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int = 132572000) -> bytes:
+def _binary_frame(message_id: int, payload: bytes, week: int = 2419, tow_ms: int = 132572000, time_status: int = 0) -> bytes:
     header = bytearray(24)
     header[:3] = b"\xaa\x44\xb5"
-    header[9] = 0
+    header[9] = time_status
     struct.pack_into("<H", header, 4, message_id)
     struct.pack_into("<H", header, 6, len(payload))
     struct.pack_into("<H", header, 10, week)
     struct.pack_into("<I", header, 12, tow_ms)
     body = bytes(header) + payload
     return body + unicore_binary_crc32(body).to_bytes(4, "little")
+
+
+def _ascii_record(body: bytes) -> bytes:
+    crc = binascii.crc32(body) & 0xFFFFFFFF
+    return b"#" + body + f"*{crc:08X}\r\n".encode("ascii")
 
 
 def _obsvmb_payload(entries: list[tuple[int, int, float, float, float, float, float, int]]) -> bytes:
@@ -95,9 +101,9 @@ def _observation(
 
 
 def test_obsvma_subset_to_csv_and_rinex(tmp_path: Path):
-    data = (
-        b"#OBSVMA,COM1,0,0;OBSVMA,2400,1000.0,GPS,1,L1,20200000.0,100.5,-1200.0,45.0,10,7|"
-        b"OBSVMA,2400,1000.0,Galileo,11,E1,23200000.0,200.5,-1000.0,42.0,9,8*00000000\r\n"
+    data = _ascii_record(
+        b"OBSVMA,COM1,0,0;OBSVMA,2400,1000.0,GPS,1,L1,20200000.0,100.5,-1200.0,45.0,10,7|"
+        b"OBSVMA,2400,1000.0,Galileo,11,E1,23200000.0,200.5,-1000.0,42.0,9,8"
     )
     records, _ = parse_stream(data)
     decoded = decode_observations(records)
@@ -179,10 +185,9 @@ def test_rinex_observation_formatter_keeps_large_values_fixed_width():
 
 
 def test_real_shape_obsvma_warns_when_signal_mapping_is_placeholder():
-    data = (
-        b"#OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
+    data = _ascii_record(
+        b"OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
         b"1,0,1,17661005.670,-92809209.627852,6,50,2037.974,5000,0,16.010,20181c23"
-        b"*00000000\r\n"
     )
     records, _ = parse_stream(data)
     decoded = decode_observations(records)
@@ -194,10 +199,9 @@ def test_real_shape_obsvma_warns_when_signal_mapping_is_placeholder():
 
 
 def test_obsvma_rejects_non_fine_receiver_time():
-    data = (
-        b"#OBSVMA,1,GPS,UNKNOWN,1,132572000,0,0,18,1;"
+    data = _ascii_record(
+        b"OBSVMA,1,GPS,UNKNOWN,1,132572000,0,0,18,1;"
         b"1,0,1,17661005.670,-92809209.627852,6,50,2037.974,5000,0,16.010,20181c23"
-        b"*00000000\r\n"
     )
     records, _ = parse_stream(data)
     decoded = decode_observations(records)
@@ -209,7 +213,17 @@ def test_binary_ephemeris_is_not_reported_as_undecoded_observation():
     records, _ = parse_stream(_binary_frame(106, bytes(224)))
     decoded = decode_observations(records)
     assert decoded.unsupported_records == {}
+    assert decoded.skipped_records["GPSEPHB"] == 1
     assert decoded.warnings == ["no raw observations were decoded"]
+
+
+def test_binary_ion_utc_are_skipped_not_unsupported_observations():
+    records, _ = parse_stream(_binary_frame(8, bytes(16)) + _binary_frame(19, bytes(16)))
+    decoded = decode_observations(records)
+
+    assert decoded.unsupported_records == {}
+    assert decoded.skipped_records["GPSIONB"] == 1
+    assert decoded.skipped_records["GPSUTCB"] == 1
 
 
 def test_obsvmb_binary_observations_decode_to_rinex(tmp_path: Path):
@@ -269,13 +283,21 @@ def test_obsvmcmpb_compressed_observations_decode_to_rinex(tmp_path: Path):
     assert "R11" in rinex
 
 
+def test_obsvmcmpb_time_unknown_has_reason_class():
+    payload = _obsvmcmpb_payload([])
+    records, _ = parse_stream(_binary_frame(138, payload, time_status=201))
+    decoded = decode_observations(records)
+
+    assert decoded.unsupported_records["OBSVMCMPB_TIME_UNKNOWN"] == 1
+    assert decoded.time_unknown_reasons["OBSVMCMPB:time_status_unknown"] == 1
+
+
 def test_obsvma_tracking_status_keeps_multiple_signals_for_same_satellite(tmp_path: Path):
-    data = (
-        b"#OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
+    data = _ascii_record(
+        b"OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
         b"2,"
         b"0,16,20814342.474,-109380108.947785,28,50,2648.551,4929,0,11.710,20181c23,"
         b"0,16,20814337.133,-85231236.201565,227,534,2063.807,3272,0,6.760,21301c22"
-        b"*00000000\r\n"
     )
     records, _ = parse_stream(data)
     decoded = decode_observations(records)
@@ -292,10 +314,9 @@ def test_obsvma_tracking_status_keeps_multiple_signals_for_same_satellite(tmp_pa
 
 
 def test_obsvma_tracking_status_decodes_glonass_offset_prn():
-    data = (
-        b"#OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
+    data = _ascii_record(
+        b"OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,1;"
         b"1,7,52,18851471.802,-100736546.989518,18,52,626.918,4760,0,9.200,00191c43"
-        b"*00000000\r\n"
     )
     records, _ = parse_stream(data)
     decoded = decode_observations(records)
@@ -306,12 +327,11 @@ def test_obsvma_tracking_status_decodes_glonass_offset_prn():
 
 
 def test_convbin_compatibility_filters_unknown_and_orders_observation_types(tmp_path: Path):
-    data = (
-        b"#OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,2;"
+    data = _ascii_record(
+        b"OBSVMA,1,GPS,FINE,2419,132572000,0,0,18,2;"
         b"2,"
         b"0,16,20814342.474,-109380108.947785,28,50,2648.551,4929,0,11.710,20181c23,"
         b"0,16,20814337.133,-85231236.201565,227,534,2063.807,3272,0,6.760,21301c22"
-        b"*00000000\r\n"
     )
     records, _ = parse_stream(data)
     decoded = decode_observations(records)

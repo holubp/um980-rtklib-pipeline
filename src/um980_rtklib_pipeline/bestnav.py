@@ -113,12 +113,18 @@ class BestNavExtraction:
     def as_dict(self) -> dict[str, object]:
         """Return JSON-friendly BESTNAV extraction details."""
 
+        accounting = bestnav_native_accounting(self.records)
         return {
             "records": len(self.records),
             "valid_epochs": len(self.records),
+            "decoded": len(self.records),
             "present": dict(self.present),
             "malformed": dict(self.malformed),
             "present_not_converted": dict(self.present_not_converted),
+            "valid_position": accounting["valid_position"],
+            "emitted_solution_points_native": accounting["emitted_solution_points"],
+            "dropped_by_reason": accounting["dropped_by_reason"],
+            "cadence": accounting["cadence"],
             "warnings": self.warnings,
             "first_time": self.records[0].time_utc.isoformat() if self.records else None,
             "last_time": self.records[-1].time_utc.isoformat() if self.records else None,
@@ -378,6 +384,56 @@ def estimate_native_hz(records: list[BestNavRecord]) -> float | None:
     intervals.sort()
     median = intervals[len(intervals) // 2]
     return None if median <= 0 else 1.0 / median
+
+
+def bestnav_native_accounting(records: list[BestNavRecord]) -> dict[str, object]:
+    """Return native-rate BESTNAV solution-emission accounting.
+
+    The summary uses the default native behaviour: one generated solution epoch
+    per unique valid BESTNAV timestamp, with no downsampling.
+    """
+
+    valid = [record for record in records if _has_position(record)]
+    deduped = _dedupe_timestamps(valid)
+    intervals = [
+        right.time_key - left.time_key
+        for left, right in zip(deduped, deduped[1:], strict=False)
+        if right.time_key > left.time_key
+    ]
+    dropped = Counter()
+    dropped["dropped_no_position"] = sum(1 for record in records if not _has_position(record))
+    dropped["dropped_bad_status"] = sum(1 for record in records if record.pos_sol_status.upper() != "SOL_COMPUTED")
+    dropped["dropped_duplicate_time"] = len(valid) - len(deduped)
+    dropped["dropped_rate_limit"] = 0
+    dropped["dropped_user_filter"] = 0
+    return {
+        "valid_position": len(valid),
+        "emitted_solution_points": len(deduped),
+        "dropped_by_reason": {key: value for key, value in dropped.items() if value},
+        "cadence": _bestnav_cadence(intervals),
+    }
+
+
+def _bestnav_cadence(intervals: list[float]) -> dict[str, object]:
+    """Return JSON-friendly BESTNAV interval statistics."""
+
+    if not intervals:
+        return {
+            "mean_hz": None,
+            "median_hz": None,
+            "max_gap_s": None,
+            "interval_histogram_s": {},
+        }
+    ordered = sorted(intervals)
+    mean_interval = sum(intervals) / len(intervals)
+    median_interval = ordered[len(ordered) // 2]
+    histogram = Counter(round(interval, 3) for interval in intervals)
+    return {
+        "mean_hz": 1.0 / mean_interval if mean_interval > 0 else None,
+        "median_hz": 1.0 / median_interval if median_interval > 0 else None,
+        "max_gap_s": max(intervals),
+        "interval_histogram_s": {f"{key:g}": value for key, value in sorted(histogram.items())},
+    }
 
 
 def _csv_fields(text: str) -> list[str]:

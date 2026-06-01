@@ -476,6 +476,100 @@ verify the base coordinates, distance to the rover route, RTCM 1005/1006
 presence, multi-GNSS MSM content, receiver/antenna metadata where available,
 and converted RINEX observation types.
 
+## Base Advisory
+
+Use `base-candidates` as a non-destructive first check before picking a base
+station. It uses live NMEA or BESTNAV-derived rover solution points to estimate
+the representative rover position and ranks known EUREF/EPN candidates without
+running RTKLIB or downloading large observation files.
+
+```bash
+um980-ppk base-candidates rover.ubx \
+  --track-source bestnav \
+  --stations CPAR,TUBO \
+  --radius-km 150 \
+  --base-resolution high \
+  --station-catalog-source curated \
+  --format markdown \
+  --analysis-json \
+  -v
+```
+
+By default, the command uses a cache-first EPN station catalogue. Use
+`--refresh-station-catalog --station-catalog-source epn-latest` to refresh the
+cache from the official EPN SSC coordinate files, or
+`--station-catalog-source curated` for fully offline CPAR/TUBO-style testing.
+The JSON output includes the coordinate source and frame so runs are
+reproducible. If catalogue refresh fails, the command falls back to a fresh
+cache or curated stations and reports the reason.
+
+Add `--probe-archives` to make lightweight archive availability checks for the
+selected span. The probe uses planned EUREF/BKG URLs and HTTP `HEAD` where
+possible; it does not download full observation bodies. `--download-headers-only`
+is accepted for the probe contract, but compressed RINEX header-range parsing is
+not implemented yet, so constellation/frequency header summaries remain
+`unknown` unless supplied by future cached probe data. High-rate and low-rate
+status are reported separately, and low-rate fallback is only advisory; normal
+pipeline base selection is not changed by this command.
+
+## Optimizer Dry Run
+
+Use `optimize-settings --dry-run` to plan a bounded comparison of RTKLIB
+configs, bases, NAV/SBAS/ION modes, and representative time samples before
+spending time on full processing. The command defaults to dry-run planning; use
+`--execute` to run the bounded plan through the existing `pipeline` command.
+Every run gets its own output directory, exact command, stdout/stderr logs and,
+when RTKLIB creates a parseable solution, compact metrics.
+It can also consume `base-candidates` JSON with
+`--base-candidates-json candidates.json --top-bases 3`.
+
+```bash
+um980-ppk optimize-settings rover.ubx \
+  --config um980-onepass-gps-gal-bds-el28.conf \
+  --bases TUBO,CPAR \
+  --base-resolution auto \
+  --nav-source auto-prefer-base \
+  --sbas-source auto \
+  --emit-ion-utc off \
+  --start-time 2026-05-30T05:00:00Z \
+  --end-time 2026-05-30T05:30:00Z \
+  --sample-count 4 \
+  --sample-duration 120s \
+  --max-variants 6 \
+  --max-runs 24 \
+  --dry-run \
+  --format markdown
+```
+
+Without an explicit time window, dry-run samples are placeholders because the
+baseline solution has not been classified yet. Keep `--max-variants` and
+`--max-runs` small for field comparisons; the goal is to avoid uncontrolled
+combinatorial processing.
+
+Tiny bounded execution example:
+
+```bash
+um980-ppk optimize-settings rover.ubx \
+  --config um980-onepass-gps-gal-bds-el28.conf \
+  --bases TUBO,CPAR \
+  --base-resolution auto \
+  --start-time 2026-05-30T05:00:00Z \
+  --end-time 2026-05-30T05:04:00Z \
+  --sample-count 1 \
+  --sample-duration 120s \
+  --max-variants 2 \
+  --max-runs 2 \
+  --execute \
+  --out-dir optimizer-out \
+  --format markdown
+```
+
+The execution backend is intentionally conservative: it invokes this package's
+own `pipeline` CLI per sample/variant, stores `optimizer-results.json`, and
+continues recording failed variants instead of claiming success. It does not
+mutate arbitrary RTKLIB options or run high RTKLIB trace unless the underlying
+pipeline command is extended to do so.
+
 `postprocess` passes a base reference position to RTKLIB when one is available.
 Use `--base-ecef X Y Z` or `--base-llh LAT LON HEIGHT` for an explicit
 position. Otherwise `--base-station CPAR` resolves current EPN/EUREF ETRF2000

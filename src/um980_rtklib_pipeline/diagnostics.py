@@ -58,6 +58,10 @@ class DiagnosticExtraction:
 
     records: list[DiagnosticRecord] = field(default_factory=list)
     present: Counter[str] = field(default_factory=Counter)
+    parsed: Counter[str] = field(default_factory=Counter)
+    emitted: Counter[str] = field(default_factory=Counter)
+    skipped: Counter[str] = field(default_factory=Counter)
+    skip_reasons: Counter[str] = field(default_factory=Counter)
     malformed: Counter[str] = field(default_factory=Counter)
     present_not_converted: Counter[str] = field(default_factory=Counter)
 
@@ -66,6 +70,10 @@ class DiagnosticExtraction:
 
         return {
             "present": dict(self.present),
+            "parsed": dict(self.parsed),
+            "emitted": dict(self.emitted),
+            "skipped": dict(self.skipped),
+            "skip_reasons": dict(self.skip_reasons),
             "malformed": dict(self.malformed),
             "present_not_converted": dict(self.present_not_converted),
             "records": [
@@ -83,10 +91,21 @@ class DiagnosticExtraction:
         }
 
 
-def extract_diagnostics(records: list[StreamRecord]) -> DiagnosticExtraction:
-    """Extract ION/UTC/TROPINFO diagnostics without claiming RTKLIB conversion."""
+def extract_diagnostics(records: list[StreamRecord], *, emit_policy: str = "off") -> DiagnosticExtraction:
+    """Extract ION/UTC/TROPINFO diagnostics without claiming unsafe conversion.
+
+    Args:
+        records: Parsed mixed-stream records.
+        emit_policy: `off`, `auto`, or `strict`. The current implementation
+            deliberately emits no RINEX NAV ION/UTC headers because no family
+            mapping has been verified against RTKLIB parser behavior yet. The
+            policy is still recorded so logs and analysis JSON explain whether
+            emission was disabled or blocked by missing verification.
+    """
 
     result = DiagnosticExtraction()
+    if emit_policy not in {"off", "auto", "strict"}:
+        raise ValueError(f"unsupported ION/UTC emission policy: {emit_policy}")
     for index, record in enumerate(records):
         msg = record.msg_type or ""
         kind, system = _classify(msg)
@@ -99,9 +118,20 @@ def extract_diagnostics(records: list[StreamRecord]) -> DiagnosticExtraction:
                 parameters = _ascii_parameters(record.text or "")
             except ValueError:
                 result.malformed[msg] += 1
+                result.skipped[msg] += 1
+                result.skip_reasons[f"{msg}:malformed_ascii_payload"] += 1
                 continue
         else:
             parameters = {"payload_bytes": max(len(record.raw) - 28, 0)}
+        result.parsed[msg] += 1
+        result.skipped[msg] += 1
+        if kind == "troposphere":
+            reason = "diagnostic_only_not_rtklib_input"
+        elif emit_policy == "off":
+            reason = "ion_utc_emission_disabled"
+        else:
+            reason = "rinex_mapping_not_verified"
+        result.skip_reasons[f"{msg}:{reason}"] += 1
         result.records.append(
             DiagnosticRecord(
                 kind=kind,
@@ -109,6 +139,7 @@ def extract_diagnostics(records: list[StreamRecord]) -> DiagnosticExtraction:
                 source=msg,
                 parameters=parameters,
                 raw_record_index=index,
+                conversion_note=f"present_not_converted: {reason}",
             )
         )
     return result

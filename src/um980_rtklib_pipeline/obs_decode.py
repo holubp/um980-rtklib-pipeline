@@ -6,7 +6,7 @@ import csv
 import logging
 import struct
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
@@ -207,6 +207,9 @@ class ObservationExtraction:
     Attributes:
         observations: Decoded observations.
         unsupported_records: Counts of records that could not be decoded.
+        time_unknown_reasons: Counts of unusable binary epoch time reasons.
+        skipped_records: Counts of non-observation records skipped by the
+            observation decoder.
         metrics: Aggregate observation metrics.
         warnings: User-facing extraction warnings.
     """
@@ -215,6 +218,8 @@ class ObservationExtraction:
     unsupported_records: dict[str, int]
     metrics: dict[str, object]
     warnings: list[str]
+    time_unknown_reasons: dict[str, int] = field(default_factory=dict)
+    skipped_records: dict[str, int] = field(default_factory=dict)
 
 
 def _float(value: str) -> float | None:
@@ -347,6 +352,20 @@ def _binary_time(record: StreamRecord) -> tuple[int, float] | None:
     if time_status == OBSVMB_TIME_UNKNOWN or week == 0:
         return None
     return week, tow_ms / 1000.0
+
+
+def _binary_time_unusable_reason(record: StreamRecord) -> str:
+    """Return a stable reason class when a binary record has no usable time."""
+
+    if not record.raw or len(record.raw) < 16:
+        return "binary_header_too_short"
+    time_status = record.raw[9]
+    week = int.from_bytes(record.raw[10:12], "little", signed=False)
+    if time_status == OBSVMB_TIME_UNKNOWN:
+        return "time_status_unknown"
+    if week == 0:
+        return "gps_week_zero"
+    return "unknown"
 
 
 def _obsvmb_observations(record: StreamRecord) -> list[Observation]:
@@ -609,6 +628,8 @@ def decode_observations(records: list[StreamRecord], *, progress: bool = False) 
 
     observations: list[Observation] = []
     unsupported: dict[str, int] = defaultdict(int)
+    time_unknown_reasons: dict[str, int] = defaultdict(int)
+    skipped: dict[str, int] = defaultdict(int)
     warnings: list[str] = []
     progress_step = 100_000
     for index, record in enumerate(records, start=1):
@@ -647,6 +668,7 @@ def decode_observations(records: list[StreamRecord], *, progress: bool = False) 
                     observations.extend(parsed_obsvmb)
                 else:
                     unsupported["OBSVMB_TIME_UNKNOWN"] += 1
+                    time_unknown_reasons[f"OBSVMB:{_binary_time_unusable_reason(record)}"] += 1
         elif record.kind == "unicore_binary" and msg_type == "OBSVMCMPB":
             try:
                 parsed_obsvmcmpb = _obsvmcmpb_observations(record)
@@ -657,8 +679,9 @@ def decode_observations(records: list[StreamRecord], *, progress: bool = False) 
                     observations.extend(parsed_obsvmcmpb)
                 else:
                     unsupported["OBSVMCMPB_TIME_UNKNOWN"] += 1
-        elif record.kind == "unicore_binary" and msg_type not in BINARY_EPHEMERIS_TYPES:
-            unsupported[record.msg_type or "unicore_binary"] += 1
+                    time_unknown_reasons[f"OBSVMCMPB:{_binary_time_unusable_reason(record)}"] += 1
+        elif record.kind != "noise":
+            skipped[record.msg_type or record.kind] += 1
 
     if unsupported:
         warnings.append(
@@ -676,7 +699,16 @@ def decode_observations(records: list[StreamRecord], *, progress: bool = False) 
     if not observations:
         warnings.append("no raw observations were decoded")
 
-    return ObservationExtraction(observations, dict(unsupported), observation_metrics(observations), warnings)
+    metrics = observation_metrics(observations)
+    metrics["time_unknown_reasons"] = dict(time_unknown_reasons)
+    return ObservationExtraction(
+        observations,
+        dict(unsupported),
+        metrics,
+        warnings,
+        dict(time_unknown_reasons),
+        dict(skipped),
+    )
 
 
 def observation_metrics(observations: list[Observation]) -> dict[str, object]:
@@ -694,12 +726,14 @@ def observation_metrics(observations: list[Observation]) -> dict[str, object]:
     bands: dict[str, int] = defaultdict(int)
     signals: dict[str, int] = defaultdict(int)
     codes: dict[str, int] = defaultdict(int)
+    system_codes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for obs in observations:
         by_epoch[(obs.gps_week, obs.tow)].append(obs)
         constellations[obs.sat_system] += 1
         bands[obs.band] += 1
         signals[obs.signal_name] += 1
         codes[obs.rinex_code] += 1
+        system_codes[obs.sat_system][obs.rinex_code] += 1
     epochs = sorted(by_epoch)
     intervals = [right[1] - left[1] for left, right in zip(epochs, epochs[1:]) if right[1] > left[1]]
     obs_counts = [len(v) for v in by_epoch.values()]
@@ -710,6 +744,9 @@ def observation_metrics(observations: list[Observation]) -> dict[str, object]:
         "bands": dict(bands),
         "signals": dict(signals),
         "rinex_observation_codes": dict(codes),
+        "rinex_observation_codes_by_constellation": {
+            system: dict(values) for system, values in system_codes.items()
+        },
     }
     if intervals:
         hz = [1.0 / interval for interval in intervals if interval > 0]

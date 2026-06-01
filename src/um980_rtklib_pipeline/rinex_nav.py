@@ -47,6 +47,9 @@ class NavExtractionReport:
     converted: dict[str, int]
     warnings: list[str]
     written: dict[str, str] = field(default_factory=dict)
+    malformed: dict[str, int] = field(default_factory=dict)
+    malformed_reasons: dict[str, dict[str, int]] = field(default_factory=dict)
+    unsupported: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable report."""
@@ -56,6 +59,9 @@ class NavExtractionReport:
             "converted": self.converted,
             "warnings": self.warnings,
             "written": self.written,
+            "malformed": self.malformed,
+            "malformed_reasons": self.malformed_reasons,
+            "unsupported": self.unsupported,
         }
 
 
@@ -206,6 +212,8 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
     irn: list[BroadcastEphemeris] = []
     sbs_messages: list[str] = []
     parse_errors: list[str] = []
+    malformed: Counter[str] = Counter()
+    malformed_reasons: dict[str, Counter[str]] = {}
 
     for record in records:
         msg_type = (record.msg_type or "").upper()
@@ -220,6 +228,8 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
                     gal.append(_parse_galepha(header, payload))
                 elif msg_type == "BDSEPHA":
                     bds.append(_parse_bdsepha(payload))
+                elif msg_type == "BD3EPHA":
+                    bd3.append(_parse_bd3epha(payload))
                 elif msg_type == "QZSSEPHA":
                     qzss.append(_parse_qzssepha(payload))
                 elif msg_type in SBAS_MESSAGE_TYPES:
@@ -243,6 +253,9 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
                     irn.append(_parse_irnssephb(record.raw))
         except (IndexError, TypeError, ValueError, struct.error) as exc:
             parse_errors.append(f"{msg_type} at offset {record.offset}: {exc}")
+            malformed[msg_type or "unknown"] += 1
+            reason = str(exc).split(":", 1)[0] or type(exc).__name__
+            malformed_reasons.setdefault(msg_type or "unknown", Counter())[reason] += 1
 
     gps = _unique_broadcast(gps)
     qzss = _unique_broadcast(qzss)
@@ -263,6 +276,7 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
     converted["GALEPHB"] = _count_source(gal, "GALEPHB")
     converted["BDSEPHA"] = _count_source(bds, "BDSEPHA")
     converted["BDSEPHB"] = _count_source(bds, "BDSEPHB")
+    converted["BD3EPHA"] = _count_source(bd3, "BD3EPHA")
     converted["BD3EPHB"] = _count_source(bd3, "BD3EPHB")
     converted["IRNSSEPHB"] = _count_source(irn, "IRNSSEPHB")
     converted["SBSMSG"] = len(sbs_messages)
@@ -300,16 +314,15 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
         warnings.append("GALEPHA records found, but no valid Galileo RINEX LNAV records were converted.")
     if counts.get("BDSEPHA", 0) and converted["BDSEPHA"] == 0:
         warnings.append("BDSEPHA records found, but no valid BeiDou RINEX CNAV records were converted.")
-    if counts.get("BD3EPHB", 0) and 0 < converted["BD3EPHB"] < counts["BD3EPHB"]:
+    bd3_found = counts.get("BD3EPHA", 0) + counts.get("BD3EPHB", 0)
+    bd3_converted = converted["BD3EPHA"] + converted["BD3EPHB"]
+    if bd3_found and 0 < bd3_converted < bd3_found:
         warnings.append(
-            f"BD3EPHB contained {counts['BD3EPHB']} records but {converted['BD3EPHB']} "
+            f"BD3EPH contained {bd3_found} records but {bd3_converted} "
             "RTKLIB-compatible BDS-3 ephemerides were written; frequency variants for the same "
             "satellite and epoch were collapsed because RTKLIB RINEX NAV keeps one broadcast "
             "ephemeris per satellite/epoch."
         )
-    for name in ("BD3EPHA",):
-        if counts.get(name, 0):
-            warnings.append(f"{name} records found; conversion not yet implemented")
     for name in BINARY_EPHEMERIS_TYPES:
         if counts.get(name, 0) and converted[name] == 0:
             warnings.append(f"{name} binary records found, but no valid RINEX NAV records were converted.")
@@ -334,6 +347,12 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
     if len(parse_errors) > 10:
         warnings.append(f"{len(parse_errors) - 10} additional malformed navigation records were skipped")
 
+    unsupported = {
+        name: max(0, counts.get(name, 0) - converted.get(name, 0) - malformed.get(name, 0))
+        for name in (*EPHEMERIS_TYPES, *BINARY_EPHEMERIS_TYPES, "SBSMSG")
+        if max(0, counts.get(name, 0) - converted.get(name, 0) - malformed.get(name, 0)) > 0
+    }
+
     return NavExtractionReport(
         found={
             **{name: counts.get(name, 0) for name in EPHEMERIS_TYPES},
@@ -343,6 +362,9 @@ def extract_rover_nav(records: list[StreamRecord], output_path: Path | None = No
         converted=converted,
         warnings=warnings,
         written=written,
+        malformed=dict(malformed),
+        malformed_reasons={name: dict(reasons) for name, reasons in malformed_reasons.items()},
+        unsupported=unsupported,
     )
 
 
@@ -813,11 +835,69 @@ def _parse_bd3ephb(raw: bytes) -> BroadcastEphemeris:
     )
 
 
+def _parse_bd3epha(fields: list[str]) -> BroadcastEphemeris:
+    _require_fields(fields, 45, "BD3EPHA")
+    sat_type = _as_int(fields[2])
+    aref = BDS3_MEO_AREF_M if sat_type == 3 else BDS3_GEO_IGSO_AREF_M
+    bdt_week = _as_int(fields[6]) - BDS_WEEK_OFFSET
+    freq_type = _as_int(fields[44])
+    tgd0, tgd1 = _bd3_group_delays_from_values(
+        tgdb1cp=_as_float(fields[28]),
+        tgdb2ap=_as_float(fields[29]),
+        tgdb2bi=_as_float(fields[30]),
+        tgdb2bq=_as_float(fields[31]),
+        freq_type=freq_type,
+    )
+    return BroadcastEphemeris(
+        system="C",
+        prn=_as_int(fields[0]),
+        toc_week=bdt_week,
+        toc_s=_as_float(fields[27]),
+        toe_s=_as_float(fields[9]),
+        sqrt_a=math.sqrt(aref + _as_float(fields[10])),
+        deln=_as_float(fields[12]),
+        m0=_as_float(fields[14]),
+        ecc=_as_float(fields[15]),
+        omega=_as_float(fields[16]),
+        cuc=_as_float(fields[17]),
+        cus=_as_float(fields[18]),
+        crc=_as_float(fields[19]),
+        crs=_as_float(fields[20]),
+        cic=_as_float(fields[21]),
+        cis=_as_float(fields[22]),
+        i0=_as_float(fields[23]),
+        idot=_as_float(fields[24]),
+        omg0=_as_float(fields[25]),
+        omgd=_as_float(fields[26]),
+        f0=_as_float(fields[34]),
+        f1=_as_float(fields[35]),
+        f2=_as_float(fields[36]),
+        iode=_as_int(fields[4]),
+        iodc=_as_int(fields[5]),
+        code=freq_type,
+        svh=_as_int(fields[1]),
+        sva=float(_as_int(fields[3])),
+        tgd0=tgd0,
+        tgd1=tgd1,
+        ttr_week=bdt_week,
+        ttr_s=_as_float(fields[8]),
+        source_message="BD3EPHA",
+    )
+
+
 def _bd3_group_delays(payload: bytes, freq_type: int) -> tuple[float, float]:
-    tgdb1cp = _r8(payload, 172)
-    tgdb2ap = _r8(payload, 180)
-    tgdb2bi = _r8(payload, 188)
-    tgdb2bq = _r8(payload, 196)
+    return _bd3_group_delays_from_values(
+        tgdb1cp=_r8(payload, 172),
+        tgdb2ap=_r8(payload, 180),
+        tgdb2bi=_r8(payload, 188),
+        tgdb2bq=_r8(payload, 196),
+        freq_type=freq_type,
+    )
+
+
+def _bd3_group_delays_from_values(
+    *, tgdb1cp: float, tgdb2ap: float, tgdb2bi: float, tgdb2bq: float, freq_type: int
+) -> tuple[float, float]:
     if freq_type == 1:
         return tgdb1cp, tgdb2ap
     if freq_type == 2:
@@ -965,7 +1045,7 @@ def _glonass_nav_lines(geph: GlonassEphemeris) -> list[str]:
 def _unique_broadcast(records: list[BroadcastEphemeris]) -> list[BroadcastEphemeris]:
     unique: dict[tuple[str, int, int, float, float, int, int, int], BroadcastEphemeris] = {}
     for record in records:
-        code = 0 if record.source_message == "BD3EPHB" else record.code
+        code = 0 if record.source_message in {"BD3EPHA", "BD3EPHB"} else record.code
         key = (record.system, record.prn, record.toc_week, record.toe_s, record.toc_s, record.iode, record.iodc, code)
         if key not in unique:
             unique[key] = record

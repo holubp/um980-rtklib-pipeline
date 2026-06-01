@@ -62,6 +62,15 @@
 - Recorded real-time base RTCM is an alternative base source, not an archive
   fallback. `--base-rtcm` must be converted with RTKLIB `convbin -r rtcm3` and
   must not be combined silently with `--download-base`.
+- Base-candidate advisory must remain non-destructive. It may rank stations,
+  refresh/cache station catalogues, and probe archive availability, but it must
+  not automatically change the normal pipeline's base selection.
+- Archive probing in advisory mode must stay lightweight by default. Prefer
+  cached metadata, directory listings, or HTTP `HEAD` checks; do not download
+  full observation bodies for `--download-headers-only`.
+- Optimizer execution must be explicitly bounded. Default to planning/dry-run,
+  require an execution flag for subprocess runs, preserve per-run commands and
+  logs, and enforce `--max-variants`/`--max-runs`.
 - EUREF provider URL templates must be verified against real public directory
   listings and sample files before being added. For BKG high-rate products,
   preflight the directory index so missing station/rate combinations produce

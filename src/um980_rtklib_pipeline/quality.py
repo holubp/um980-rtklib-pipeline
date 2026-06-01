@@ -37,14 +37,20 @@ def build_analysis(
         "solution_points": len(solutions.solution_points),
         "nmea_cadence": solutions.nmea_cadence,
         "raw_observations": observations.metrics,
+        "observation_decode": {
+            "unsupported_records": observations.unsupported_records,
+            "time_unknown_reasons": observations.time_unknown_reasons,
+            "skipped_non_observation_records": observations.skipped_records,
+        },
         "unsupported_observation_records": observations.unsupported_records,
-        "warnings": [*solutions.warnings, *observations.warnings],
+        "warnings": list(dict.fromkeys([*solutions.warnings, *observations.warnings])),
     }
     if rover_nav is not None:
         analysis["ephemeris"] = rover_nav.as_dict()
         analysis["warnings"].extend(rover_nav.warnings)  # type: ignore[index,union-attr]
     if extra:
         analysis.update(extra)
+    analysis["warnings"] = list(dict.fromkeys(analysis.get("warnings", [])))  # type: ignore[arg-type]
     return analysis
 
 

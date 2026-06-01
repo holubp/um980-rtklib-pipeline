@@ -11,11 +11,13 @@ import shutil
 import sys
 from dataclasses import dataclass
 from datetime import timedelta
+from glob import glob
 from pathlib import Path
 
 from .badsat import BadSatConfig, choose_bad_sats, compute_sat_metrics, parse_rtklib_stat
 from .badsat_report import write_badsat_json_report, write_badsat_markdown_report
 from .base_rt import convert_rtcm_to_rinex, fetch_ntrip_sourcetable, record_ntrip_base
+from .base_advisory import CURATED_STATION_POSITIONS, build_base_advisory_report, format_base_advisory
 from .bestnav import (
     bestnav_records_to_nmea,
     extract_bestnav_records,
@@ -39,6 +41,8 @@ from .euref import (
 from .files import (
     RinexObsCapabilities,
     basename_for,
+    classify_rinex_file,
+    detect_rinex_obs_systems,
     ensure_out_dir,
     filter_rinex_obs_by_overlap,
     read_rinex_obs_capabilities,
@@ -48,6 +52,7 @@ from .initgen import (
     InitProfile,
     ION_MESSAGES,
     NMEA_PRESETS,
+    SBAS_MODES,
     UTC_MESSAGES,
     debug_ascii_ephemeris_policy,
     ephemeris_policy,
@@ -59,6 +64,14 @@ from .logging_config import configure_logging
 from .message_stats import build_message_stats, log_message_stats
 from .nav_resolver import resolve_nav_sources
 from .obs_decode import decode_observations, write_observations_csv
+from .optimizer import (
+    build_optimizer_plan,
+    execute_optimizer_plan,
+    format_optimizer_plan,
+    load_bases_from_candidates,
+    load_base_list,
+    parse_duration_seconds,
+)
 from .quality import build_analysis, write_analysis_json
 from .rinex_nav import extract_rover_nav, rover_nav_files
 from .rinex_obs import observations_for_rinex, write_rinex_obs
@@ -73,6 +86,7 @@ from .rtklib import (
 from .rtklib_config_patch import patch_config_with_autoqc
 from .rtklib_summary import format_rtklib_solution_summary, summarize_rtklib_solution
 from .solution import (
+    SolutionExtraction,
     SolutionPoint,
     bestnav_records_to_solution_extraction,
     extract_solutions,
@@ -83,7 +97,10 @@ from .solution import (
     write_solution_csv,
     write_solution_nmea,
 )
+from .stations import default_station_catalog_cache, load_station_catalog
 from .stream import parse_stream
+from .time_window import ProcessingWindow, processing_window_from_values
+from .timeutil import gps_week_tow_to_datetime
 
 BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate", "bkg-igs-highrate")
 BASE_RATE_HIGH = "1s"
@@ -244,6 +261,53 @@ def _add_track_source_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_emit_ion_utc_arg(parser: argparse.ArgumentParser) -> None:
+    """Add safe ION/UTC RINEX emission policy selection."""
+
+    parser.add_argument(
+        "--emit-ion-utc",
+        choices=["off", "auto", "strict"],
+        default="off",
+        help=(
+            "ION/UTC RINEX NAV header policy. off preserves diagnostics only; auto emits only mappings "
+            "verified against RTKLIB, currently none; strict fails if ION/UTC records are present but "
+            "cannot be emitted safely."
+        ),
+    )
+
+
+def _add_sbas_source_args(parser: argparse.ArgumentParser) -> None:
+    """Add RTKLIB SBAS correction sidecar source controls."""
+
+    parser.add_argument(
+        "--sbas-source",
+        choices=["off", "rover", "base", "external", "auto"],
+        default="auto",
+        help=(
+            "SBAS correction-message source for RTKLIB .sbs input. auto uses --sbas-file first, "
+            "then a real rover-generated .sbs sidecar; off passes no .sbs file. No fake .sbs file is created."
+        ),
+    )
+    parser.add_argument("--sbas-file", action="append", help="External RTKLIB .sbs correction-message file.")
+
+
+def _add_time_window_args(parser: argparse.ArgumentParser) -> None:
+    """Add selected-recording-interval options."""
+
+    parser.add_argument(
+        "--start-time",
+        "--datetime-start",
+        dest="start_time",
+        help="Process only data at/after this ISO-8601 datetime. Naive values are treated as UTC.",
+    )
+    parser.add_argument(
+        "--end-time",
+        "--datetime-end",
+        dest="end_time",
+        help="Process only data at/before this ISO-8601 datetime. Naive values are treated as UTC.",
+    )
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -278,6 +342,106 @@ def _configure_cli_logging(args: argparse.Namespace) -> None:
     configure_logging(_verbose_enabled(args), args.log_file, debug=_debug_enabled(args))
 
 
+def _processing_window_from_args(args: argparse.Namespace) -> ProcessingWindow:
+    """Return the selected UTC processing window from CLI args."""
+
+    return processing_window_from_values(getattr(args, "start_time", None), getattr(args, "end_time", None))
+
+
+def _span_from_solution_points(points: list[SolutionPoint]) -> dict[str, str | None]:
+    if not points:
+        return {"start": None, "end": None}
+    return {"start": min(point.time_utc for point in points).isoformat(), "end": max(point.time_utc for point in points).isoformat()}
+
+
+def _span_from_observations(observations) -> dict[str, str | None]:
+    if not observations:
+        return {"start": None, "end": None}
+    times = [gps_week_tow_to_datetime(obs.gps_week, obs.tow) for obs in observations]
+    return {"start": min(times).isoformat(), "end": max(times).isoformat()}
+
+
+def _row_in_window(row: dict[str, object], window: ProcessingWindow) -> bool:
+    value = row.get("time_utc")
+    if not isinstance(value, str):
+        return True
+    try:
+        parsed = processing_window_from_values(value, None).start
+    except ValueError:
+        return True
+    return bool(parsed is None or window.contains(parsed))
+
+
+def _filter_solution_extraction(solutions: SolutionExtraction, window: ProcessingWindow) -> SolutionExtraction:
+    """Return solution extraction restricted to the selected processing window."""
+
+    if not window.enabled:
+        return solutions
+    kept_indices = [index for index, point in enumerate(solutions.solution_points) if window.contains(point.time_utc)]
+    points = [solutions.solution_points[index] for index in kept_indices]
+    rows = [row for row in solutions.all_rows if _row_in_window(row, window)]
+    solution_nmea = _filter_parallel_solution_lines(solutions.solution_nmea, len(solutions.solution_points), kept_indices)
+    solution_records = _filter_parallel_solution_lines(solutions.solution_records, len(solutions.solution_points), kept_indices)
+    warnings = list(solutions.warnings)
+    warnings.append(
+        f"solution output filtered by selected processing window: kept {len(points)} of "
+        f"{len(solutions.solution_points)} points"
+    )
+    return SolutionExtraction(
+        all_nmea=solutions.all_nmea,
+        solution_records=solution_records,
+        solution_points=points,
+        all_rows=rows,
+        nmea_cadence=solutions.nmea_cadence,
+        warnings=warnings,
+        solution_nmea=solution_nmea,
+    )
+
+
+def _filter_parallel_solution_lines(lines: list[str], point_count: int, kept_indices: list[int]) -> list[str]:
+    """Filter solution line groups that are one-or-three records per point."""
+
+    if not lines or point_count <= 0:
+        return []
+    if len(lines) == point_count:
+        return [lines[index] for index in kept_indices]
+    if len(lines) == point_count * 3:
+        filtered: list[str] = []
+        for index in kept_indices:
+            filtered.extend(lines[index * 3 : index * 3 + 3])
+        return filtered
+    return lines
+
+
+def _filter_observation_extraction(observations, window: ProcessingWindow):
+    """Return observation extraction restricted to the selected processing window."""
+
+    if not window.enabled:
+        return observations
+    kept = [
+        obs
+        for obs in observations.observations
+        if window.contains(gps_week_tow_to_datetime(obs.gps_week, obs.tow))
+    ]
+    from .obs_decode import ObservationExtraction, observation_metrics
+
+    metrics = observation_metrics(kept)
+    metrics["time_unknown_reasons"] = dict(observations.time_unknown_reasons)
+    warnings = list(observations.warnings)
+    warnings.append(
+        f"raw observations filtered by selected processing window: kept {len(kept)} of "
+        f"{len(observations.observations)} observations"
+    )
+    return ObservationExtraction(
+        observations=kept,
+        unsupported_records=observations.unsupported_records,
+        metrics=metrics,
+        warnings=warnings,
+        time_unknown_reasons=observations.time_unknown_reasons,
+        skipped_records=observations.skipped_records,
+    )
+
+
 def _human_bytes(size: int) -> str:
     """Return a compact human-readable byte count."""
 
@@ -309,6 +473,13 @@ def _load_records(path: Path):
 def _extract_bundle(args: argparse.Namespace):
     rover = Path(args.rover_log)
     progress = logging.getLogger().isEnabledFor(logging.INFO)
+    window = _processing_window_from_args(args)
+    if window.enabled:
+        logging.info(
+            "selected processing window: start=%s end=%s",
+            window.start.isoformat() if window.start else "recording-start",
+            window.end.isoformat() if window.end else "recording-end",
+        )
     records, stream_diag = _load_records(rover)
     logging.info("extracting solution records")
     solutions = extract_solutions(records, progress=progress)
@@ -321,10 +492,11 @@ def _extract_bundle(args: argparse.Namespace):
     logging.info("decoding raw observations")
     observations = decode_observations(records, progress=progress)
     logging.info(
-        "decoded raw observations: observations=%d epochs=%s unsupported=%d",
+        "decoded raw observations: observations=%d epochs=%s unsupported_observation_records=%d skipped_non_observation_records=%d",
         len(observations.observations),
         observations.metrics.get("epochs", 0),
         sum(observations.unsupported_records.values()),
+        sum(observations.skipped_records.values()),
     )
     logging.info("scanning rover navigation records")
     rover_nav = extract_rover_nav(records)
@@ -358,14 +530,34 @@ def _extract_bundle(args: argparse.Namespace):
             solutions = bestnav_solutions
         elif track_source in {"bestnav", "bestnavb"}:
             raise ValueError(f"--track-source {track_source} was requested but no valid BESTNAV solution epochs exist")
+    original_solution_span = _span_from_solution_points(solutions.solution_points)
+    original_observation_span = _span_from_observations(observations.observations)
+    solutions = _filter_solution_extraction(solutions, window)
+    observations = _filter_observation_extraction(observations, window)
+    effective_solution_span = _span_from_solution_points(solutions.solution_points)
+    effective_observation_span = _span_from_observations(observations.observations)
     logging.info("scanning ION/UTC/TROPINFO diagnostics")
-    diagnostics = extract_diagnostics(records)
+    emit_ion_utc = getattr(args, "emit_ion_utc", "off")
+    diagnostics = extract_diagnostics(records, emit_policy=emit_ion_utc)
     logging.info(
-        "preserved diagnostics: records=%d malformed=%d present_not_converted=%d",
+        "preserved diagnostics: records=%d malformed=%d present_not_converted=%d emit_ion_utc=%s",
         len(diagnostics.records),
         sum(diagnostics.malformed.values()),
         sum(diagnostics.present_not_converted.values()),
+        emit_ion_utc,
     )
+    if emit_ion_utc == "strict":
+        blocked = {
+            name: count
+            for name, count in diagnostics.present_not_converted.items()
+            if name.upper().startswith(("GPSION", "BDSION", "BD3ION", "GALION", "GPSUTC", "BDSUTC", "BD3UTC", "GALUTC"))
+        }
+        if blocked:
+            detail = ", ".join(f"{name}={count}" for name, count in sorted(blocked.items()))
+            raise ValueError(
+                "--emit-ion-utc strict requested, but no ION/UTC family currently has a verified "
+                f"RTKLIB-compatible RINEX NAV mapping: {detail}"
+            )
     message_stats = build_message_stats(
         records=records,
         stream=stream_diag,
@@ -384,8 +576,15 @@ def _extract_bundle(args: argparse.Namespace):
         rover_nav=rover_nav,
         extra={
             "bestnav": bestnav.as_dict(),
-            "diagnostics": diagnostics.as_dict(),
+            "diagnostics": {**diagnostics.as_dict(), "emit_ion_utc_policy": emit_ion_utc},
             "message_stats": message_stats.as_dict(),
+            "processing_window": {
+                "selected": window.as_dict(),
+                "original_solution_span": original_solution_span,
+                "original_observation_span": original_observation_span,
+                "effective_solution_span": effective_solution_span,
+                "effective_observation_span": effective_observation_span,
+            },
         },
     )
     analysis["warnings"] = list(dict.fromkeys([*analysis.get("warnings", []), *bestnav.warnings, *message_stats.warnings]))
@@ -619,6 +818,7 @@ def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base
         metavar="0..2",
         help="Pass rnx2rtkp -y LEVEL to write solution status details; 2 includes residuals.",
     )
+    _add_sbas_source_args(parser)
     _add_auto_sat_qc_args(parser)
 
 
@@ -1646,6 +1846,7 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
     ppp_cfg = config.get("ppp", {}) if isinstance(config.get("ppp", {}), dict) else {}
     diag_cfg = config.get("diagnostics", {}) if isinstance(config.get("diagnostics", {}), dict) else {}
     eph_cfg = config.get("ephemeris", {}) if isinstance(config.get("ephemeris", {}), dict) else {}
+    sbas_cfg = config.get("sbas", {}) if isinstance(config.get("sbas", {}), dict) else {}
 
     preset = args.nmea_preset or config.get("nmea_preset") or deep_get(config, "nmea", "preset", default="minimal")
     nmea = dict(NMEA_PRESETS[preset])
@@ -1746,6 +1947,12 @@ def _profile_from_args(args: argparse.Namespace) -> InitProfile:
         ion_period_s=float(ion_period) if ion_period is not None else None,
         utc_messages=_resolve_utc_messages(args, diag_cfg),
         utc_period_s=float(utc_period) if utc_period is not None else None,
+        sbas=(args.sbas or str(sbas_cfg.get("mode", "off"))).lower(),
+        sbas_timeout_s=(
+            int(args.sbas_timeout)
+            if args.sbas_timeout is not None
+            else (int(sbas_cfg["timeout"]) if "timeout" in sbas_cfg else None)
+        ),
         include_gpsion=False,
         save_config=bool(args.save_config or config.get("save_config", False)),
     )
@@ -1961,6 +2168,103 @@ def cmd_rinex(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_base_candidates(args: argparse.Namespace) -> int:
+    """Handle non-destructive base-station advisory."""
+
+    _configure_cli_logging(args)
+    rover, _, _, solutions, _, _, _, _, _ = _extract_bundle(args)
+    window = _processing_window_from_args(args)
+    if not solutions.solution_points:
+        raise ValueError("base-candidates requires live NMEA or BESTNAV solution points")
+    catalog_cache = Path(args.station_catalog_cache) if args.station_catalog_cache else default_station_catalog_cache()
+    catalog = load_station_catalog(
+        cache_path=catalog_cache,
+        source=args.station_catalog_source,
+        refresh=args.refresh_station_catalog,
+        curated_positions=CURATED_STATION_POSITIONS,
+    )
+    report = build_base_advisory_report(
+        solution_points=solutions.solution_points,
+        start=window.start,
+        end=window.end,
+        radius_km=args.radius_km,
+        max_candidates=args.max_candidates,
+        base_resolution=args.base_resolution,
+        allow_resolution_fallback=args.allow_resolution_fallback == "yes",
+        stations=_csv_items(args.stations) or None,
+        station_catalog=catalog,
+        probe_archives=args.probe_archives,
+        download_headers_only=args.download_headers_only,
+        refresh_probes=args.refresh_probes,
+        probe_cache_dir=Path(args.probe_cache_dir) if args.probe_cache_dir else None,
+        nav_source=args.nav_source,
+        require_nav=args.require_nav,
+        require_constellations=_csv_items(args.require_constellations),
+    )
+    rendered = format_base_advisory(report, args.format)
+    if args.out:
+        Path(args.out).write_text(rendered + "\n", encoding="utf-8")
+        logging.info("wrote base-candidate advisory: %s", args.out)
+    else:
+        print(rendered)
+    if args.analysis_json:
+        out_dir = ensure_out_dir(args.out_dir)
+        base = basename_for(rover, args.basename)
+        analysis_path = out_dir / f"{base}.base-candidates.json"
+        write_analysis_json(analysis_path, report.as_dict())
+        logging.info("wrote base-candidate JSON: %s", analysis_path)
+    return 0
+
+
+def cmd_optimize_settings(args: argparse.Namespace) -> int:
+    """Handle bounded RTKLIB settings/base optimisation planning."""
+
+    _configure_cli_logging(args)
+    window = _processing_window_from_args(args)
+    bases = _csv_items(args.bases)
+    if args.base:
+        bases.insert(0, args.base)
+    if args.base_list:
+        bases.extend(load_base_list(Path(args.base_list)))
+    if args.base_candidates_json:
+        bases.extend(load_bases_from_candidates(Path(args.base_candidates_json), top_bases=args.top_bases))
+    bases = list(dict.fromkeys(base for base in bases if base))
+    sample_duration_s = parse_duration_seconds(args.sample_duration)
+    plan = build_optimizer_plan(
+        rover_files=[Path(path) for path in args.rover_log],
+        config=Path(args.config) if args.config else None,
+        bases=bases,
+        base_resolution=args.base_resolution,
+        nav_source=args.nav_source,
+        sbas_source=args.sbas_source,
+        emit_ion_utc=args.emit_ion_utc,
+        window=window,
+        sample_count=args.sample_count,
+        sample_duration_s=sample_duration_s,
+        max_variants=args.max_variants,
+        max_runs=args.max_runs,
+        dry_run=not args.execute,
+    )
+    if args.execute:
+        plan = execute_optimizer_plan(
+            plan,
+            out_dir=ensure_out_dir(args.out_dir) if args.out_dir else Path("optimizer-out"),
+            keep_intermediate=args.keep_intermediate == "yes",
+        )
+    rendered = format_optimizer_plan(plan, args.format)
+    if args.out:
+        Path(args.out).write_text(rendered + "\n", encoding="utf-8")
+        logging.info("wrote optimizer plan: %s", args.out)
+    else:
+        print(rendered)
+    if args.analysis_json:
+        out_dir = ensure_out_dir(args.out_dir)
+        analysis_path = out_dir / "optimizer-plan.json"
+        write_analysis_json(analysis_path, plan.as_dict())
+        logging.info("wrote optimizer JSON: %s", analysis_path)
+    return 0
+
+
 def _time_window_from_solutions(args: argparse.Namespace, margin_s: int):
     rover, _, _, solutions, _, _, _, _, _ = _extract_bundle(args)
     if not solutions.solution_points:
@@ -2057,6 +2361,155 @@ def _convert_base_rtcm_if_requested(args: argparse.Namespace, out_dir: Path, bas
     return [obs], nav_files
 
 
+def _expand_nav_inputs(files: list[str] | None, patterns: list[str] | None) -> list[Path]:
+    """Return explicit files plus glob-expanded NAV input paths."""
+
+    paths = [Path(path) for path in files or []]
+    for pattern in patterns or []:
+        matches = sorted(glob(pattern))
+        if not matches:
+            logging.warning("NAV glob matched no files: %s", pattern)
+        paths.extend(Path(match) for match in matches)
+    return _dedupe_paths(paths)
+
+
+def _nav_source_for_resolver(args: argparse.Namespace) -> str:
+    """Map CLI NAV source aliases onto resolver policy names."""
+
+    source = getattr(args, "nav_source", "auto")
+    if source in {"auto-prefer-base", "merge"}:
+        return "auto"
+    return source
+
+
+def _nav_merge_for_resolver(args: argparse.Namespace) -> str:
+    """Return NAV merge policy, applying the legacy `--nav-source merge` alias."""
+
+    if getattr(args, "nav_source", "auto") == "merge":
+        return "best-per-system"
+    return getattr(args, "nav_merge", "best-per-system")
+
+
+def _log_nav_resolution(resolution, *, source: str, merge: str) -> None:
+    """Log concise NAV source and rover/base usability diagnostics."""
+
+    logging.info(
+        "NAV source policy: source=%s merge=%s priority=explicit>base>rover>external",
+        source,
+        merge,
+    )
+    for candidate in getattr(resolution, "candidates", []):
+        logging.debug(
+            "candidate NAV: role=%s path=%s systems=%s usable=%s notes=%s",
+            getattr(candidate, "role", getattr(candidate, "source", "unknown")),
+            candidate.path,
+            ",".join(sorted(getattr(candidate, "systems", set()))) or "none",
+            getattr(candidate, "usable", "unknown"),
+            "; ".join(getattr(candidate, "notes", [])) or "none",
+        )
+    for candidate in getattr(resolution, "selected", []):
+        logging.info(
+            "selected NAV: role=%s path=%s systems=%s",
+            getattr(candidate, "role", getattr(candidate, "source", "unknown")),
+            candidate.path,
+            ",".join(sorted(getattr(candidate, "systems", set()))) or "none",
+        )
+    rover_obs_systems = getattr(resolution, "rover_obs_systems", set())
+    base_obs_systems = getattr(resolution, "base_obs_systems", set())
+    if rover_obs_systems or base_obs_systems:
+        logging.info(
+            "NAV usability: rover_obs_systems=%s base_obs_systems=%s usable_rtk_systems=%s not_useful=%s",
+            ",".join(sorted(rover_obs_systems)) or "unknown",
+            ",".join(sorted(base_obs_systems)) or "unknown",
+            ",".join(sorted(getattr(resolution, "usable_rtk_systems", set()))) or "none",
+            ",".join(sorted(getattr(resolution, "nav_systems_not_useful", set()))) or "none",
+        )
+
+
+def _file_inventory(path: Path) -> dict[str, object]:
+    """Return local file metadata for RTKLIB input inventory."""
+
+    exists = path.exists()
+    return {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": path.stat().st_size if exists else None,
+        "kind": classify_rinex_file(path) if exists else "missing",
+    }
+
+
+def _rtklib_input_inventory(
+    *,
+    rover_obs: Path,
+    base_obs: list[Path],
+    nav_files: list[Path],
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    """Build a reproducible RTKLIB input inventory."""
+
+    return {
+        "rover_obs": _file_inventory(rover_obs),
+        "base_obs": [_file_inventory(path) for path in base_obs],
+        "nav_sbas_inputs": [_file_inventory(path) for path in nav_files],
+        "nav_source": getattr(args, "nav_source", "auto"),
+        "nav_merge": getattr(args, "nav_merge", "best-per-system"),
+        "sbas_source": getattr(args, "sbas_source", "auto"),
+        "emit_ion_utc": getattr(args, "emit_ion_utc", "off"),
+        "processing_window": _processing_window_from_args(args).as_dict(),
+        "rtkconf": getattr(args, "rtkconf", None),
+        "output_format": getattr(args, "output_format", None),
+    }
+
+
+def _log_rtklib_input_inventory(inventory: dict[str, object]) -> None:
+    """Log a concise RTKLIB input inventory."""
+
+    rover = inventory["rover_obs"]  # type: ignore[index]
+    logging.info(
+        "RTKLIB input rover_obs: %s kind=%s size=%s",
+        rover["path"],  # type: ignore[index]
+        rover["kind"],  # type: ignore[index]
+        rover["size_bytes"],  # type: ignore[index]
+    )
+    for item in inventory["base_obs"]:  # type: ignore[index]
+        logging.info(
+            "RTKLIB input base_obs: %s kind=%s size=%s",
+            item["path"],
+            item["kind"],
+            item["size_bytes"],
+        )
+    for item in inventory["nav_sbas_inputs"]:  # type: ignore[index]
+        logging.info(
+            "RTKLIB input nav_sbas: %s kind=%s size=%s",
+            item["path"],
+            item["kind"],
+            item["size_bytes"],
+        )
+    logging.info(
+        "RTKLIB source modes: nav_source=%s nav_merge=%s sbas_source=%s emit_ion_utc=%s",
+        inventory["nav_source"],
+        inventory["nav_merge"],
+        inventory["sbas_source"],
+        inventory["emit_ion_utc"],
+    )
+
+
+def _write_rtklib_inventory_analysis(out_dir: Path, basename: str, inventory: dict[str, object]) -> None:
+    """Merge RTKLIB inventory into existing analysis JSON when present."""
+
+    analysis_path = out_dir / f"{basename}.analysis.json"
+    if not analysis_path.exists():
+        return
+    try:
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logging.warning("could not update analysis JSON with RTKLIB inventory: %s", analysis_path)
+        return
+    analysis["rtklib_inventory"] = inventory
+    write_analysis_json(analysis_path, analysis)
+    logging.info("updated analysis JSON with RTKLIB inventory: %s", analysis_path)
+
+
 def cmd_postprocess(args: argparse.Namespace) -> int:
     """Handle `postprocess`.
 
@@ -2087,13 +2540,23 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     if not base_obs:
         raise ValueError("--base-obs or --base-rtcm is required for postprocess")
     logging.info("resolving navigation inputs for RTKLIB")
+    explicit_nav = _expand_nav_inputs(getattr(args, "nav_file", None), getattr(args, "nav_glob", None))
+    base_nav = _expand_nav_inputs(getattr(args, "base_nav_file", None), getattr(args, "base_nav_glob", None))
+    manual_rover_nav = _expand_nav_inputs(getattr(args, "rover_nav_file", None), getattr(args, "rover_nav_glob", None))
+    rover_nav = _dedupe_paths([*manual_rover_nav, *rover_nav])
+    nav_source = _nav_source_for_resolver(args)
+    nav_merge = _nav_merge_for_resolver(args)
     nav_resolution = resolve_nav_sources(
-        explicit=args.nav_file,
+        explicit=explicit_nav,
+        base=base_nav,
         base_rtcm=base_rtcm_nav,
         rover=rover_nav,
-        observed_systems=set(),
-        merge_policy=args.nav_merge,
+        rover_obs_systems=detect_rinex_obs_systems(rover_obs),
+        base_obs_systems=set().union(*(detect_rinex_obs_systems(path) for path in base_obs)),
+        nav_source=nav_source,
+        merge_policy=nav_merge,
     )
+    _log_nav_resolution(nav_resolution, source=getattr(args, "nav_source", "auto"), merge=nav_merge)
     if not nav_resolution.selected:
         raise ValueError(nav_resolution.warnings[0])
     rnx2rtkp = resolve_rtklib_tool(args.rnx2rtkp, rtklib_dir=args.rtklib_dir)
@@ -2107,6 +2570,9 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
+    nav_files = _apply_sbas_source_policy(args, _dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav))
+    inventory = _rtklib_input_inventory(rover_obs=rover_obs, base_obs=base_obs, nav_files=nav_files, args=args)
+    _log_rtklib_input_inventory(inventory)
     commands = _run_rtklib_output_formats(
         args=args,
         rnx2rtkp=rnx2rtkp,
@@ -2114,7 +2580,7 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
         basename=base,
         rover_obs=rover_obs,
         base_obs=base_obs,
-        nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav),
+        nav_files=nav_files,
         base_obs_arg=base_obs_arg,
         base_ecef=base_ecef,
         base_llh=base_llh,
@@ -2166,7 +2632,17 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
                 args.time_margin,
             )
             base_obs.extend(_download_base_files_for_window(args, rover_span.start - margin, rover_span.end + margin))
-    should_run_rtklib = bool(args.run_rtklib or args.rtkconf or args.nav_file or base_obs)
+    should_run_rtklib = bool(
+        args.run_rtklib
+        or args.rtkconf
+        or getattr(args, "nav_file", None)
+        or getattr(args, "nav_glob", None)
+        or getattr(args, "base_nav_file", None)
+        or getattr(args, "base_nav_glob", None)
+        or getattr(args, "rover_nav_file", None)
+        or getattr(args, "rover_nav_glob", None)
+        or base_obs
+    )
     if not should_run_rtklib:
         logging.warning(
             "pipeline generated extraction/RINEX products but did not run RTKLIB. "
@@ -2184,13 +2660,23 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     _log_rover_base_capability_report(rover_obs, base_obs)
     generated_rover_nav = rover_nav_files(out_dir / f"{base}.rover-gps.nav")
     logging.info("found %d generated rover navigation sidecar files", len(generated_rover_nav))
+    explicit_nav = _expand_nav_inputs(getattr(args, "nav_file", None), getattr(args, "nav_glob", None))
+    base_nav = _expand_nav_inputs(getattr(args, "base_nav_file", None), getattr(args, "base_nav_glob", None))
+    manual_rover_nav = _expand_nav_inputs(getattr(args, "rover_nav_file", None), getattr(args, "rover_nav_glob", None))
+    rover_nav = _dedupe_paths([*manual_rover_nav, *generated_rover_nav])
+    nav_source = _nav_source_for_resolver(args)
+    nav_merge = _nav_merge_for_resolver(args)
     nav_resolution = resolve_nav_sources(
-        explicit=args.nav_file,
+        explicit=explicit_nav,
+        base=base_nav,
         base_rtcm=base_rtcm_nav,
-        rover=generated_rover_nav,
-        observed_systems=set(),
-        merge_policy=args.nav_merge,
+        rover=rover_nav,
+        rover_obs_systems=detect_rinex_obs_systems(rover_obs),
+        base_obs_systems=set().union(*(detect_rinex_obs_systems(path) for path in base_obs)),
+        nav_source=nav_source,
+        merge_policy=nav_merge,
     )
+    _log_nav_resolution(nav_resolution, source=getattr(args, "nav_source", "auto"), merge=nav_merge)
     for warning in nav_resolution.warnings:
         logging.warning("%s", warning)
     if not nav_resolution.selected:
@@ -2200,6 +2686,14 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     logging.info("resolving base position")
     base_ecef, base_llh = _resolve_base_position(args, base_obs=base_obs)
     base_obs_arg = _prepare_rtklib_base_obs_argument(base_obs, out_dir, base)
+    nav_files = _apply_sbas_source_policy(
+        args,
+        _dedupe_paths([candidate.path for candidate in nav_resolution.selected] + rover_nav),
+    )
+    inventory = _rtklib_input_inventory(rover_obs=rover_obs, base_obs=base_obs, nav_files=nav_files, args=args)
+    _log_rtklib_input_inventory(inventory)
+    if getattr(args, "analysis_json", False):
+        _write_rtklib_inventory_analysis(out_dir, base, inventory)
     commands = _run_rtklib_output_formats(
         args=args,
         rnx2rtkp=rnx2rtkp,
@@ -2207,7 +2701,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         basename=base,
         rover_obs=rover_obs,
         base_obs=base_obs,
-        nav_files=_dedupe_paths([candidate.path for candidate in nav_resolution.selected] + generated_rover_nav),
+        nav_files=nav_files,
         base_obs_arg=base_obs_arg,
         base_ecef=base_ecef,
         base_llh=base_llh,
@@ -2226,6 +2720,53 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
             unique.append(path)
             seen.add(key)
     return unique
+
+
+def _is_sbs_path(path: Path) -> bool:
+    """Return true when `path` appears to be an RTKLIB SBAS sidecar."""
+
+    if path.suffix.lower() == ".sbs":
+        return True
+    return path.exists() and classify_rinex_file(path) == "sbs"
+
+
+def _apply_sbas_source_policy(args: argparse.Namespace, nav_files: list[Path]) -> list[Path]:
+    """Filter/add RTKLIB SBAS correction sidecars according to CLI policy."""
+
+    policy = getattr(args, "sbas_source", "auto")
+    explicit = [Path(path) for path in getattr(args, "sbas_file", None) or []]
+    non_sbs = [path for path in nav_files if not _is_sbs_path(path)]
+    discovered = [path for path in nav_files if _is_sbs_path(path)]
+
+    if policy == "off":
+        if discovered or explicit:
+            logging.info(
+                "SBAS correction source disabled; not passing %d .sbs file(s) to RTKLIB",
+                len(discovered) + len(explicit),
+            )
+        return non_sbs
+    if policy == "external":
+        if not explicit:
+            raise ValueError("--sbas-source external requires --sbas-file")
+        logging.info("SBAS correction source=external files=%s", ",".join(str(path) for path in explicit))
+        return _dedupe_paths([*non_sbs, *explicit])
+    if policy == "rover":
+        if not discovered:
+            raise ValueError("--sbas-source rover requested, but no rover-derived .sbs sidecar was generated")
+        logging.info("SBAS correction source=rover files=%s", ",".join(str(path) for path in discovered))
+        return _dedupe_paths([*non_sbs, *discovered])
+    if policy == "base":
+        raise ValueError("--sbas-source base is not implemented; provide --sbas-file or use --sbas-source auto/off")
+    if policy != "auto":
+        raise ValueError(f"unsupported SBAS source policy: {policy}")
+    if explicit:
+        logging.info("SBAS correction source=external files=%s", ",".join(str(path) for path in explicit))
+        return _dedupe_paths([*non_sbs, *explicit])
+    if discovered:
+        logging.info("SBAS correction source=rover files=%s", ",".join(str(path) for path in discovered))
+        return _dedupe_paths([*non_sbs, *discovered])
+    logging.info("SBAS correction source=auto: no valid .sbs sidecar available; RTKLIB will run without SBAS corrections")
+    return non_sbs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2306,6 +2847,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also repeat selected UTC/time-system messages every N seconds, e.g. 300.",
     )
     gen.add_argument("--include-utc", action="store_true", help="Enable all UTC/time-system families.")
+    gen.add_argument(
+        "--sbas",
+        choices=sorted(SBAS_MODES),
+        help="Explicit SBAS receiver mode for generated init commands; default is off unless configured.",
+    )
+    gen.add_argument(
+        "--sbas-timeout",
+        type=int,
+        help="Generate CONFIG SBAS TIMEOUT seconds; UM980 accepts 0 or 120..1800 on supported firmware.",
+    )
     gen.add_argument("--save-config", action="store_true")
     gen.add_argument("--no-save-config", action="store_true")
     gen.add_argument("--strict-bitrate", action="store_true")
@@ -2319,6 +2870,8 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name)
         p.add_argument("rover_log")
         _add_common(p)
+        _add_time_window_args(p)
+        _add_emit_ion_utc_arg(p)
         if name in {"extract", "rinex"}:
             p.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
             p.add_argument(
@@ -2339,9 +2892,73 @@ def build_parser() -> argparse.ArgumentParser:
                 _add_bestnav_nmea_args(p)
         p.set_defaults(func=func)
 
+    base_candidates = sub.add_parser("base-candidates")
+    base_candidates.add_argument("rover_log")
+    base_candidates.add_argument("--network", choices=["euref"], default="euref")
+    base_candidates.add_argument("--radius-km", type=float, default=150.0)
+    base_candidates.add_argument("--max-candidates", type=int, default=10)
+    base_candidates.add_argument("--stations", help="Optional comma-separated station aliases/markers to evaluate.")
+    base_candidates.add_argument("--base-resolution", choices=["low", "high", "auto"], default="auto")
+    base_candidates.add_argument("--allow-resolution-fallback", choices=["yes", "no"], default="yes")
+    base_candidates.add_argument("--nav-source", choices=["rover", "base", "auto-prefer-base", "merge"], default="auto-prefer-base")
+    base_candidates.add_argument("--require-constellations", help="Comma-separated required rover/base constellations for advisory scoring.")
+    base_candidates.add_argument("--require-nav", action="store_true", help="Penalise candidates when requested NAV source is not known to be available.")
+    base_candidates.add_argument("--format", choices=["table", "markdown", "json"], default="table")
+    base_candidates.add_argument("--out")
+    base_candidates.add_argument("--refresh-station-catalog", action="store_true", help="Refresh the cached official EPN SSC station catalogue.")
+    base_candidates.add_argument("--station-catalog-source", choices=["auto", "cache", "epn-latest", "curated"], default="auto")
+    base_candidates.add_argument("--station-catalog-cache", help="Station catalogue JSON cache path.")
+    base_candidates.add_argument("--probe-archives", action="store_true", help="Probe planned archive URLs with lightweight HEAD requests.")
+    base_candidates.add_argument("--download-headers-only", action="store_true", help="Probe mode placeholder: do not download full observation bodies.")
+    base_candidates.add_argument("--refresh-probes", action="store_true", help="Ignore cached archive probe results.")
+    base_candidates.add_argument("--probe-cache-dir", help="Archive probe cache directory.")
+    _add_track_source_arg(base_candidates)
+    _add_bestnav_nmea_args(base_candidates)
+    _add_time_window_args(base_candidates)
+    _add_emit_ion_utc_arg(base_candidates)
+    _add_common(base_candidates)
+    base_candidates.set_defaults(
+        func=cmd_base_candidates,
+        solution="none",
+        position_nmea="none",
+        obs_csv=False,
+        raw_output="none",
+        rinex_version="3.04",
+        rinex_compat="native",
+    )
+
+    opt = sub.add_parser("optimize-settings")
+    opt.add_argument("rover_log", nargs="+")
+    opt.add_argument("--base", help="Primary base station or base file for the baseline variant.")
+    opt.add_argument("--bases", help="Comma-separated base stations/files to compare.")
+    opt.add_argument("--base-list", help="Small CSV/text file with one base station/file per line.")
+    opt.add_argument("--base-candidates-json", help="Consume base-candidates JSON and add its top ranked stations.")
+    opt.add_argument("--top-bases", type=int, default=3)
+    opt.add_argument("--base-resolution", choices=["low", "high", "auto"], default="auto")
+    opt.add_argument("--allow-resolution-fallback", choices=["yes", "no"], default="yes")
+    opt.add_argument(
+        "--nav-source",
+        choices=["rover", "base", "auto-prefer-base", "merge", "auto", "explicit", "external", "none"],
+        default="auto-prefer-base",
+    )
+    opt.add_argument("--sbas-source", choices=["off", "rover", "base", "external", "auto"], default="auto")
+    _add_emit_ion_utc_arg(opt)
+    _add_time_window_args(opt)
+    opt.add_argument("--sample-count", type=int, default=4)
+    opt.add_argument("--sample-duration", default="120s", help="Sample duration such as 120s, 5m, or 1h.")
+    opt.add_argument("--max-variants", type=int, default=6)
+    opt.add_argument("--max-runs", type=int, default=24)
+    opt.add_argument("--format", choices=["table", "markdown", "json"], default="table")
+    opt.add_argument("--out")
+    opt.add_argument("--execute", action="store_true", help="Execute the bounded plan. Default is dry-run planning only.")
+    opt.add_argument("--keep-intermediate", choices=["yes", "no"], default="no")
+    _add_common(opt)
+    opt.set_defaults(func=cmd_optimize_settings)
+
     dl = sub.add_parser("download-base")
     dl.add_argument("rover_log")
     _add_base_download_args(dl, require_station=True)
+    _add_time_window_args(dl)
     _add_common(dl)
     dl.set_defaults(func=cmd_download_base)
 
@@ -2373,12 +2990,22 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--rover-obs", required=True)
     post.add_argument("--nav-file", action="append")
     post.add_argument("--nav-glob", action="append")
+    post.add_argument("--base-nav-file", action="append")
+    post.add_argument("--base-nav-glob", action="append")
+    post.add_argument("--rover-nav-file", action="append")
+    post.add_argument("--rover-nav-glob", action="append")
+    post.add_argument(
+        "--nav-source",
+        choices=["auto", "explicit", "base", "rover", "external", "none", "auto-prefer-base", "merge"],
+        default="auto",
+        help="NAV source policy. auto prefers explicit, then base, rover, external. auto-prefer-base is an alias for auto; merge selects best-per-system.",
+    )
     post.add_argument("--nav-provider", choices=["auto", "custom", "none"], default="auto")
     post.add_argument("--download-nav", action="store_true")
     post.add_argument("--no-download-nav", action="store_true")
     post.add_argument("--use-rover-nav", action="store_true")
     post.add_argument("--no-use-rover-nav", action="store_true")
-    post.add_argument("--nav-merge", choices=["best-per-system", "all"], default="best-per-system")
+    post.add_argument("--nav-merge", choices=["off", "best-per-system", "all"], default="best-per-system")
     _add_rtklib_processing_args(post, require_base_obs=False)
     _add_base_position_args(post)
     _add_common(post)
@@ -2393,7 +3020,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recorded real-time base RTCM3 stream; converted with convbin and used as the RTKLIB base observation input.",
     )
     pipe.add_argument("--nav-file", action="append")
-    pipe.add_argument("--nav-merge", choices=["best-per-system", "all"], default="best-per-system")
+    pipe.add_argument("--nav-glob", action="append")
+    pipe.add_argument("--base-nav-file", action="append")
+    pipe.add_argument("--base-nav-glob", action="append")
+    pipe.add_argument("--rover-nav-file", action="append")
+    pipe.add_argument("--rover-nav-glob", action="append")
+    pipe.add_argument(
+        "--nav-source",
+        choices=["auto", "explicit", "base", "rover", "external", "none", "auto-prefer-base", "merge"],
+        default="auto",
+        help="NAV source policy. auto prefers explicit, then base, rover, external. auto-prefer-base is an alias for auto; merge selects best-per-system.",
+    )
+    pipe.add_argument("--nav-merge", choices=["off", "best-per-system", "all"], default="best-per-system")
     pipe.add_argument("--run-rtklib", action="store_true")
     pipe.add_argument("--rtklib-dir")
     pipe.add_argument("--rnx2rtkp", default="rnx2rtkp")
@@ -2450,6 +3088,9 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="all")
     pipe.add_argument("--rinex-version", default="3.04")
     pipe.add_argument("--rinex-compat", choices=["native", "convbin"], default="convbin")
+    _add_time_window_args(pipe)
+    _add_emit_ion_utc_arg(pipe)
+    _add_sbas_source_args(pipe)
     _add_bestnav_nmea_args(pipe)
     _add_base_download_args(pipe, require_station=False, include_rtklib_dir=False)
     _add_base_position_args(pipe)

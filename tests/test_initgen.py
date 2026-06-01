@@ -167,6 +167,31 @@ def test_bestnav_and_utc_messages_are_rendered_with_selected_format():
     assert estimate.nmea_bytes_per_s > 0
 
 
+def test_sbas_config_commands_are_rendered():
+    profile = InitProfile(sbas="egnos", sbas_timeout_s=600)
+    script, _ = render_init_script(profile)
+    assert "CONFIG SBAS ENABLE EGNOS" in script
+    assert "CONFIG SBAS TIMEOUT 600" in script
+
+
+def test_sbas_off_is_explicit_default():
+    script, _ = render_init_script(InitProfile())
+    assert "CONFIG SBAS DISABLE" in script
+
+
+def test_cli_sbas_options_set_profile():
+    parser = cli.build_parser()
+    args = parser.parse_args(["init", "generate", "--sbas", "egnos", "--sbas-timeout", "600"])
+    profile = cli._profile_from_args(args)
+    assert profile.sbas == "egnos"
+    assert profile.sbas_timeout_s == 600
+
+
+def test_invalid_sbas_timeout_fails():
+    with pytest.raises(ValueError, match="SBAS timeout"):
+        render_init_script(InitProfile(sbas="auto", sbas_timeout_s=30))
+
+
 def test_invalid_ion_period_fails():
     with pytest.raises(ValueError, match="ionosphere repeat period"):
         render_init_script(InitProfile(ion_messages=("gps",), ion_period_s=0))

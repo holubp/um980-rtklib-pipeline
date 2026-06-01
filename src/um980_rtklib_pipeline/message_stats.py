@@ -32,8 +32,12 @@ class MessageStats:
     bestnav_records: Counter[str] = field(default_factory=Counter)
     bestnav_valid_epochs: int = 0
     raw_observation_records: Counter[str] = field(default_factory=Counter)
+    raw_observation_skipped: Counter[str] = field(default_factory=Counter)
+    raw_observation_time_unknown_reasons: Counter[str] = field(default_factory=Counter)
     raw_observation_epochs: int = 0
     raw_observations: int = 0
+    sbas_observation_count: int = 0
+    sbas_observation_codes: Counter[str] = field(default_factory=Counter)
     ephemeris_records: Counter[str] = field(default_factory=Counter)
     ephemeris_converted: Counter[str] = field(default_factory=Counter)
     ephemeris_unsupported: Counter[str] = field(default_factory=Counter)
@@ -60,6 +64,7 @@ class MessageStats:
                 "nmea": sum(self.nmea_records.values()),
                 "unicore_ascii": sum(self.unicore_ascii_records.values()),
                 "unicore_binary": sum(self.unicore_binary_records.values()),
+                "checksum_failures": dict(self.checksum_failures),
             },
             "nmea_records": dict(self.nmea_records),
             "unicore_ascii_records": dict(self.unicore_ascii_records),
@@ -71,8 +76,21 @@ class MessageStats:
             },
             "raw_observations": {
                 "records": dict(self.raw_observation_records),
+                "skipped_non_observation_records": dict(self.raw_observation_skipped),
                 "epochs": self.raw_observation_epochs,
                 "observations": self.raw_observations,
+                "unsupported": dict(self.unsupported_records),
+                "time_unknown_reasons": dict(self.raw_observation_time_unknown_reasons),
+            },
+            "sbas": {
+                "observations_present": self.sbas_observation_count > 0,
+                "observation_count": self.sbas_observation_count,
+                "observation_codes": dict(self.sbas_observation_codes),
+                "correction_messages": {
+                    "present": self.ephemeris_records.get("SBSMSG", 0),
+                    "converted": self.ephemeris_converted.get("SBSMSG", 0),
+                    "sidecar_status": "written" if self.ephemeris_converted.get("SBSMSG", 0) else "not_written",
+                },
             },
             "ephemerides": {
                 "records": dict(self.ephemeris_records),
@@ -138,17 +156,32 @@ def build_message_stats(
     stats.malformed_records.update(bestnav.malformed)
     stats.raw_observation_epochs = int(observations.metrics.get("epochs", 0) or 0)
     stats.raw_observations = int(observations.metrics.get("observations", 0) or 0)
+    stats.raw_observation_skipped.update(observations.skipped_records)
+    stats.raw_observation_time_unknown_reasons.update(observations.time_unknown_reasons)
     stats.unsupported_records.update(observations.unsupported_records)
+    by_constellation = observations.metrics.get("rinex_observation_codes_by_constellation", {})
+    if isinstance(by_constellation, dict):
+        sbas_codes = by_constellation.get("SBAS", {})
+        if isinstance(sbas_codes, dict):
+            stats.sbas_observation_codes.update({str(key): int(value) for key, value in sbas_codes.items()})
+            stats.sbas_observation_count = sum(stats.sbas_observation_codes.values())
     stats.ephemeris_records.update(rover_nav.found)
     stats.ephemeris_converted.update(rover_nav.converted)
-    for message, found in rover_nav.found.items():
-        converted = rover_nav.converted.get(message, 0)
-        if found > converted:
-            stats.ephemeris_unsupported[message] += found - converted
+    stats.malformed_records.update(getattr(rover_nav, "malformed", {}))
+    rover_nav_unsupported = getattr(rover_nav, "unsupported", {})
+    if rover_nav_unsupported:
+        stats.ephemeris_unsupported.update(rover_nav_unsupported)
+    else:
+        for message, found in rover_nav.found.items():
+            converted = rover_nav.converted.get(message, 0)
+            malformed = getattr(rover_nav, "malformed", {}).get(message, 0)
+            if found > converted + malformed:
+                stats.ephemeris_unsupported[message] += found - converted - malformed
     stats.ionosphere_present_not_converted.update(stats.ionosphere_records)
     stats.utc_present_not_converted.update(stats.utc_records)
     stats.malformed_records["nmea_checksum"] += stream.invalid_nmea_records
     stats.malformed_records["unicore_binary_frame"] += stream.invalid_unicore_binary_records
+    stats.malformed_records["unicore_ascii_frame"] += getattr(stream, "invalid_unicore_ascii_records", 0)
 
     if stats.ionosphere_records:
         stats.warnings.append(

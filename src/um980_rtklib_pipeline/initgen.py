@@ -92,6 +92,7 @@ UTC_MESSAGES: dict[str, dict[str, str]] = {
     "bd3": {"ascii": "BD3UTCA", "binary": "BD3UTCB"},
     "gal": {"ascii": "GALUTCA", "binary": "GALUTCB"},
 }
+SBAS_MODES = {"off", "auto", "egnos", "waas", "msas", "gagan", "sdcm", "kass", "bds", "asecna", "span"}
 DEFAULT_PPP_TIMEOUT_S = 120
 DEFAULT_PPP_CONVERGE = (15, 30)
 DEBUG_ASCII_EPHEMERIS_SYSTEMS = ("gps", "glo", "gal", "bds", "bd3", "qzss")
@@ -148,6 +149,11 @@ class InitProfile:
             interval.
         utc_period_s: Optional periodic repeat interval in seconds for selected
             UTC/time-system parameter families.
+        sbas: SBAS receiver mode. `off` emits `CONFIG SBAS DISABLE`; other
+            values emit `CONFIG SBAS ENABLE <MODE>`.
+        sbas_timeout_s: Optional SBAS timeout in seconds. The UM980 command
+            accepts `0` to disable SBAS, or 120..1800 seconds on supported
+            firmware.
         include_gpsion: Backwards-compatible shortcut for adding `gps` to
             `ion_messages`.
         save_config: Append `SAVECONFIG`.
@@ -178,6 +184,8 @@ class InitProfile:
     ion_period_s: float | None = None
     utc_messages: tuple[str, ...] = ()
     utc_period_s: float | None = None
+    sbas: str = "off"
+    sbas_timeout_s: int | None = None
     include_gpsion: bool = False
     save_config: bool = False
 
@@ -420,6 +428,12 @@ def validate_profile(profile: InitProfile) -> None:
         raise ValueError(f"unsupported UTC/time-system message families: {', '.join(invalid_utc)}")
     if profile.utc_period_s is not None and profile.utc_period_s <= 0:
         raise ValueError("UTC/time-system repeat period must be greater than zero seconds")
+    if profile.sbas not in SBAS_MODES:
+        raise ValueError(f"unsupported SBAS mode: {profile.sbas}")
+    if profile.sbas_timeout_s is not None and (
+        profile.sbas_timeout_s < 0 or (0 < profile.sbas_timeout_s < 120) or profile.sbas_timeout_s > 1800
+    ):
+        raise ValueError("SBAS timeout must be 0 or in the 120..1800 second range")
 
 
 def render_init_script(
@@ -499,6 +513,14 @@ def render_init_script(
         )
     else:
         lines.append("MODE ROVER")
+    lines.append("")
+
+    if profile.sbas == "off":
+        lines.append("CONFIG SBAS DISABLE")
+    else:
+        lines.append(f"CONFIG SBAS ENABLE {profile.sbas.upper()}")
+    if profile.sbas_timeout_s is not None:
+        lines.append(f"CONFIG SBAS TIMEOUT {profile.sbas_timeout_s:g}")
     lines.append("")
 
     bestnav_message = _bestnav_message_name(profile)
@@ -583,6 +605,8 @@ def write_json_report(path: Path, profile: InitProfile, estimate: BitrateEstimat
             "ion_period_s": profile.ion_period_s,
             "utc_messages": list(profile.utc_messages),
             "utc_period_s": profile.utc_period_s,
+            "sbas": profile.sbas,
+            "sbas_timeout_s": profile.sbas_timeout_s,
         },
         "estimated_payload": estimate.as_dict(),
         "format_comparison_at_requested_rate": {
