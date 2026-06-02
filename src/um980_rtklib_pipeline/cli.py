@@ -2013,7 +2013,11 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
     trace_summary = _trace_summary_for_quality(args, commands or [])
     cleanup = {
         "trace_cleanup_requested": getattr(args, "quality_trace", "off") == "temporary",
-        "trace_deleted": bool(trace_summary and trace_summary.get("generated_temporarily") and not trace_summary.get("retained")),
+        "trace_deleted": bool(trace_summary and trace_summary.get("trace_deleted")),
+        "trace_cleanup_attempted_paths": trace_summary.get("trace_cleanup_attempted_paths", []) if isinstance(trace_summary, dict) else [],
+        "trace_cleanup_deleted_paths": trace_summary.get("trace_cleanup_deleted_paths", []) if isinstance(trace_summary, dict) else [],
+        "trace_cleanup_failed_paths": trace_summary.get("trace_cleanup_failed_paths", {}) if isinstance(trace_summary, dict) else {},
+        "trace_cleanup_skipped_paths": trace_summary.get("trace_cleanup_skipped_paths", {}) if isinstance(trace_summary, dict) else {},
         "stat_cleanup_requested": bool(getattr(args, "quality_clean_stat", False)),
         "stat_files_deleted": [],
         "stat_files_kept": [str(stat)] if stat else [],

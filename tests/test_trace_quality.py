@@ -69,16 +69,23 @@ def test_trace_parser_streams_and_counts_events(tmp_path: Path):
 def test_trace_parser_reads_full_file_by_default_and_marks_caps(tmp_path: Path):
     trace = tmp_path / "large.trace"
     trace.write_text("".join("resamb: ratio=3.2\n" for _ in range(1200)), encoding="ascii")
+    crlf_trace = tmp_path / "crlf.trace"
+    crlf_trace.write_bytes(b"resamb: ratio=3.2\r\n" * 10)
 
     full = analyze_rtklib_trace(trace)
     capped = analyze_rtklib_trace(trace, max_bytes=100)
+    crlf = analyze_rtklib_trace(crlf_trace)
 
     assert full["trace_lines_read"] == 1200
     assert full["trace_truncated"] is False
     assert full["trace_bytes_read"] == full["trace_file_size_bytes"]
+    assert full["trace_raw_bytes_read"] == full["trace_file_size_bytes"]
+    assert full["trace_decoded_chars_read"] == full["trace_file_size_bytes"]
     assert full["trace_parse_elapsed_s"] >= 0.0
     assert capped["trace_truncated"] is True
     assert capped["trace_bytes_read"] <= 100
+    assert crlf["trace_raw_bytes_read"] == crlf_trace.stat().st_size
+    assert crlf["trace_lines_read"] == 10
 
 
 def test_trace_parser_ignores_unknown_and_malformed_lines(tmp_path: Path):
@@ -129,6 +136,100 @@ def test_traced_rnx2rtkp_adds_trace_level_and_uses_temp_cwd(tmp_path: Path, monk
     assert not Path(seen["cwd"]).exists()
 
 
+def test_temporary_trace_prefers_solution_default_over_temp_cwd_and_deletes_it(tmp_path: Path, monkeypatch):
+    rover, base, nav, conf, output = _minimal_inputs(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["cwd"] = kwargs["cwd"]
+        Path(kwargs["cwd"], "rnx2rtkp.trace").write_text("cycle slip tiny temp\n", encoding="ascii")
+        Path(str(output) + ".trace").write_text("".join("resamb: ratio=3.2\n" for _ in range(1000)), encoding="ascii")
+        output.write_text("%  GPST latitude(deg) longitude(deg) height(m) Q ns\n", encoding="ascii")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(rtklib.subprocess, "run", fake_run)
+
+    command = run_rnx2rtkp(
+        rnx2rtkp="/bin/sh",
+        rtkconf=conf,
+        output_file=output,
+        rover_obs=rover,
+        base_obs=[base],
+        nav_files=[nav],
+        trace_mode="temporary",
+        dry_run=False,
+    )
+
+    summary = command.trace_summary
+    assert summary["selected_trace_source"] == "solution-default"
+    assert summary["parsed_trace_path"] == str(Path(str(output) + ".trace").resolve())
+    assert summary["trace_lines_read"] == 1000
+    assert summary["counters"]["ar_ratio_lines"] == 1000
+    assert summary["trace_deleted"] is True
+    assert not Path(str(output) + ".trace").exists()
+    assert not Path(seen["cwd"]).exists()
+
+
+def test_temporary_trace_reports_failed_delete(tmp_path: Path, monkeypatch):
+    rover, base, nav, conf, output = _minimal_inputs(tmp_path)
+
+    def fake_run(args, **kwargs):
+        Path(str(output) + ".trace").write_text("resamb: ratio=3.2\n", encoding="ascii")
+        output.write_text("%  GPST latitude(deg) longitude(deg) height(m) Q ns\n", encoding="ascii")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    def fake_delete(path):
+        return False, "permission denied"
+
+    monkeypatch.setattr(rtklib.subprocess, "run", fake_run)
+    monkeypatch.setattr(rtklib, "_delete_trace_path", fake_delete)
+
+    command = run_rnx2rtkp(
+        rnx2rtkp="/bin/sh",
+        rtkconf=conf,
+        output_file=output,
+        rover_obs=rover,
+        base_obs=[base],
+        nav_files=[nav],
+        trace_mode="temporary",
+        dry_run=False,
+    )
+
+    summary = command.trace_summary
+    assert summary["trace_deleted"] is False
+    assert summary["trace_cleanup_failed_paths"][str(Path(str(output) + ".trace").resolve())] == "permission denied"
+    assert Path(str(output) + ".trace").exists()
+
+
+def test_temporary_trace_does_not_delete_unmodified_preexisting_trace(tmp_path: Path, monkeypatch):
+    rover, base, nav, conf, output = _minimal_inputs(tmp_path)
+    preexisting = Path(str(output) + ".trace")
+    preexisting.write_text("resamb: ratio=3.2\n", encoding="ascii")
+
+    def fake_run(args, **kwargs):
+        output.write_text("%  GPST latitude(deg) longitude(deg) height(m) Q ns\n", encoding="ascii")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(rtklib.subprocess, "run", fake_run)
+
+    command = run_rnx2rtkp(
+        rnx2rtkp="/bin/sh",
+        rtkconf=conf,
+        output_file=output,
+        rover_obs=rover,
+        base_obs=[base],
+        nav_files=[nav],
+        trace_mode="temporary",
+        dry_run=False,
+    )
+
+    summary = command.trace_summary
+    assert summary["trace_deleted"] is False
+    assert summary["trace_cleanup_attempted_paths"] == []
+    assert summary["trace_cleanup_skipped_paths"][str(preexisting.resolve())] == "pre-existing trace was not modified by this run"
+    assert preexisting.exists()
+
+
 def test_keep_trace_retains_requested_file(tmp_path: Path, monkeypatch):
     rover, base, nav, conf, output = _minimal_inputs(tmp_path)
     retained = tmp_path / "kept.trace"
@@ -157,6 +258,37 @@ def test_keep_trace_retains_requested_file(tmp_path: Path, monkeypatch):
     assert command.trace_retained is True
     assert command.trace_file == retained
     assert command.trace_effective_level == 2
+
+
+def test_keep_trace_moves_solution_default_when_requested(tmp_path: Path, monkeypatch):
+    rover, base, nav, conf, output = _minimal_inputs(tmp_path)
+    retained = tmp_path / "retained-real.trace"
+
+    def fake_run(args, **kwargs):
+        Path(kwargs["cwd"], "rnx2rtkp.trace").write_text("cycle slip tiny temp\n", encoding="ascii")
+        Path(str(output) + ".trace").write_text("".join("resamb: ratio=4.1\n" for _ in range(20)), encoding="ascii")
+        output.write_text("%  GPST latitude(deg) longitude(deg) height(m) Q ns\n", encoding="ascii")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(rtklib.subprocess, "run", fake_run)
+
+    command = run_rnx2rtkp(
+        rnx2rtkp="/bin/sh",
+        rtkconf=conf,
+        output_file=output,
+        rover_obs=rover,
+        base_obs=[base],
+        nav_files=[nav],
+        trace_mode="keep",
+        trace_file=retained,
+        dry_run=False,
+    )
+
+    assert command.trace_summary["selected_trace_source"] == "solution-default"
+    assert command.trace_summary["parsed_trace_path"] == str(retained.resolve())
+    assert command.trace_summary["trace_lines_read"] == 20
+    assert retained.exists()
+    assert not Path(str(output) + ".trace").exists()
 
 
 def test_trace_level_zero_rejected_before_rtklib(tmp_path: Path):

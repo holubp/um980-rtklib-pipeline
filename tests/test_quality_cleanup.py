@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pytest
@@ -181,3 +182,40 @@ def test_off_trace_mode_rejects_trace_level():
 
     with pytest.raises(ValueError, match="requires --quality-trace"):
         cli._validate_quality_trace_args(args)
+
+
+def test_standalone_quality_trace_parses_explicit_trace_and_retains_it(tmp_path: Path):
+    solution = tmp_path / "solution.pos"
+    trace = tmp_path / "solution.pos.trace"
+    out_json = tmp_path / "quality.json"
+    out_md = tmp_path / "quality.md"
+    _write_pos(solution)
+    trace.write_text("".join("resamb: ratio=3.2\n" for _ in range(50)), encoding="ascii")
+
+    rc = cli.main(
+        [
+            "quality",
+            "--solution",
+            str(solution),
+            "--trace",
+            str(trace),
+            "--quality-trace-max-bytes",
+            "0",
+            "--out-json",
+            str(out_json),
+            "--out-md",
+            str(out_md),
+        ]
+    )
+
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert rc == 0
+    assert trace.exists()
+    assert data["trace"]["available"] is True
+    assert data["trace"]["source"] == "existing"
+    assert data["trace"]["path"] == str(trace)
+    assert data["trace"]["trace_file_size_bytes"] == trace.stat().st_size
+    assert data["trace"]["trace_raw_bytes_read"] == trace.stat().st_size
+    assert data["trace"]["trace_lines_read"] == 50
+    assert data["trace"]["trace_truncated"] is False
+    assert "Trace parsed path" in out_md.read_text(encoding="utf-8")

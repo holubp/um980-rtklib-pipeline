@@ -53,7 +53,8 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20, max_bytes: 
     examples: dict[str, list[str]] = {}
     ratios: list[float] = []
     lines_read = 0
-    bytes_read = 0
+    raw_bytes_read = 0
+    decoded_chars_read = 0
     truncated = False
     parser_warnings: list[str] = []
     started = time.perf_counter()
@@ -74,13 +75,34 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20, max_bytes: 
             "examples": {},
         }
 
-    with path.open("r", encoding="ascii", errors="ignore") as handle:
-        for raw_line in handle:
-            encoded_len = len(raw_line.encode("ascii", errors="ignore"))
-            if max_bytes > 0 and bytes_read + encoded_len > max_bytes:
+    with path.open("rb") as handle:
+        for raw_bytes in handle:
+            raw_len = len(raw_bytes)
+            if max_bytes > 0 and raw_bytes_read + raw_len > max_bytes:
+                remaining = max_bytes - raw_bytes_read
+                if remaining > 0:
+                    raw_bytes = raw_bytes[:remaining]
+                    raw_bytes_read += len(raw_bytes)
+                    raw_line = raw_bytes.decode("ascii", errors="ignore")
+                    decoded_chars_read += len(raw_line)
+                    if raw_line:
+                        lines_read += 1
+                        line = raw_line.strip()
+                        if line:
+                            lower = line.lower()
+                            matched = _classify_line(lower)
+                            for category in matched:
+                                counters[category] += 1
+                                _add_example(examples, category, line, max_example_lines)
+                            for value in _extract_ratios(line):
+                                ratios.append(value)
+                                counters["ar_ratio_lines"] += 1
+                                _add_example(examples, "ar_ratio_lines", line, max_example_lines)
                 truncated = True
                 break
-            bytes_read += encoded_len
+            raw_bytes_read += raw_len
+            raw_line = raw_bytes.decode("ascii", errors="ignore")
+            decoded_chars_read += len(raw_line)
             lines_read += 1
             line = raw_line.strip()
             if not line:
@@ -105,11 +127,13 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20, max_bytes: 
         "retained": None,
         "path": str(path),
         "trace_file_size_bytes": stat.st_size,
-        "trace_bytes_read": bytes_read,
+        "trace_raw_bytes_read": raw_bytes_read,
+        "trace_decoded_chars_read": decoded_chars_read,
+        "trace_bytes_read": raw_bytes_read,
         "trace_lines_read": lines_read,
         "trace_truncated": truncated,
         "trace_parse_elapsed_s": time.perf_counter() - started,
-        "bytes_read": bytes_read,
+        "bytes_read": raw_bytes_read,
         "lines_read": lines_read,
         "parser_warnings": parser_warnings,
         "counters": counters,

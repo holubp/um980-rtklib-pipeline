@@ -704,9 +704,13 @@ PYTHONPATH=src python -m um980_rtklib_pipeline.cli pipeline rover.ubx \
   --quality-trace temporary
 ```
 
-This runs `rnx2rtkp` with trace level 3 in an isolated temporary directory,
-streams aggregate trace diagnostics into the quality JSON/Markdown report, and
-then deletes the trace. Use level 2 for a smaller trace:
+This runs `rnx2rtkp` with trace level 3 in an isolated temporary directory.
+RTKLIB commonly writes the main trace next to the solution as
+`<solution-output>.trace`; the pipeline prefers that real solution trace over
+small temporary-cwd artifacts, streams aggregate diagnostics into the quality
+JSON/Markdown report, records the parsed path and raw bytes read, and then
+deletes the generated trace when temporary cleanup is enabled. Use level 2 for a
+smaller trace:
 
 ```bash
 --quality-trace temporary --rtklib-trace-level 2
@@ -724,7 +728,7 @@ Use keep mode only for manual debugging:
 ```
 
 Trace level 0 is rejected for trace generation. Existing traces can be analysed
-without rerunning RTKLIB:
+without rerunning RTKLIB, and explicit `--trace PATH` is retained by default:
 
 ```bash
 PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \

@@ -1313,12 +1313,15 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
         lines.extend(
             [
                 f"- Trace mode: `{trace.get('source')}`",
+                f"- Trace parsed path: `{trace.get('parsed_trace_path', trace.get('path'))}`",
                 f"- Effective trace level: `{trace.get('effective_level')}`",
                 f"- Trace retained: {'yes' if trace.get('retained') else 'no'}",
                 f"- Trace file size bytes: {trace.get('trace_file_size_bytes', trace.get('bytes_read'))}",
-                f"- Trace bytes read: {trace.get('trace_bytes_read', trace.get('bytes_read'))}",
+                f"- Trace raw bytes read: {trace.get('trace_raw_bytes_read', trace.get('trace_bytes_read', trace.get('bytes_read')))}",
+                f"- Trace decoded chars read: {trace.get('trace_decoded_chars_read', 'n/a')}",
                 f"- Trace lines read: {trace.get('trace_lines_read', trace.get('lines_read'))}",
                 f"- Trace truncated: {trace.get('trace_truncated', False)}",
+                f"- Trace deleted: {trace.get('trace_deleted', False)}",
                 "",
                 "| Event category | Count |",
                 "| --- | ---: |",

@@ -480,14 +480,64 @@ def _effective_trace_level(trace_mode: str, trace_level: int | None) -> int | No
 def _find_trace_candidate(directory: Path) -> Path | None:
     """Find the most likely RTKLIB trace file in an isolated run directory."""
 
+    candidates = _find_trace_candidates(directory)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime, path.stat().st_size))
+
+
+def _find_trace_candidates(directory: Path) -> list[Path]:
+    """Return non-empty trace candidates in `directory`."""
+
     candidates: dict[Path, None] = {}
+    if not directory.exists():
+        return []
     for pattern in ("rnx2rtkp.trace", "*.trace", "trace*"):
         for path in directory.glob(pattern):
             if path.is_file() and path.stat().st_size > 0:
                 candidates[path] = None
-    if not candidates:
+    return list(candidates)
+
+
+def _nonempty_file(path: Path | None) -> bool:
+    """Return true when `path` is an existing non-empty file."""
+
+    if path is None:
+        return False
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _delete_trace_path(path: Path) -> tuple[bool, str | None]:
+    """Delete one trace file and return `(deleted, error)`."""
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True, None
+    except OSError as exc:
+        return False, str(exc)
+    return not path.exists(), None if not path.exists() else "file still exists after unlink"
+
+
+def _file_signature(path: Path | None) -> tuple[int, int] | None:
+    """Return a cheap file identity signature for cleanup ownership checks."""
+
+    if path is None:
         return None
-    return max(candidates, key=lambda path: (path.stat().st_mtime, path.stat().st_size))
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+def _trace_path_strings(paths: list[Path]) -> list[str]:
+    """Return stable string paths without duplicates."""
+
+    return [str(path) for path in dict.fromkeys(paths)]
 
 
 def run_rnx2rtkp(
@@ -564,12 +614,20 @@ def run_rnx2rtkp(
             rtkconf = rtkconf.resolve()
         if base_obs_arg is not None:
             base_obs_arg = _resolve_wildcard_parent(base_obs_arg)
+        if trace_file is not None:
+            trace_file = trace_file.resolve()
         logging.info(
             "quality_trace=%s requested_rtklib_trace_level=%s effective_rtklib_trace_level=%s",
             trace_mode,
             trace_level if trace_level is not None else "<unset>",
             effective_trace_level,
         )
+    expected_output_trace = Path(str(output_file) + ".trace")
+    pre_trace_signatures = {
+        path: _file_signature(path)
+        for path in [expected_output_trace, trace_file]
+        if path is not None
+    }
 
     args = build_rnx2rtkp_command(
         rnx2rtkp=rnx2rtkp,
@@ -620,37 +678,93 @@ def run_rnx2rtkp(
                     rtklib_error = exc
     trace_summary: dict[str, object] | None = None
     selected_trace: Path | None = None
+    parsed_trace_path: Path | None = None
+    selected_trace_source: str | None = None
     trace_retained = False
     if trace_dir is not None and not dry_run:
-        selected_trace = _find_trace_candidate(trace_dir)
+        temp_candidates = _find_trace_candidates(trace_dir)
+        generated_trace_files = [
+            path
+            for path in [expected_output_trace, trace_file, *temp_candidates]
+            if path is not None and _nonempty_file(path)
+        ]
+        explicit_trace = trace_file if _nonempty_file(trace_file) else None
+        temp_trace = _find_trace_candidate(trace_dir)
+        if _nonempty_file(expected_output_trace):
+            selected_trace = expected_output_trace
+            selected_trace_source = "solution-default"
+        elif explicit_trace is not None:
+            selected_trace = explicit_trace
+            selected_trace_source = "explicit"
+        elif temp_trace is not None:
+            selected_trace = temp_trace
+            selected_trace_source = "temp-cwd"
         if selected_trace is not None:
             retained_path: Path | None = None
             if trace_mode == "keep":
-                retained_path = trace_file or output_file.with_suffix(".trace")
-                retained_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(selected_trace), retained_path)
-                selected_trace = retained_path
+                retained_path = trace_file or expected_output_trace
+                if selected_trace != retained_path:
+                    retained_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(selected_trace), retained_path)
+                    selected_trace = retained_path
+                selected_trace = selected_trace.resolve()
                 trace_retained = True
-            trace_summary = analyze_rtklib_trace(selected_trace, max_bytes=trace_max_bytes)
+            parsed_trace_path = selected_trace
+            trace_summary = analyze_rtklib_trace(parsed_trace_path, max_bytes=trace_max_bytes)
+            cleanup_attempted: list[Path] = []
+            cleanup_deleted: list[Path] = []
+            cleanup_failed: dict[str, str] = {}
+            cleanup_skipped: dict[str, str] = {}
+            cleanup_allowed = trace_mode == "temporary" and trace_cleanup != "never"
+            if trace_mode == "temporary" and trace_cleanup == "on-success":
+                cleanup_allowed = rtklib_error is None and output_file.exists()
+            if cleanup_allowed:
+                before_signature = pre_trace_signatures.get(parsed_trace_path)
+                after_signature = _file_signature(parsed_trace_path)
+                generated_or_changed = parsed_trace_path in temp_candidates or before_signature is None or before_signature != after_signature
+                if generated_or_changed:
+                    cleanup_attempted.append(parsed_trace_path)
+                    deleted, error = _delete_trace_path(parsed_trace_path)
+                    if deleted:
+                        cleanup_deleted.append(parsed_trace_path)
+                    else:
+                        cleanup_failed[str(parsed_trace_path)] = error or "delete failed"
+                else:
+                    cleanup_skipped[str(parsed_trace_path)] = "pre-existing trace was not modified by this run"
             trace_summary.update(
                 {
                     "source": trace_mode,
                     "generated_temporarily": trace_mode == "temporary",
                     "retained": trace_retained,
-                    "path": str(selected_trace) if trace_retained else None,
+                    "path": str(parsed_trace_path),
                     "effective_level": effective_trace_level,
-                    "trace_deleted": trace_mode == "temporary" and trace_cleanup in {"always", "on-success"},
+                    "expected_trace_path": str(expected_output_trace),
+                    "parsed_trace_path": str(parsed_trace_path),
+                    "selected_trace_source": selected_trace_source,
+                    "generated_trace_files": _trace_path_strings(generated_trace_files),
+                    "trace_cleanup_attempted_paths": _trace_path_strings(cleanup_attempted),
+                    "trace_cleanup_deleted_paths": _trace_path_strings(cleanup_deleted),
+                    "trace_cleanup_failed_paths": cleanup_failed,
+                    "trace_cleanup_skipped_paths": cleanup_skipped,
+                    "trace_deleted": trace_mode == "temporary" and not parsed_trace_path.exists(),
                 }
             )
             logging.info(
-                "parsed RTKLIB trace diagnostics: mode=%s level=%s retained=%s file=%s",
+                "parsed RTKLIB trace diagnostics: mode=%s level=%s source=%s retained=%s file=%s",
                 trace_mode,
                 effective_trace_level,
+                selected_trace_source,
                 trace_retained,
-                selected_trace if trace_retained else "<temporary>",
+                parsed_trace_path,
             )
         else:
-            logging.warning("RTKLIB trace mode %s was requested, but no trace file was found in %s", trace_mode, trace_dir)
+            generated_trace_files = []
+            logging.warning(
+                "RTKLIB trace mode %s was requested, but no trace file was found at %s or in %s",
+                trace_mode,
+                expected_output_trace,
+                trace_dir,
+            )
         if trace_mode == "temporary" and trace_cleanup == "on-success":
             cleanup_trace_dir = output_file.exists()
         if trace_mode == "temporary" and trace_cleanup == "never":
@@ -658,6 +772,15 @@ def run_rnx2rtkp(
             logging.info("temporary RTKLIB trace directory retained by policy: %s", trace_dir)
         if cleanup_trace_dir:
             shutil.rmtree(trace_dir, ignore_errors=True)
+        if trace_summary is not None:
+            remaining = [
+                path
+                for path in [expected_output_trace, trace_file, *_find_trace_candidates(trace_dir)]
+                if path is not None and _nonempty_file(path)
+            ]
+            trace_summary["remaining_trace_files"] = _trace_path_strings(remaining)
+            if trace_mode == "temporary":
+                trace_summary["trace_deleted"] = parsed_trace_path is not None and not parsed_trace_path.exists()
     if rtklib_error is not None:
         raise rtklib_error
     return RtklibCommand(
@@ -666,7 +789,7 @@ def run_rnx2rtkp(
         stdout_log,
         stderr_log,
         wrapper_file,
-        trace_file=selected_trace if trace_retained else None,
+        trace_file=parsed_trace_path if trace_retained else None,
         trace_generated_temporarily=trace_mode == "temporary",
         trace_retained=trace_retained,
         trace_effective_level=effective_trace_level,
