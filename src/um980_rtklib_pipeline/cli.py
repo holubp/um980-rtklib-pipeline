@@ -1679,6 +1679,13 @@ def _validate_quality_trace_args(args: argparse.Namespace, *, standalone: bool =
 
     mode = getattr(args, "quality_trace", "off")
     trace_level = getattr(args, "rtklib_trace_level", None)
+
+    # Standalone `quality --trace PATH` analyses an existing trace file.  The
+    # user should not also have to write `--quality-trace existing`; that option
+    # is mainly a pipeline/postprocess policy for generated traces.
+    if standalone and getattr(args, "trace", None) and mode == "off":
+        return None
+
     if mode == "off":
         if trace_level is not None and trace_level > 0:
             raise ValueError("--rtklib-trace-level requires --quality-trace temporary or --quality-trace keep")
@@ -2048,10 +2055,39 @@ def _trace_summary_for_quality(args: argparse.Namespace, commands: list) -> dict
     """Return trace diagnostics requested for quality analysis."""
 
     mode = getattr(args, "quality_trace", "off")
-    if mode == "existing":
-        summary = analyze_rtklib_trace(Path(args.trace), max_bytes=max(0, int(getattr(args, "quality_trace_max_bytes", 0) or 0)))
-        summary.update({"source": "existing", "generated_temporarily": False, "retained": True, "effective_level": None})
+    # Explicit standalone trace input always wins.  This fixes:
+    #   um980-ppk quality --trace solution.nmea.trace ...
+    # previously producing `"trace": {"available": false}` unless the user also
+    # supplied `--quality-trace existing`.
+    explicit_trace = getattr(args, "trace", None)
+    if explicit_trace:
+        trace_path = Path(explicit_trace)
+        if not trace_path.exists():
+            raise FileNotFoundError(f"--trace was specified but file does not exist: {trace_path}")
+        summary = analyze_rtklib_trace(
+            trace_path,
+            max_bytes=max(0, int(getattr(args, "quality_trace_max_bytes", 0) or 0)),
+        )
+        summary.update(
+            {
+                "source": "existing",
+                "generated_temporarily": False,
+                "retained": True,
+                "effective_level": None,
+                "path": str(trace_path),
+            }
+        )
+        if logging.getLogger().isEnabledFor(logging.INFO):
+            logging.info(
+                "parsed RTKLIB trace diagnostics: source=existing file=%s size=%s bytes_read=%s lines=%s truncated=%s",
+                trace_path,
+                summary.get("trace_file_size_bytes"),
+                summary.get("trace_bytes_read"),
+                summary.get("trace_lines_read"),
+                summary.get("trace_truncated"),
+            )
         return summary
+
     for command in commands:
         summary = getattr(command, "trace_summary", None)
         if summary:
@@ -2093,8 +2129,23 @@ def _quality_rerun_command(args: argparse.Namespace, solution: Path, stat: Path 
     ]
     if stat is not None:
         command.extend(["--stat", str(stat)])
-    if getattr(args, "trace", None) and getattr(args, "quality_trace", "off") == "existing":
-        command.extend(["--quality-trace", "existing", "--trace", str(args.trace)])
+
+    # Prefer an explicitly supplied trace, otherwise include RTKLIB's default
+    # `<solution>.trace` when it exists.  This makes rerun.sh capable of
+    # reproducing trace-aware QC without rerunning RTKLIB.
+    trace_path: Path | None = None
+    if getattr(args, "trace", None):
+        trace_path = Path(args.trace)
+    else:
+        inferred_trace = Path(str(solution) + ".trace")
+        if inferred_trace.exists():
+            trace_path = inferred_trace
+    if trace_path is not None:
+        command.extend(["--trace", str(trace_path)])
+
+    if getattr(args, "quality_trace_max_bytes", 0) not in {None, 0, 0.0}:
+        command.extend(["--quality-trace-max-bytes", str(args.quality_trace_max_bytes)])
+
     for attr, option in (
         ("quality_stat_max_lines", "--quality-stat-max-lines"),
         ("quality_stat_max_seconds", "--quality-stat-max-seconds"),
