@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from um980_rtklib_pipeline import cli
+from um980_rtklib_pipeline.stream import StreamDiagnostics
 
 
 def test_duplicate_nav_merge_warns_and_last_value_wins(caplog) -> None:
@@ -98,3 +99,79 @@ def test_extract_prints_analysis_summary_once_with_analysis_json(tmp_path: Path,
     captured = capsys.readouterr()
     assert rc == 0
     assert (captured.out + captured.err).count("binary_resynchronisation_events") == 1
+
+
+def test_extract_bundle_reuses_cached_rover_parse(tmp_path: Path, monkeypatch) -> None:
+    rover = tmp_path / "rover.ubx"
+    rover.write_bytes(b"")
+    calls = {"load": 0}
+
+    def fake_load_records(_path):
+        calls["load"] += 1
+        return [], StreamDiagnostics()
+
+    monkeypatch.setattr(cli, "_load_records", fake_load_records)
+    args = SimpleNamespace(
+        rover_log=str(rover),
+        track_source="auto",
+        emit_ion_utc="off",
+        start_time=None,
+        end_time=None,
+    )
+
+    first = cli._extract_bundle(args)
+    second = cli._extract_bundle(args)
+
+    assert first is second
+    assert calls["load"] == 1
+
+
+def test_observation_csv_write_is_deduplicated(tmp_path: Path, monkeypatch) -> None:
+    calls: list[Path] = []
+
+    def fake_write(path, _observations):
+        calls.append(path)
+        path.write_text("ok\n", encoding="ascii")
+
+    monkeypatch.setattr(cli, "write_observations_csv", fake_write)
+    args = SimpleNamespace()
+    path = tmp_path / "obs.csv"
+
+    cli._write_observation_csv_once(args, path, [])
+    cli._write_observation_csv_once(args, path, [])
+
+    assert calls == [path]
+
+
+def test_quality_alias_writes_outputs(tmp_path: Path) -> None:
+    solution = tmp_path / "run.pos"
+    out_json = tmp_path / "quality.json"
+    out_md = tmp_path / "quality.md"
+    solution.write_text("2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n", encoding="ascii")
+
+    rc = cli.main(["quality", "--solution", str(solution), "--out-json", str(out_json), "--out-md", str(out_md)])
+
+    assert rc == 0
+    assert out_json.exists()
+    assert out_md.exists()
+
+
+def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        verbose=True,
+        debug=False,
+        no_emit_run_script=False,
+        emit_run_script="auto",
+        _original_argv=["pipeline", "rover file.ubx", "--rtkconf", "config with spaces.conf"],
+        print_step_commands=False,
+    )
+
+    cli._init_rerun_artifacts(args, tmp_path, "rover")
+    cli._append_rerun_command(args, "Standalone quality", ["python", "-m", "um980_rtklib_pipeline.cli", "quality", "--solution", "a b.pos"])
+
+    script = (tmp_path / "rover.rerun.sh").read_text(encoding="utf-8")
+    markdown = (tmp_path / "rover.commands.md").read_text(encoding="utf-8")
+    assert "set -euo pipefail" in script
+    assert "'rover file.ubx'" in script
+    assert "'a b.pos'" in script
+    assert "Standalone quality" in markdown

@@ -8,6 +8,7 @@ lines are ignored and ambiguous numeric fields are not interpreted.
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from statistics import median
 from typing import Iterable
@@ -55,6 +56,7 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20, max_bytes: 
     bytes_read = 0
     truncated = False
     parser_warnings: list[str] = []
+    started = time.perf_counter()
     try:
         stat = path.stat()
     except OSError as exc:
@@ -106,6 +108,7 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20, max_bytes: 
         "trace_bytes_read": bytes_read,
         "trace_lines_read": lines_read,
         "trace_truncated": truncated,
+        "trace_parse_elapsed_s": time.perf_counter() - started,
         "bytes_read": bytes_read,
         "lines_read": lines_read,
         "parser_warnings": parser_warnings,

@@ -104,3 +104,8 @@
   values. RTK QC confidence must stay separate from raw RTK state; incomplete
   residual/slip alignment should produce unknown/limited confidence, not a hard
   false-fix conclusion.
+- Large RTKLIB `.stat` analysis must remain indexed and bounded: never perform
+  a linear nearest-solution-epoch scan inside loops over `$SAT` rows or raw slip
+  flags. Deduplicate slip evidence first, align unique STAT epochs with a
+  bisect-backed index, and keep rerun scripts/commands available for manual
+  reproduction of RTKLIB and quality steps.

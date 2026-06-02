@@ -7,8 +7,10 @@ import json
 import logging
 import math
 import re
+import shlex
 import shutil
 import sys
+import time
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from glob import glob
@@ -442,6 +444,9 @@ def _add_quality_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quality-no-route-bins", action="store_true")
     parser.add_argument("--quality-baseline-bins", default="0,10,20,30,40,50,75,100,150")
     parser.add_argument("--quality-md-raw-json", action="store_true")
+    parser.add_argument("--quality-stat-max-lines", type=int, default=0, help="Maximum RTKLIB .stat lines to parse; 0 is unlimited.")
+    parser.add_argument("--quality-stat-max-seconds", type=float, default=0.0, help="Maximum wall-clock seconds to spend parsing .stat; 0 is unlimited.")
+    parser.add_argument("--quality-fast", action="store_true", help="Skip expensive STAT detail parsing while keeping raw solution summaries.")
 
 
 def _add_quality_trace_args(parser: argparse.ArgumentParser, *, standalone: bool = False) -> None:
@@ -488,6 +493,13 @@ def _add_quality_pipeline_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quality-out-json", help="JSON RTK quality report path.")
     _add_quality_trace_args(parser)
     _add_quality_analyze_args(parser)
+
+
+def _add_rerun_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--print-step-commands", action="store_true", help="Log copy-pasteable commands for major pipeline steps.")
+    parser.add_argument("--emit-run-script", nargs="?", const="auto", help="Write rerun shell script; optional PATH or 'auto'.")
+    parser.add_argument("--no-emit-run-script", action="store_true", help="Disable automatic rerun script emission.")
+    parser.add_argument("--dry-run-plan", action="store_true", help="Print planned phases/commands without running RTKLIB.")
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -664,6 +676,97 @@ def _human_bytes(size: int) -> str:
     return f"{size} B"
 
 
+def _performance(args: argparse.Namespace) -> dict[str, object]:
+    perf = getattr(args, "_performance", None)
+    if not isinstance(perf, dict):
+        perf = {"phases": {}}
+        setattr(args, "_performance", perf)
+    return perf
+
+
+class _PhaseTimer:
+    def __init__(self, args: argparse.Namespace, name: str, **counts: object) -> None:
+        self.args = args
+        self.name = name
+        self.counts = counts
+        self.started = 0.0
+
+    def __enter__(self) -> "_PhaseTimer":
+        self.started = time.perf_counter()
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("phase start: %s", self.name)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        elapsed = time.perf_counter() - self.started
+        perf = _performance(self.args)
+        phases = perf.setdefault("phases", {})
+        if isinstance(phases, dict):
+            phases[self.name] = {"elapsed_s": elapsed, **self.counts}
+        if logging.getLogger().isEnabledFor(logging.INFO):
+            logging.info("phase %s elapsed=%.3fs", self.name, elapsed)
+
+
+def _time_phase(args: argparse.Namespace, name: str, **counts: object) -> _PhaseTimer:
+    return _PhaseTimer(args, name, **counts)
+
+
+def _quote_command(items: list[str]) -> str:
+    return " ".join(shlex.quote(str(item)) for item in items)
+
+
+def _rerun_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "no_emit_run_script", False):
+        return False
+    requested = getattr(args, "emit_run_script", None)
+    if requested:
+        return True
+    return bool(getattr(args, "verbose", False) or getattr(args, "debug", False))
+
+
+def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str) -> None:
+    """Create rerun script/Markdown files when requested."""
+
+    if not _rerun_enabled(args):
+        return
+    requested = getattr(args, "emit_run_script", None)
+    script = out_dir / f"{basename}.rerun.sh" if requested in {None, "auto"} else Path(requested)
+    commands_md = out_dir / f"{basename}.commands.md"
+    setattr(args, "_rerun_script", script)
+    setattr(args, "_commands_md", commands_md)
+    original = getattr(args, "_original_argv", None)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"# Working directory: {Path.cwd()}",
+    ]
+    if original:
+        header.append("# Original command:")
+        header.append(_quote_command(["PYTHONPATH=src", "python", "-m", "um980_rtklib_pipeline.cli", *original]))
+    script.write_text("\n".join(header) + "\n\n", encoding="utf-8")
+    commands_md.write_text("# Reproducible Run Commands\n\n", encoding="utf-8")
+    logging.info("rerun script: %s", script)
+    logging.info("commands markdown: %s", commands_md)
+
+
+def _append_rerun_command(args: argparse.Namespace, title: str, command: list[str] | str) -> None:
+    """Append a copy-pasteable command to rerun artifacts."""
+
+    script = getattr(args, "_rerun_script", None)
+    commands_md = getattr(args, "_commands_md", None)
+    rendered = command if isinstance(command, str) else _quote_command([str(item) for item in command])
+    if getattr(args, "print_step_commands", False) or getattr(args, "verbose", False):
+        logging.info("%s: %s", title, rendered)
+    if script:
+        Path(script).write_text(Path(script).read_text(encoding="utf-8") + f"# {title}\n{rendered}\n\n", encoding="utf-8")
+    if commands_md:
+        Path(commands_md).write_text(
+            Path(commands_md).read_text(encoding="utf-8") + f"## {title}\n\n```bash\n{rendered}\n```\n\n",
+            encoding="utf-8",
+        )
+
+
 def _load_records(path: Path):
     size = path.stat().st_size
     logging.info("reading rover log: %s (%s)", path, _human_bytes(size))
@@ -682,6 +785,10 @@ def _load_records(path: Path):
 
 
 def _extract_bundle(args: argparse.Namespace):
+    cached = getattr(args, "_extract_bundle_cache", None)
+    if cached is not None:
+        logging.info("reusing parsed rover products from current pipeline run")
+        return cached
     rover = Path(args.rover_log)
     progress = logging.getLogger().isEnabledFor(logging.INFO)
     window = _processing_window_from_args(args)
@@ -691,9 +798,11 @@ def _extract_bundle(args: argparse.Namespace):
             window.start.isoformat() if window.start else "recording-start",
             window.end.isoformat() if window.end else "recording-end",
         )
-    records, stream_diag = _load_records(rover)
+    with _time_phase(args, "rover_parse", input_bytes=rover.stat().st_size if rover.exists() else None):
+        records, stream_diag = _load_records(rover)
     logging.info("extracting solution records")
-    solutions = extract_solutions(records, progress=progress)
+    with _time_phase(args, "extract_solutions"):
+        solutions = extract_solutions(records, progress=progress)
     logging.info(
         "extracted solutions: points=%d nmea_records=%d all_nmea=%d",
         len(solutions.solution_points),
@@ -701,7 +810,8 @@ def _extract_bundle(args: argparse.Namespace):
         len(solutions.all_nmea),
     )
     logging.info("decoding raw observations")
-    observations = decode_observations(records, progress=progress)
+    with _time_phase(args, "decode_observations"):
+        observations = decode_observations(records, progress=progress)
     logging.info(
         "decoded raw observations: observations=%d epochs=%s unsupported_observation_records=%d skipped_non_observation_records=%d",
         len(observations.observations),
@@ -710,11 +820,13 @@ def _extract_bundle(args: argparse.Namespace):
         sum(observations.skipped_records.values()),
     )
     logging.info("scanning rover navigation records")
-    rover_nav = extract_rover_nav(records)
+    with _time_phase(args, "scan_rover_navigation"):
+        rover_nav = extract_rover_nav(records)
     converted_nav = sum(rover_nav.converted.values())
     logging.info("scanned rover navigation: converted=%d warnings=%d", converted_nav, len(rover_nav.warnings))
     logging.info("scanning BESTNAV receiver-solution records")
-    bestnav = extract_bestnav_records(records)
+    with _time_phase(args, "scan_bestnav"):
+        bestnav = extract_bestnav_records(records)
     logging.info(
         "decoded BESTNAV records: present=%d valid_epochs=%d malformed=%d",
         sum(bestnav.present.values()),
@@ -749,7 +861,8 @@ def _extract_bundle(args: argparse.Namespace):
     effective_observation_span = _span_from_observations(observations.observations)
     logging.info("scanning ION/UTC/TROPINFO diagnostics")
     emit_ion_utc = getattr(args, "emit_ion_utc", "off")
-    diagnostics = extract_diagnostics(records, emit_policy=emit_ion_utc)
+    with _time_phase(args, "scan_diagnostics"):
+        diagnostics = extract_diagnostics(records, emit_policy=emit_ion_utc)
     logging.info(
         "preserved diagnostics: records=%d malformed=%d present_not_converted=%d emit_ion_utc=%s",
         len(diagnostics.records),
@@ -769,14 +882,15 @@ def _extract_bundle(args: argparse.Namespace):
                 "--emit-ion-utc strict requested, but no ION/UTC family currently has a verified "
                 f"RTKLIB-compatible RINEX NAV mapping: {detail}"
             )
-    message_stats = build_message_stats(
-        records=records,
-        stream=stream_diag,
-        solutions=solutions,
-        observations=observations,
-        rover_nav=rover_nav,
-        bestnav=bestnav,
-    )
+    with _time_phase(args, "build_message_stats"):
+        message_stats = build_message_stats(
+            records=records,
+            stream=stream_diag,
+            solutions=solutions,
+            observations=observations,
+            rover_nav=rover_nav,
+            bestnav=bestnav,
+        )
     if logging.getLogger().isEnabledFor(logging.INFO):
         log_message_stats(message_stats, debug=logging.getLogger().isEnabledFor(logging.DEBUG))
     logging.info("building analysis report")
@@ -789,6 +903,7 @@ def _extract_bundle(args: argparse.Namespace):
             "bestnav": bestnav.as_dict(),
             "diagnostics": {**diagnostics.as_dict(), "emit_ion_utc_policy": emit_ion_utc},
             "message_stats": message_stats.as_dict(),
+            "performance": _performance(args),
             "processing_window": {
                 "selected": window.as_dict(),
                 "original_solution_span": original_solution_span,
@@ -799,7 +914,9 @@ def _extract_bundle(args: argparse.Namespace):
         },
     )
     analysis["warnings"] = list(dict.fromkeys([*analysis.get("warnings", []), *bestnav.warnings, *message_stats.warnings]))
-    return rover, records, stream_diag, solutions, observations, rover_nav, bestnav, message_stats, analysis
+    bundle = (rover, records, stream_diag, solutions, observations, rover_nav, bestnav, message_stats, analysis)
+    setattr(args, "_extract_bundle_cache", bundle)
+    return bundle
 
 
 def _print_analysis_summary(analysis: dict[str, object]) -> None:
@@ -830,6 +947,23 @@ def _log_analysis_warnings(analysis: dict[str, object]) -> None:
         return
     for warning in warnings:
         logging.warning("%s", warning)
+
+
+def _write_observation_csv_once(args: argparse.Namespace, path: Path, observations) -> None:
+    """Write observation CSV at most once per output path in this process."""
+
+    written = getattr(args, "_observation_csv_written", None)
+    if not isinstance(written, set):
+        written = set()
+        setattr(args, "_observation_csv_written", written)
+    key = str(path.resolve())
+    if key in written:
+        logging.info("observation CSV already written, skipping duplicate: %s", path)
+        return
+    with _time_phase(args, "observation_csv_write", observations=len(observations)):
+        write_observations_csv(path, observations)
+    written.add(key)
+    logging.info("wrote observation CSV: %s", path)
 
 
 def _ecef_from_llh(lat_deg: float, lon_deg: float, height_m: float) -> tuple[float, float, float]:
@@ -1845,6 +1979,9 @@ def _run_rtklib_output_formats(
         )
         logging.info("RTKLIB postprocessing finished: %s", output_file)
         _log_rtklib_solution_summary(args, output_file)
+        wrapper = getattr(command, "wrapper_file", None)
+        if wrapper is not None:
+            _append_rerun_command(args, f"Rerun RTKLIB {output_format}", ["bash", str(wrapper)])
         commands.append(command)
     return commands
 
@@ -1865,6 +2002,7 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
         logging.warning("quality analysis running without .stat evidence: %s", solution)
     md_path = Path(args.quality_out_md) if getattr(args, "quality_out_md", None) else out_dir / f"{basename}-rtk.quality.md"
     json_path = Path(args.quality_out_json) if getattr(args, "quality_out_json", None) else out_dir / f"{basename}-rtk.quality.json"
+    _append_rerun_command(args, "Rerun quality analysis", _quality_rerun_command(args, solution, stat, json_path, md_path))
     trace_summary = _trace_summary_for_quality(args, commands or [])
     cleanup = {
         "trace_cleanup_requested": getattr(args, "quality_trace", "off") == "temporary",
@@ -1879,9 +2017,14 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
         thresholds=_quality_thresholds_from_args(args),
         trace_summary=trace_summary,
         cleanup=cleanup,
+        stat_max_lines=max(0, int(getattr(args, "quality_stat_max_lines", 0) or 0)),
+        stat_max_seconds=max(0.0, float(getattr(args, "quality_stat_max_seconds", 0.0) or 0.0)),
+        fast=bool(getattr(args, "quality_fast", False)),
     )
-    md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
-    write_quality_json(json_path, analysis)
+    _log_quality_performance(analysis)
+    with _time_phase(args, "quality_report_write"):
+        md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
+        write_quality_json(json_path, analysis)
     deleted_stats: list[str] = []
     if getattr(args, "quality_clean_stat", False) and stat is not None:
         stat.unlink()
@@ -1895,8 +2038,9 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
                 "stat_files_kept": [],
             },
         )
-        md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
-        write_quality_json(json_path, analysis)
+        with _time_phase(args, "quality_report_write_after_cleanup"):
+            md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
+            write_quality_json(json_path, analysis)
     logging.info("wrote RTK quality analysis: markdown=%s json=%s", md_path, json_path)
 
 
@@ -1905,7 +2049,7 @@ def _trace_summary_for_quality(args: argparse.Namespace, commands: list) -> dict
 
     mode = getattr(args, "quality_trace", "off")
     if mode == "existing":
-        summary = analyze_rtklib_trace(Path(args.trace))
+        summary = analyze_rtklib_trace(Path(args.trace), max_bytes=max(0, int(getattr(args, "quality_trace_max_bytes", 0) or 0)))
         summary.update({"source": "existing", "generated_temporarily": False, "retained": True, "effective_level": None})
         return summary
     for command in commands:
@@ -1913,6 +2057,56 @@ def _trace_summary_for_quality(args: argparse.Namespace, commands: list) -> dict
         if summary:
             return summary
     return None
+
+
+def _log_quality_performance(analysis) -> None:
+    """Log bounded performance counters from quality analysis."""
+
+    data = analysis.as_dict()
+    performance = data.get("performance", {})
+    if not isinstance(performance, dict) or not logging.getLogger().isEnabledFor(logging.INFO):
+        return
+    logging.info(
+        "quality STAT summary parsed: lines=%s sat_lines=%s raw_slip_flags=%s "
+        "dedup_slip_events=%s unique_slip_epochs=%s elapsed=%.3fs",
+        performance.get("stat_lines_read", 0),
+        performance.get("sat_lines_parsed", 0),
+        performance.get("raw_slip_flags", 0),
+        performance.get("dedup_slip_events", 0),
+        performance.get("unique_slip_epochs", 0),
+        float(performance.get("stat_parse_elapsed_s", 0.0) or 0.0),
+    )
+
+
+def _quality_rerun_command(args: argparse.Namespace, solution: Path, stat: Path | None, json_path: Path, md_path: Path) -> list[str]:
+    command = [
+        "python",
+        "-m",
+        "um980_rtklib_pipeline.cli",
+        "quality",
+        "--solution",
+        str(solution),
+        "--out-json",
+        str(json_path),
+        "--out-md",
+        str(md_path),
+    ]
+    if stat is not None:
+        command.extend(["--stat", str(stat)])
+    if getattr(args, "trace", None) and getattr(args, "quality_trace", "off") == "existing":
+        command.extend(["--quality-trace", "existing", "--trace", str(args.trace)])
+    for attr, option in (
+        ("quality_stat_max_lines", "--quality-stat-max-lines"),
+        ("quality_stat_max_seconds", "--quality-stat-max-seconds"),
+        ("quality_motion_profile", "--quality-motion-profile"),
+        ("quality_route_bin_km", "--quality-route-bin-km"),
+    ):
+        value = getattr(args, attr, None)
+        if value not in {None, "", 0, 0.0, "auto"}:
+            command.extend([option, str(value)])
+    if getattr(args, "quality_fast", False):
+        command.append("--quality-fast")
+    return command
 
 
 def _select_quality_solution_file(out_dir: Path, basename: str, formats: list[str]) -> Path | None:
@@ -2417,8 +2611,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         logging.info("wrote GPX output: %s", gpx)
     if args.obs_csv:
         obs_csv = out_dir / f"{base}.observations.csv"
-        write_observations_csv(obs_csv, observations.observations)
-        logging.info("wrote observation CSV: %s", obs_csv)
+        _write_observation_csv_once(args, obs_csv, observations.observations)
     if getattr(args, "bestnav_nmea", None):
         _write_bestnav_nmea(Path(args.bestnav_nmea), bestnav, args)
     if args.analysis_json:
@@ -2446,8 +2639,7 @@ def cmd_rinex(args: argparse.Namespace) -> int:
     base = basename_for(rover, args.basename)
     if args.obs_csv:
         obs_csv = out_dir / f"{base}.observations.csv"
-        write_observations_csv(obs_csv, observations.observations)
-        logging.info("wrote observation CSV: %s", obs_csv)
+        _write_observation_csv_once(args, obs_csv, observations.observations)
     nav_path = out_dir / f"{base}.rover-gps.nav"
     logging.info("extracting rover navigation files: base=%s", nav_path)
     nav_report = extract_rover_nav(records, nav_path)
@@ -2472,14 +2664,15 @@ def cmd_rinex(args: argparse.Namespace) -> int:
         approx_position = _approx_position_from_solutions(solutions.solution_points)
         if approx_position is None:
             logging.warning("no decoded rover solution height available; RINEX APPROX POSITION XYZ will be 0 0 0")
-        write_rinex_obs(
-            obs_path,
-            rinex_observations,
-            rinex_version=args.rinex_version,
-            compatibility=args.rinex_compat,
-            approx_position=approx_position,
-            progress=logging.getLogger().isEnabledFor(logging.INFO),
-        )
+        with _time_phase(args, "rinex_obs_write", observations=len(rinex_observations)):
+            write_rinex_obs(
+                obs_path,
+                rinex_observations,
+                rinex_version=args.rinex_version,
+                compatibility=args.rinex_compat,
+                approx_position=approx_position,
+                progress=logging.getLogger().isEnabledFor(logging.INFO),
+            )
         logging.info("wrote rover RINEX OBS: %s", obs_path)
     except ValueError as exc:
         analysis["warnings"] = list(
@@ -2620,7 +2813,11 @@ def cmd_quality_analyze(args: argparse.Namespace) -> int:
         thresholds=_quality_thresholds_from_args(args),
         trace_summary=trace_summary,
         cleanup=cleanup,
+        stat_max_lines=max(0, int(getattr(args, "quality_stat_max_lines", 0) or 0)),
+        stat_max_seconds=max(0.0, float(getattr(args, "quality_stat_max_seconds", 0.0) or 0.0)),
+        fast=bool(getattr(args, "quality_fast", False)),
     )
+    _log_quality_performance(analysis)
     if args.out_json:
         write_quality_json(Path(args.out_json), analysis)
         logging.info("wrote quality JSON: %s", args.out_json)
@@ -2908,6 +3105,9 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     _log_effective_run_summary(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = args.basename or Path(args.rover_log).stem
+    if getattr(args, "dry_run_plan", False):
+        setattr(args, "dry_run", True)
+    _init_rerun_artifacts(args, out_dir, base)
     rover_nav = []
     if args.use_rover_nav:
         logging.info("extracting rover navigation for RTKLIB input")
@@ -2990,12 +3190,16 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     _log_effective_run_summary(args)
     if getattr(args, "base_rtcm", None) and args.download_base:
         raise ValueError("--base-rtcm and --download-base are mutually exclusive; choose one base source")
+    if getattr(args, "dry_run_plan", False):
+        setattr(args, "dry_run", True)
+        logging.info("dry-run plan enabled: RTKLIB execution will be planned but not run")
+    out_dir = ensure_out_dir(args.out_dir)
+    base = basename_for(args.rover_log, args.basename)
+    _init_rerun_artifacts(args, out_dir, base)
     logging.info("pipeline step 1/3: extract receiver products")
     cmd_extract(args)
     logging.info("pipeline step 2/3: generate rover RINEX and navigation files")
     cmd_rinex(args)
-    out_dir = ensure_out_dir(args.out_dir)
-    base = basename_for(args.rover_log, args.basename)
     rover_obs = out_dir / f"{base}.direct.obs"
     base_obs = [Path(item) for item in args.base_obs or []]
     converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
@@ -3009,7 +3213,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
                 "falling back to solution-record time span for base downloads",
                 rover_obs,
             )
-            base_obs.extend(_download_base_files(args))
+            with _time_phase(args, "base_download_staging"):
+                base_obs.extend(_download_base_files(args))
         else:
             margin = timedelta(seconds=args.time_margin)
             logging.info(
@@ -3018,7 +3223,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
                 rover_span.end + margin,
                 args.time_margin,
             )
-            base_obs.extend(_download_base_files_for_window(args, rover_span.start - margin, rover_span.end + margin))
+            with _time_phase(args, "base_download_staging"):
+                base_obs.extend(_download_base_files_for_window(args, rover_span.start - margin, rover_span.end + margin))
     should_run_rtklib = bool(
         args.run_rtklib
         or args.rtkconf
@@ -3081,18 +3287,19 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     _log_rtklib_input_inventory(inventory)
     if getattr(args, "analysis_json", False):
         _write_rtklib_inventory_analysis(out_dir, base, inventory)
-    commands = _run_rtklib_output_formats(
-        args=args,
-        rnx2rtkp=rnx2rtkp,
-        out_dir=out_dir,
-        basename=base,
-        rover_obs=rover_obs,
-        base_obs=base_obs,
-        nav_files=nav_files,
-        base_obs_arg=base_obs_arg,
-        base_ecef=base_ecef,
-        base_llh=base_llh,
-    )
+    with _time_phase(args, "rtklib_run", output_formats=",".join(_rtklib_output_formats(args))):
+        commands = _run_rtklib_output_formats(
+            args=args,
+            rnx2rtkp=rnx2rtkp,
+            out_dir=out_dir,
+            basename=base,
+            rover_obs=rover_obs,
+            base_obs=base_obs,
+            nav_files=nav_files,
+            base_obs_arg=base_obs_arg,
+            base_ecef=base_ecef,
+            base_llh=base_llh,
+        )
     _run_quality_analysis_if_requested(args, out_dir, base, commands)
     for command in commands:
         print(format_command(command.args))
@@ -3272,7 +3479,7 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             )
             _add_track_source_arg(p)
-            p.add_argument("--obs-csv", action="store_true")
+            p.add_argument("--obs-csv", "--write-observation-csv", dest="obs_csv", action="store_true")
             p.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="none")
             p.add_argument("--rinex-version", default="3.04")
             p.add_argument("--rinex-compat", choices=["native", "convbin"], default="native")
@@ -3315,16 +3522,18 @@ def build_parser() -> argparse.ArgumentParser:
         rinex_compat="native",
     )
 
-    quality = sub.add_parser("quality-analyze")
-    quality.add_argument("--solution", required=True, help="RTKLIB NMEA/POS/LLH solution output.")
-    quality.add_argument("--stat", help="Optional RTKLIB .stat file.")
-    quality.add_argument("--out-md", help="Markdown report output path.")
-    quality.add_argument("--out-json", help="JSON report output path.")
-    quality.add_argument("--format", choices=["text", "markdown", "json"], default="text")
-    _add_quality_trace_args(quality, standalone=True)
-    _add_quality_analyze_args(quality)
-    _add_common(quality)
-    quality.set_defaults(func=cmd_quality_analyze)
+    for quality_name in ("quality-analyze", "quality"):
+        quality = sub.add_parser(quality_name)
+        quality.add_argument("--solution", required=True, help="RTKLIB NMEA/POS/LLH solution output.")
+        quality.add_argument("--solution-type", choices=["nmea", "pos", "auto"], default="auto", help="Accepted for rerun-script compatibility; auto detects from file contents.")
+        quality.add_argument("--stat", help="Optional RTKLIB .stat file.")
+        quality.add_argument("--out-md", help="Markdown report output path.")
+        quality.add_argument("--out-json", help="JSON report output path.")
+        quality.add_argument("--format", choices=["text", "markdown", "json"], default="text")
+        _add_quality_trace_args(quality, standalone=True)
+        _add_quality_analyze_args(quality)
+        _add_common(quality)
+        quality.set_defaults(func=cmd_quality_analyze)
 
     opt = sub.add_parser("optimize-settings")
     opt.add_argument("rover_log", nargs="+")
@@ -3408,6 +3617,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_rtklib_processing_args(post, require_base_obs=False)
     _add_quality_pipeline_args(post)
     _add_base_position_args(post)
+    _add_rerun_args(post)
     _add_common(post)
     post.set_defaults(func=cmd_postprocess)
 
@@ -3473,7 +3683,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pass rnx2rtkp -y LEVEL to write solution status details; 2 includes residuals.",
     )
     _add_auto_sat_qc_args(pipe)
-    pipe.add_argument("--obs-csv", action="store_true", default=True)
+    pipe.add_argument("--obs-csv", "--write-observation-csv", dest="obs_csv", action="store_true", default=True)
+    pipe.add_argument("--no-write-observation-csv", dest="obs_csv", action="store_false")
     pipe.add_argument("--solution", choices=["all", "csv", "gpx", "nmea", "none"], default="all")
     _add_track_source_arg(pipe)
     pipe.add_argument(
@@ -3495,6 +3706,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_base_download_args(pipe, require_station=False, include_rtklib_dir=False)
     _add_quality_pipeline_args(pipe)
     _add_base_position_args(pipe)
+    _add_rerun_args(pipe)
     _add_common(pipe)
     pipe.set_defaults(func=cmd_pipeline)
     return parser
@@ -3515,6 +3727,7 @@ def main(argv: list[str] | None = None) -> int:
     duplicate_options = _scan_duplicate_options(raw_argv)
     args = parser.parse_args(raw_argv)
     setattr(args, "_duplicate_options", duplicate_options)
+    setattr(args, "_original_argv", raw_argv)
     try:
         return args.func(args)
     except Exception as exc:

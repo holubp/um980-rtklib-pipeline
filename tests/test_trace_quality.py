@@ -76,6 +76,7 @@ def test_trace_parser_reads_full_file_by_default_and_marks_caps(tmp_path: Path):
     assert full["trace_lines_read"] == 1200
     assert full["trace_truncated"] is False
     assert full["trace_bytes_read"] == full["trace_file_size_bytes"]
+    assert full["trace_parse_elapsed_s"] >= 0.0
     assert capped["trace_truncated"] is True
     assert capped["trace_bytes_read"] <= 100
 

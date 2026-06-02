@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import time
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -120,6 +122,7 @@ class QualityAnalysis:
     warnings: list[str] = field(default_factory=list)
     trace: dict[str, object] | None = None
     cleanup: dict[str, object] | None = None
+    performance: dict[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         """Return stable JSON-friendly analysis data."""
@@ -148,6 +151,7 @@ class QualityAnalysis:
                 "stat_files_deleted": [],
                 "stat_files_kept": [],
             },
+            "performance": self.performance,
             "warnings": self.warnings,
         }
 
@@ -170,6 +174,55 @@ class _StatAccumulator:
     top_residuals_by_sat: dict[str, int] = field(default_factory=dict)
     slips_by_sat: dict[str, int] = field(default_factory=dict)
     rejections_by_sat: dict[str, int] = field(default_factory=dict)
+    parse_elapsed_s: float = 0.0
+    truncated: bool = False
+    truncate_reason: str | None = None
+    max_lines: int = 0
+    max_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class EpochIndex:
+    """Bisect-backed nearest-neighbour lookup for solution epochs."""
+
+    epochs: list[SolutionEpoch]
+    times_s: list[float]
+
+    @classmethod
+    def build(cls, epochs: list[SolutionEpoch]) -> "EpochIndex":
+        """Build an index sorted by time."""
+
+        ordered = sorted(epochs, key=lambda epoch: epoch.time)
+        return cls(ordered, [_timestamp_s(epoch.time) for epoch in ordered])
+
+    def nearest(self, when: datetime, *, max_dt_s: float = 0.51) -> SolutionEpoch | None:
+        """Return the nearest epoch within `max_dt_s`, or `None`."""
+
+        index = self.nearest_index(when, max_dt_s=max_dt_s)
+        return self.epochs[index] if index is not None else None
+
+    def nearest_index(self, when: datetime, *, max_dt_s: float = 0.51) -> int | None:
+        """Return the nearest epoch index within `max_dt_s`, or `None`."""
+
+        if not self.epochs:
+            return None
+        target = _timestamp_s(when)
+        position = bisect_left(self.times_s, target)
+        candidates: list[int] = []
+        if position < len(self.epochs):
+            candidates.append(position)
+        if position:
+            candidates.append(position - 1)
+        best = min(candidates, key=lambda item: abs(self.times_s[item] - target))
+        return best if abs(self.times_s[best] - target) <= max_dt_s else None
+
+
+def _timestamp_s(value: datetime) -> float:
+    """Return POSIX seconds, treating naive datetimes as UTC."""
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.timestamp()
 
 
 def build_analysis(
@@ -233,6 +286,9 @@ def analyze_rtk_quality(
     thresholds: QualityThresholds | None = None,
     trace_summary: dict[str, object] | None = None,
     cleanup: dict[str, object] | None = None,
+    stat_max_lines: int = 0,
+    stat_max_seconds: float = 0.0,
+    fast: bool = False,
 ) -> QualityAnalysis:
     """Analyse RTKLIB solution quality from `.nmea`/`.pos` and optional `.stat`.
 
@@ -246,21 +302,29 @@ def analyze_rtk_quality(
     """
 
     limits = thresholds or QualityThresholds()
+    solution_parse_started = time.perf_counter()
     epochs, solution_warnings, solution_type = parse_solution_epochs(solution_path)
-    stat = parse_stat_file(stat_path) if stat_path else None
+    solution_parse_elapsed_s = time.perf_counter() - solution_parse_started
+    stat = parse_stat_file(stat_path, max_lines=stat_max_lines, max_seconds=stat_max_seconds, fast=fast) if stat_path and not fast else None
     warnings = [*solution_warnings]
     if stat_path and stat is None:
-        warnings.append(f"stat file unavailable or unreadable: {stat_path}")
+        if fast:
+            warnings.append("quality-fast enabled; STAT parsing and detailed residual/slip QC were skipped")
+        else:
+            warnings.append(f"stat file unavailable or unreadable: {stat_path}")
     if stat_path is None:
         warnings.append("stat file not supplied; residual/slip/rejection analysis unavailable")
     elif stat is not None and stat.parsed_sat_lines == 0:
         warnings.append("stat residual/slip metrics unavailable: no recognised $SAT lines")
+    if stat is not None and stat.truncated:
+        warnings.append(f"STAT parsing truncated by {stat.truncate_reason}; QC confidence is limited")
 
     segments = compute_segments(epochs, gap_split_s=limits.gap_split_s, jump_clip_m=limits.jump_clip_m)
     time_summary = _time_summary(epochs, limits)
     distance_summary = _distance_summary(epochs)
-    residuals = _residual_summary(stat, epochs) if stat else _empty_residual_summary()
-    slips = _slip_summary(stat, epochs) if stat else _empty_slip_summary()
+    epoch_index = EpochIndex.build(epochs)
+    residuals = _residual_summary(stat, epoch_index) if stat else _empty_residual_summary()
+    slips = _slip_summary(stat, epoch_index) if stat else _empty_slip_summary()
     rejections = _rejection_summary(stat) if stat else {"available": False, "count": None, "top_satellites": []}
     motion = _motion_summary(epochs, limits)
     transitions = _transition_summary(epochs, segments, limits, motion)
@@ -279,7 +343,18 @@ def analyze_rtk_quality(
         "stat_lines": stat.stat_lines if stat else 0,
         "stat_sat_lines_parsed": stat.parsed_sat_lines if stat else 0,
         "stat_sat_lines_unparsed": stat.unparsed_sat_lines if stat else 0,
+        "stat_truncated": stat.truncated if stat else False,
+        "stat_truncate_reason": stat.truncate_reason if stat else None,
         "warnings": warnings,
+    }
+    performance = {
+        "solution_parse_elapsed_s": solution_parse_elapsed_s,
+        "stat_parse_elapsed_s": stat.parse_elapsed_s if stat else 0.0,
+        "stat_lines_read": stat.stat_lines if stat else 0,
+        "sat_lines_parsed": stat.parsed_sat_lines if stat else 0,
+        "raw_slip_flags": stat.slip_count if stat else 0,
+        "dedup_slip_events": len(stat.slip_events) if stat else 0,
+        "unique_slip_epochs": len({event[0] for event in stat.slip_events}) if stat else 0,
     }
     return QualityAnalysis(
         inputs={
@@ -287,6 +362,9 @@ def analyze_rtk_quality(
             "stat": str(stat_path) if stat_path else None,
             "solution_type": solution_type,
             "stat_available": stat is not None,
+            "stat_max_lines": stat_max_lines,
+            "stat_max_seconds": stat_max_seconds,
+            "quality_fast": fast,
         },
         parser_coverage=parser_coverage,
         time_summary=time_summary,
@@ -304,6 +382,7 @@ def analyze_rtk_quality(
         warnings=list(dict.fromkeys(warnings)),
         trace=trace_summary,
         cleanup=cleanup,
+        performance=performance,
     )
 
 
@@ -510,19 +589,51 @@ def _segment_from_epochs(epochs: list[SolutionEpoch], start: int, end: int, *, j
     )
 
 
-def parse_stat_file(path: Path | None) -> _StatAccumulator | None:
-    """Parse a tolerant subset of RTKLIB `.stat` SAT rows."""
+def parse_stat_file(
+    path: Path | None,
+    *,
+    max_lines: int = 0,
+    max_seconds: float = 0.0,
+    fast: bool = False,
+) -> _StatAccumulator | None:
+    """Parse a tolerant subset of RTKLIB `.stat` SAT rows.
+
+    Args:
+        path: STAT path.
+        max_lines: Optional maximum physical lines to scan. Zero is unlimited.
+        max_seconds: Optional wall-clock parse budget. Zero is unlimited.
+        fast: When true, skip parsing and return an empty accumulator.
+    """
 
     if path is None or not path.exists():
         return None
+    started = time.perf_counter()
     stat = _StatAccumulator()
-    for line in path.read_text(encoding="ascii", errors="ignore").splitlines():
-        stat.stat_lines += 1
-        if not line.startswith("$SAT"):
-            continue
-        stat.sat_lines += 1
-        if not _parse_sat_stat_line(line, stat):
-            stat.unparsed_sat_lines += 1
+    stat.max_lines = max(0, int(max_lines or 0))
+    stat.max_seconds = max(0.0, float(max_seconds or 0.0))
+    if fast:
+        stat.truncated = True
+        stat.truncate_reason = "quality-fast"
+        stat.parse_elapsed_s = 0.0
+        return stat
+    with path.open("r", encoding="ascii", errors="ignore") as handle:
+        for line in handle:
+            if stat.max_lines and stat.stat_lines >= stat.max_lines:
+                stat.truncated = True
+                stat.truncate_reason = f"max_lines={stat.max_lines}"
+                break
+            if stat.max_seconds and time.perf_counter() - started >= stat.max_seconds:
+                stat.truncated = True
+                stat.truncate_reason = f"max_seconds={stat.max_seconds:g}"
+                break
+            line = line.rstrip("\r\n")
+            stat.stat_lines += 1
+            if not line.startswith("$SAT"):
+                continue
+            stat.sat_lines += 1
+            if not _parse_sat_stat_line(line, stat):
+                stat.unparsed_sat_lines += 1
+    stat.parse_elapsed_s = time.perf_counter() - started
     return stat
 
 
@@ -910,12 +1021,12 @@ def _transition_jump_item(left: SolutionEpoch, right: SolutionEpoch, segment_sta
     }
 
 
-def _residual_summary(stat: _StatAccumulator | None, epochs: list[SolutionEpoch]) -> dict[str, object]:
+def _residual_summary(stat: _StatAccumulator | None, epoch_index: EpochIndex) -> dict[str, object]:
     if stat is None or stat.parsed_sat_lines == 0:
         return _empty_residual_summary()
     by_quality: dict[str, dict[str, list[float]]] = {quality: {"carrier": [], "code": []} for quality in QUALITY_ORDER}
     for time, residuals in stat.residuals_by_time.items():
-        nearest = _nearest_epoch(epochs, time)
+        nearest = epoch_index.nearest(time)
         if nearest is None:
             continue
         by_quality[nearest.quality]["carrier"].extend(residuals.get("carrier", []))
@@ -944,35 +1055,40 @@ def _residual_summary(stat: _StatAccumulator | None, epochs: list[SolutionEpoch]
     }
 
 
-def _slip_summary(stat: _StatAccumulator, epochs: list[SolutionEpoch]) -> dict[str, object]:
+def _slip_summary(stat: _StatAccumulator, epoch_index: EpochIndex) -> dict[str, object]:
     if stat.parsed_sat_lines == 0:
         return _empty_slip_summary()
     duration_min = 0.0
+    epochs = epoch_index.epochs
     if epochs:
         duration_min = max(0.0, (epochs[-1].time - epochs[0].time).total_seconds() / 60.0)
     slip_epoch_indexes: set[int] = set()
+    unique_stat_slip_epochs = {time for time, _, _, _ in stat.slip_events}
+    stat_epoch_to_solution_index: dict[datetime, int | None] = {
+        time: epoch_index.nearest_index(time) for time in unique_stat_slip_epochs
+    }
     for time, _, _, _ in stat.slip_events:
-        nearest = _nearest_epoch(epochs, time)
-        if nearest is not None:
-            try:
-                slip_epoch_indexes.add(epochs.index(nearest))
-            except ValueError:
-                pass
+        nearest_index = stat_epoch_to_solution_index.get(time)
+        if nearest_index is not None:
+            slip_epoch_indexes.add(nearest_index)
     epochs_with_slip_pct = (100.0 * len(slip_epoch_indexes) / len(epochs)) if epochs and slip_epoch_indexes else None
     fixed_count = sum(1 for epoch in epochs if epoch.quality == "fixed")
     fixed_with_recent = 0
     if fixed_count and slip_epoch_indexes:
-        slip_times = [epochs[index].time for index in slip_epoch_indexes]
+        slip_times_s = sorted(_timestamp_s(epochs[index].time) for index in slip_epoch_indexes)
         for epoch in epochs:
             if epoch.quality != "fixed":
                 continue
-            if any(0 <= (epoch.time - slip_time).total_seconds() <= 10.0 for slip_time in slip_times):
+            epoch_s = _timestamp_s(epoch.time)
+            pos = bisect_left(slip_times_s, epoch_s - 10.0)
+            if pos < len(slip_times_s) and slip_times_s[pos] <= epoch_s:
                 fixed_with_recent += 1
     return {
         "available": True,
         "raw_slip_flags_total": stat.slip_count,
         "raw_slip_flags_per_min": (stat.slip_count / duration_min) if duration_min else 0.0,
         "deduplicated_slip_events_total": len(stat.slip_events),
+        "unique_slip_epochs": len(unique_stat_slip_epochs),
         "epochs_with_slip": len(slip_epoch_indexes) if slip_epoch_indexes else None,
         "fixed_epochs_with_recent_slip_pct": (100.0 * fixed_with_recent / fixed_count) if fixed_count and slip_epoch_indexes else None,
         "events_total": stat.slip_count,
@@ -986,17 +1102,6 @@ def _rejection_summary(stat: _StatAccumulator) -> dict[str, object]:
     if stat.parsed_sat_lines == 0:
         return {"available": False, "count": None, "top_satellites": []}
     return {"available": True, "count": stat.rejected_count, "top_satellites": _top_counts(stat.rejections_by_sat)}
-
-
-def _nearest_epoch(epochs: list[SolutionEpoch], time: datetime, *, max_dt_s: float = 0.51) -> SolutionEpoch | None:
-    """Return the nearest solution epoch within a bounded time tolerance."""
-
-    if not epochs:
-        return None
-    nearest = min(epochs, key=lambda epoch: abs((epoch.time - time).total_seconds()))
-    if abs((nearest.time - time).total_seconds()) <= max_dt_s:
-        return nearest
-    return None
 
 
 def write_quality_json(path: Path, analysis: QualityAnalysis) -> None:
@@ -1351,6 +1456,7 @@ def _empty_slip_summary() -> dict[str, object]:
         "raw_slip_flags_total": None,
         "raw_slip_flags_per_min": None,
         "deduplicated_slip_events_total": None,
+        "unique_slip_epochs": None,
         "epochs_with_slip": None,
         "fixed_epochs_with_recent_slip_pct": None,
         "events_total": None,

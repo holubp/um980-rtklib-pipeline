@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline.nmea import make_sentence
 from um980_rtklib_pipeline.quality import (
+    EpochIndex,
     QualityThresholds,
+    SolutionEpoch,
     analyze_rtk_quality,
     compute_segments,
     parse_solution_epochs,
     parse_stat_file,
 )
+from um980_rtklib_pipeline.timeutil import gps_week_tow_to_utc_datetime
 
 
 def _gga(time: str, lat: str, lon: str, quality: int, sats: int = 18, hdop: float = 0.7, height: float = 250.0) -> str:
@@ -51,6 +55,21 @@ def test_nmea_gga_parser_maps_quality_and_fields(tmp_path: Path):
     assert epochs[0].height_m == 250.0
     assert epochs[0].num_sats == 18
     assert epochs[0].hdop == 0.7
+
+
+def test_epoch_index_nearest_lookup_exact_between_and_bounds() -> None:
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    epochs = [
+        _epoch_at(base, 0.0),
+        _epoch_at(base, 1.0),
+        _epoch_at(base, 2.0),
+    ]
+    index = EpochIndex.build(epochs)
+
+    assert index.nearest(base) == epochs[0]
+    assert index.nearest(base + timedelta(seconds=1.4)) == epochs[1]
+    assert index.nearest(base - timedelta(seconds=5.0)) is None
+    assert index.nearest(base + timedelta(seconds=5.0)) is None
 
 
 def test_segment_computation_splits_on_quality_and_gaps(tmp_path: Path):
@@ -230,6 +249,70 @@ def test_incomplete_diagnostics_limit_qc_confidence_without_forcing_suspect(tmp_
     assert any("not aligned" in warning for warning in data["warnings"])
 
 
+def test_large_stat_slip_summary_uses_deduplicated_epoch_alignment(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    solution = tmp_path / "large.pos"
+    solution.write_text(
+        "".join(
+            f"{(base + timedelta(seconds=index)).strftime('%Y/%m/%d %H:%M:%S')}.000 "
+            f"{50.0 + index * 0.000001:.7f} 14.0000000 250.0 1 18\n"
+            for index in range(10_000)
+        ),
+        encoding="ascii",
+    )
+    stat = tmp_path / "large.stat"
+    sats = [f"G{sat:02d}" for sat in range(1, 11)]
+    lines = []
+    for index in range(100_000):
+        tow = 450000.0 + (index % 1000)
+        sat = sats[index % len(sats)]
+        # Same epoch/sat/frequency repeats many times and must collapse.
+        lines.append(f"$SAT,2419,{tow:.1f},{sat},L1,45,120,0.12,2.5,1,42,0,1,0,0,0,0\n")
+    stat.write_text("".join(lines), encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat).as_dict()
+
+    assert data["slips"]["raw_slip_flags_total"] == 100_000
+    assert data["slips"]["deduplicated_slip_events_total"] == 1000
+    assert data["slips"]["unique_slip_epochs"] == 1000
+    assert data["slips"]["epochs_with_slip"] == 1000
+    assert data["performance"]["raw_slip_flags"] == 100_000
+    assert data["performance"]["dedup_slip_events"] == 1000
+
+
+def test_quality_stat_max_lines_marks_limited_confidence(tmp_path: Path):
+    solution = _write_minimal_pos(tmp_path)
+    stat = tmp_path / "limited.stat"
+    stat.write_text(
+        "".join("$SAT,2419,450000.0,G01,L1,45,120,0.12,2.5,1,42,0,1,0,0,0,0\n" for _ in range(10)),
+        encoding="ascii",
+    )
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat, stat_max_lines=3).as_dict()
+
+    assert data["parser_coverage"]["stat_truncated"] is True
+    assert data["parser_coverage"]["stat_lines"] == 3
+    assert any("STAT parsing truncated" in warning for warning in data["warnings"])
+
+
+def test_quality_fast_skips_stat_detail(tmp_path: Path):
+    solution = _write_minimal_pos(tmp_path)
+    stat = tmp_path / "run.stat"
+    stat.write_text("$SAT,2419,450000.0,G01,L1,45,120,0.12,2.5,1,42,0,1,0,0,0,0\n", encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat, fast=True).as_dict()
+
+    assert data["inputs"]["quality_fast"] is True
+    assert data["inputs"]["stat_available"] is False
+    assert any("quality-fast enabled" in warning for warning in data["warnings"])
+
+
+def test_no_linear_nearest_epoch_scan_in_quality_module() -> None:
+    source = Path("src/um980_rtklib_pipeline/quality.py").read_text(encoding="utf-8")
+
+    assert "min(epochs, key=" not in source
+
+
 def test_pipeline_quality_analyze_invokes_analyzer(tmp_path: Path, monkeypatch):
     output = tmp_path / "rover-rtk.pos"
     output.write_text("2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n", encoding="ascii")
@@ -270,6 +353,21 @@ def test_pipeline_quality_analyze_invokes_analyzer(tmp_path: Path, monkeypatch):
 def _write_minimal_pos(tmp_path: Path) -> Path:
     path = tmp_path / "run.pos"
     path.write_text("2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n", encoding="ascii")
+    return path
+
+
+def _epoch_at(base: datetime, offset_s: float):
+    return SolutionEpoch(
+        time=base + timedelta(seconds=offset_s),
+        lat=50.0,
+        lon=14.0,
+        height_m=250.0,
+        quality="fixed",
+        raw_quality=1,
+        num_sats=16,
+        hdop=None,
+        source="pos",
+    )
     return path
 
 

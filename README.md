@@ -487,6 +487,19 @@ ION/UTC families are reported as available or diagnostic-only unless they were
 actually emitted into a supported RINEX NAV header; availability alone is not
 reported as emission.
 
+Verbose runs also create reproducibility artifacts by default unless disabled
+with `--no-emit-run-script`:
+
+- `<out_dir>/<basename>.rerun.sh`
+- `<out_dir>/<basename>.commands.md`
+
+The files are appended as commands become known, so they are still useful after
+partial failures. They include the original high-level command, the exact
+RTKLIB wrapper invocation, and the standalone quality-analysis command. Use
+`--print-step-commands` to log copy-paste commands during the run, or
+`--emit-run-script PATH` to choose a script path explicitly. `--dry-run-plan`
+generates the plan and RTKLIB wrapper commands without running RTKLIB.
+
 RTK2Go and other public casters are treated as generic NTRIP casters. To inspect
 a caster without adding RTK2Go-specific assumptions:
 
@@ -599,7 +612,7 @@ pipeline command is extended to do so.
 
 ## RTK Quality Analysis
 
-Use `quality-analyze` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
+Use `quality-analyze` or its shorter alias `quality` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
 solution together with an optional `.stat` file. The analyser keeps raw RTK
 state summaries separate from QC confidence. Raw fixed/float/DGPS/single
 percentages are reported unchanged, while fixed epochs are additionally
@@ -617,6 +630,23 @@ PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \
   --out-md rover_20260531095025-quality.md \
   --out-json rover_20260531095025-quality.json
 ```
+
+Large `.stat` files are parsed as a single streaming pass. Slip evidence is
+deduplicated and unique STAT epochs are aligned to solution epochs through an
+indexed lookup rather than a linear scan. The JSON `performance` block reports
+`stat_parse_elapsed_s`, `stat_lines_read`, `sat_lines_parsed`,
+`raw_slip_flags`, `dedup_slip_events`, and `unique_slip_epochs`.
+
+Optional bounds are available for quick inspection:
+
+```bash
+--quality-stat-max-lines 200000
+--quality-stat-max-seconds 10
+--quality-fast
+```
+
+If parsing is capped or `--quality-fast` skips STAT detail, the report marks
+QC confidence as limited/unknown where residual or slip evidence is incomplete.
 
 Distance and time are both reported because they answer different questions.
 Time-based segment length is always relevant. Distance-based segment length is
