@@ -66,6 +66,20 @@ def test_trace_parser_streams_and_counts_events(tmp_path: Path):
     assert len(summary["examples"]["cycle_slip_lines"]) == 1
 
 
+def test_trace_parser_reads_full_file_by_default_and_marks_caps(tmp_path: Path):
+    trace = tmp_path / "large.trace"
+    trace.write_text("".join("resamb: ratio=3.2\n" for _ in range(1200)), encoding="ascii")
+
+    full = analyze_rtklib_trace(trace)
+    capped = analyze_rtklib_trace(trace, max_bytes=100)
+
+    assert full["trace_lines_read"] == 1200
+    assert full["trace_truncated"] is False
+    assert full["trace_bytes_read"] == full["trace_file_size_bytes"]
+    assert capped["trace_truncated"] is True
+    assert capped["trace_bytes_read"] <= 100
+
+
 def test_trace_parser_ignores_unknown_and_malformed_lines(tmp_path: Path):
     trace = tmp_path / "trace.log"
     trace.write_bytes(b"\xff\xfeunknown\nratio=not-a-number\n")
@@ -83,7 +97,10 @@ def test_traced_rnx2rtkp_adds_trace_level_and_uses_temp_cwd(tmp_path: Path, monk
     def fake_run(args, **kwargs):
         seen["args"] = args
         seen["cwd"] = kwargs.get("cwd")
-        Path(kwargs["cwd"], "rnx2rtkp.trace").write_text("resamb: ratio=3.2\ncycle slip\n", encoding="ascii")
+        Path(kwargs["cwd"], "rnx2rtkp.trace").write_text(
+            "".join("resamb: ratio=3.2\n" for _ in range(1001)) + "cycle slip\n",
+            encoding="ascii",
+        )
         output.write_text("%  GPST latitude(deg) longitude(deg) height(m) Q ns\n", encoding="ascii")
         return argparse.Namespace(returncode=0, stdout="", stderr="")
 
@@ -106,6 +123,8 @@ def test_traced_rnx2rtkp_adds_trace_level_and_uses_temp_cwd(tmp_path: Path, monk
     assert command.trace_generated_temporarily is True
     assert command.trace_retained is False
     assert command.trace_summary["counters"]["cycle_slip_lines"] == 1
+    assert command.trace_summary["trace_lines_read"] == 1002
+    assert command.trace_summary["trace_truncated"] is False
     assert not Path(seen["cwd"]).exists()
 
 

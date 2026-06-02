@@ -91,6 +91,12 @@ class QualityThresholds:
     gap_split_s: float = 2.0
     stationary_speed_threshold_mps: float = 0.3
     jump_clip_m: float = 100.0
+    motion_profile: str = "auto"
+    max_speed_mps: float | None = None
+    max_accel_mps2: float | None = None
+    transition_window_s: float = 2.0
+    route_bin_km: float | None = 10.0
+    baseline_bins: list[float] = field(default_factory=lambda: [0, 10, 20, 30, 40, 50, 75, 100, 150])
 
 
 @dataclass(frozen=True)
@@ -107,7 +113,11 @@ class QualityAnalysis:
     rejections: dict[str, object]
     transition_jumps: dict[str, object]
     false_fix_suspicion: dict[str, object]
-    warnings: list[str]
+    motion: dict[str, object] = field(default_factory=dict)
+    dropout_reacquisition: dict[str, object] = field(default_factory=dict)
+    baseline_summary: dict[str, object] = field(default_factory=dict)
+    route_bins: list[dict[str, object]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     trace: dict[str, object] | None = None
     cleanup: dict[str, object] | None = None
 
@@ -125,6 +135,10 @@ class QualityAnalysis:
             "rejections": self.rejections,
             "transition_jumps": self.transition_jumps,
             "false_fix_suspicion": self.false_fix_suspicion,
+            "motion": self.motion,
+            "dropout_reacquisition": self.dropout_reacquisition,
+            "baseline_summary": self.baseline_summary,
+            "route_bins": self.route_bins,
             "trace": self.trace or {"available": False},
             "cleanup": self.cleanup
             or {
@@ -147,6 +161,7 @@ class _StatAccumulator:
     carrier_residual_abs_m: list[float] = field(default_factory=list)
     code_residual_abs_m: list[float] = field(default_factory=list)
     slip_times: list[datetime] = field(default_factory=list)
+    slip_events: set[tuple[datetime, str, str, str]] = field(default_factory=set)
     slip_count: int = 0
     rejected_count: int = 0
     used_counts_by_time: dict[datetime, int] = field(default_factory=dict)
@@ -244,11 +259,19 @@ def analyze_rtk_quality(
     segments = compute_segments(epochs, gap_split_s=limits.gap_split_s, jump_clip_m=limits.jump_clip_m)
     time_summary = _time_summary(epochs, limits)
     distance_summary = _distance_summary(epochs)
-    residuals = _residual_summary(stat, segments) if stat else _empty_residual_summary()
+    residuals = _residual_summary(stat, epochs) if stat else _empty_residual_summary()
     slips = _slip_summary(stat, epochs) if stat else _empty_slip_summary()
     rejections = _rejection_summary(stat) if stat else {"available": False, "count": None, "top_satellites": []}
-    transitions = _transition_summary(epochs, segments, limits)
-    suspicion = _false_fix_suspicion(segments, epochs, stat, transitions, limits)
+    motion = _motion_summary(epochs, limits)
+    transitions = _transition_summary(epochs, segments, limits, motion)
+    dropout = _dropout_reacquisition_summary(epochs, segments, limits)
+    suspicion = _false_fix_suspicion(segments, epochs, stat, transitions, residuals, slips, limits)
+    baseline_summary = _baseline_summary(epochs, limits)
+    route_bins = _route_bins(epochs, limits)
+    if residuals.get("available") and residuals.get("quality_aligned") is False:
+        warnings.append("STAT residuals parsed globally but not aligned to solution quality states; residuals not used for hard fixed-epoch suspicion.")
+    if slips.get("available") and slips.get("epochs_with_slip_pct") is None:
+        warnings.append("STAT slip flags are not sufficiently time-aligned/deduplicated; raw slip counts are not used for hard fixed-epoch suspicion.")
     warnings.extend(_top_warnings(time_summary, suspicion, transitions, residuals, slips))
     parser_coverage = {
         "solution_epochs": len(epochs),
@@ -274,6 +297,10 @@ def analyze_rtk_quality(
         rejections=rejections,
         transition_jumps=transitions,
         false_fix_suspicion=suspicion,
+        motion=motion,
+        dropout_reacquisition=dropout,
+        baseline_summary=baseline_summary,
+        route_bins=route_bins,
         warnings=list(dict.fromkeys(warnings)),
         trace=trace_summary,
         cleanup=cleanup,
@@ -536,6 +563,7 @@ def _parse_sat_stat_line(line: str, stat: _StatAccumulator) -> bool:
     if slip:
         stat.slip_count += 1
         stat.slip_times.append(time)
+        stat.slip_events.add((time, sat, fields[4] if len(fields) > 4 else "", "slip"))
         stat.slips_by_sat[sat] = stat.slips_by_sat.get(sat, 0) + 1
     if rejected:
         stat.rejected_count += 1
@@ -618,27 +646,129 @@ def _segment_summary(segments: list[Segment]) -> dict[str, object]:
     return result
 
 
+def _motion_summary(epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> dict[str, object]:
+    speeds: list[float] = []
+    for left, right in zip(epochs, epochs[1:], strict=False):
+        if left.lat is None or left.lon is None or right.lat is None or right.lon is None:
+            continue
+        dt = (right.time - left.time).total_seconds()
+        if dt <= 0:
+            continue
+        speeds.append(_haversine_m(left.lat, left.lon, right.lat, right.lon) / dt)
+    p95 = _percentile(speeds, 95) or 0.0
+    requested = thresholds.motion_profile
+    if requested == "auto":
+        if p95 <= 1.0:
+            profile = "static"
+        elif p95 <= 3.0:
+            profile = "walking"
+        elif p95 <= 15.0:
+            profile = "cycling"
+        elif p95 <= 45.0:
+            profile = "vehicle"
+        else:
+            profile = "highway"
+    else:
+        profile = requested
+    defaults = {"static": 1.0, "walking": 3.0, "cycling": 15.0, "vehicle": 45.0, "highway": 60.0}
+    max_speed = thresholds.max_speed_mps or defaults.get(profile, 45.0)
+    return {
+        "requested_profile": requested,
+        "inferred_profile": profile,
+        "median_speed_mps": _percentile(speeds, 50),
+        "p95_speed_mps": _percentile(speeds, 95),
+        "max_speed_mps": max(speeds) if speeds else None,
+        "max_speed_threshold_mps": max_speed,
+        "max_accel_threshold_mps2": thresholds.max_accel_mps2,
+    }
+
+
+def _dropout_reacquisition_summary(
+    epochs: list[SolutionEpoch],
+    segments: list[Segment],
+    _thresholds: QualityThresholds,
+) -> dict[str, object]:
+    outages: list[float] = []
+    reacq: list[float] = []
+    for previous, outage, current in zip(segments, segments[1:], segments[2:], strict=False):
+        if previous.quality == "fixed" and current.quality == "fixed" and outage.quality != "fixed":
+            outages.append(outage.duration_s)
+            if previous.end_index < len(epochs) and current.start_index < len(epochs):
+                reacq.append(max(0.0, (epochs[current.start_index].time - epochs[previous.end_index].time).total_seconds()))
+    return {
+        "likely_occlusion_events": len(outages),
+        "median_outage_s": _percentile(outages, 50),
+        "max_outage_s": max(outages) if outages else None,
+        "median_reacquisition_s": _percentile(reacq, 50),
+    }
+
+
+def _baseline_summary(_epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> dict[str, object]:
+    return {
+        "available": False,
+        "reason": "base coordinates not supplied to quality analyzer",
+        "bins_km": thresholds.baseline_bins,
+        "interpretation": "Baseline distance is reported for context when available and is not used by itself to mark fixed epochs suspect.",
+    }
+
+
+def _route_bins(epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> list[dict[str, object]]:
+    if thresholds.route_bin_km is None or thresholds.route_bin_km <= 0:
+        return []
+    bins: list[dict[str, object]] = []
+    bin_m = thresholds.route_bin_km * 1000.0
+    current_start = 0.0
+    quality_time: dict[str, float] = {quality: 0.0 for quality in QUALITY_ORDER}
+    distance = 0.0
+    for left, right in zip(epochs, epochs[1:], strict=False):
+        if left.lat is None or left.lon is None or right.lat is None or right.lon is None:
+            continue
+        step = _haversine_m(left.lat, left.lon, right.lat, right.lon)
+        dt = max(0.0, (right.time - left.time).total_seconds())
+        while distance + step >= current_start + bin_m and step > 0:
+            bins.append(
+                {
+                    "start_km": current_start / 1000.0,
+                    "end_km": (current_start + bin_m) / 1000.0,
+                    "quality_time_s": dict(quality_time),
+                }
+            )
+            current_start += bin_m
+            quality_time = {quality: 0.0 for quality in QUALITY_ORDER}
+        quality_time[left.quality] = quality_time.get(left.quality, 0.0) + dt
+        distance += step
+    if epochs:
+        bins.append({"start_km": current_start / 1000.0, "end_km": distance / 1000.0, "quality_time_s": dict(quality_time)})
+    return bins
+
+
 def _false_fix_suspicion(
     segments: list[Segment],
     epochs: list[SolutionEpoch],
     stat: _StatAccumulator | None,
     transitions: dict[str, object],
+    residuals: dict[str, object],
+    slips: dict[str, object],
     thresholds: QualityThresholds,
 ) -> dict[str, object]:
     trusted_time = provisional_time = suspect_time = 0.0
     trusted_distance = provisional_distance = suspect_distance = 0.0
+    unknown_time = unknown_distance = 0.0
     reasons = {
         "short_time_segment": 0.0,
         "short_distance_while_moving": 0.0,
         "recent_slip": 0.0,
         "high_residual": 0.0,
         "transition_jump": 0.0,
+        "incomplete_diagnostics": 0.0,
     }
     fixed_entry_warning_indexes = {
         item["segment_start_index"]
         for item in transitions.get("fixed_entry_jumps", [])  # type: ignore[union-attr]
-        if isinstance(item, dict) and item.get("horizontal_m", 0) >= thresholds.transition_jump_warning_m
+        if isinstance(item, dict) and item.get("motion_anomaly") in {"warning", "severe"}
     }
+    residuals_hard = bool(residuals.get("quality_aligned"))
+    slips_hard = slips.get("epochs_with_slip_pct") is not None
     for segment in segments:
         if segment.quality != "fixed":
             continue
@@ -652,28 +782,46 @@ def _false_fix_suspicion(
             and (segment.median_speed_mps or 0.0) >= thresholds.stationary_speed_threshold_mps
         ):
             flags.append("short_distance_while_moving")
-        if stat and _has_recent_slip(stat, segment, thresholds.recent_slip_window_s):
+        if stat and slips_hard and _has_recent_slip(stat, segment, thresholds.recent_slip_window_s):
             flags.append("recent_slip")
-        if _segment_high_residual(stat, segment, thresholds):
+        if residuals_hard and _segment_high_residual(stat, segment, thresholds):
             flags.append("high_residual")
         if segment.start_index in fixed_entry_warning_indexes:
             flags.append("transition_jump")
         for flag in set(flags):
             if flag in reasons:
                 reasons[flag] += segment.duration_s
-        severe = "very_short_time_segment" in flags or "transition_jump" in flags or ("recent_slip" in flags and "short_time_segment" in flags)
+        diagnostics_incomplete = bool(stat) and (not residuals_hard or not slips_hard)
+        if diagnostics_incomplete:
+            reasons["incomplete_diagnostics"] += segment.duration_s
+        severe = "transition_jump" in flags or ("recent_slip" in flags and "short_time_segment" in flags)
         if severe:
             suspect_time += segment.duration_s
             suspect_distance += segment.distance_m
         elif flags:
             provisional_time += segment.duration_s
             provisional_distance += segment.distance_m
+        elif diagnostics_incomplete:
+            unknown_time += segment.duration_s
+            unknown_distance += segment.distance_m
         else:
             trusted_time += segment.duration_s
             trusted_distance += segment.distance_m
-    total_fixed_time = trusted_time + provisional_time + suspect_time
-    total_fixed_distance = trusted_distance + provisional_distance + suspect_distance
+    total_fixed_time = trusted_time + provisional_time + suspect_time + unknown_time
+    total_fixed_distance = trusted_distance + provisional_distance + suspect_distance + unknown_distance
     return {
+        "qc_confidence_available": total_fixed_time > 0.0,
+        "raw_fixed_time_s": total_fixed_time,
+        "raw_fixed_distance_m": total_fixed_distance,
+        "qc_supported_fixed_time_s": trusted_time,
+        "qc_supported_fixed_distance_m": trusted_distance,
+        "qc_provisional_fixed_time_s": provisional_time,
+        "qc_provisional_fixed_distance_m": provisional_distance,
+        "qc_suspect_fixed_time_s": suspect_time,
+        "qc_suspect_fixed_distance_m": suspect_distance,
+        "qc_unknown_fixed_time_s": unknown_time,
+        "qc_unknown_fixed_distance_m": unknown_distance,
+        "qc_limitations": _qc_limitations(residuals, slips),
         "trusted_fixed_time_s": trusted_time,
         "provisional_fixed_time_s": provisional_time,
         "suspect_fixed_time_s": suspect_time,
@@ -690,13 +838,28 @@ def _false_fix_suspicion(
     }
 
 
+def _qc_limitations(residuals: dict[str, object], slips: dict[str, object]) -> list[str]:
+    limitations: list[str] = []
+    if residuals.get("available") and residuals.get("quality_aligned") is False:
+        limitations.append("residuals_global_not_quality_aligned")
+    if slips.get("available") and slips.get("epochs_with_slip_pct") is None:
+        limitations.append("slips_not_time_aligned")
+    if residuals.get("available") is False:
+        limitations.append("residuals_unavailable")
+    if slips.get("available") is False:
+        limitations.append("slips_unavailable")
+    return limitations
+
+
 def _transition_summary(
     epochs: list[SolutionEpoch],
     segments: list[Segment],
     thresholds: QualityThresholds,
+    motion: dict[str, object],
 ) -> dict[str, object]:
     fixed_entries: list[dict[str, object]] = []
     fixed_exits: list[dict[str, object]] = []
+    setattr(_transition_jump_item, "_max_speed_mps", float(motion.get("max_speed_threshold_mps") or 45.0))
     for previous, current in zip(segments, segments[1:], strict=False):
         if current.quality == "fixed" and previous.quality != "fixed":
             item = _transition_jump_item(epochs[previous.end_index], epochs[current.start_index], current.start_index)
@@ -707,10 +870,10 @@ def _transition_summary(
             if item:
                 fixed_exits.append(item)
     return {
-        "fixed_entry_gt_warning": sum(1 for item in fixed_entries if item["horizontal_m"] > thresholds.transition_jump_warning_m),
-        "fixed_entry_gt_severe": sum(1 for item in fixed_entries if item["horizontal_m"] > thresholds.transition_jump_severe_m),
-        "fixed_exit_gt_warning": sum(1 for item in fixed_exits if item["horizontal_m"] > thresholds.transition_jump_warning_m),
-        "fixed_exit_gt_severe": sum(1 for item in fixed_exits if item["horizontal_m"] > thresholds.transition_jump_severe_m),
+        "fixed_entry_gt_warning": sum(1 for item in fixed_entries if item.get("motion_anomaly") in {"warning", "severe"}),
+        "fixed_entry_gt_severe": sum(1 for item in fixed_entries if item.get("motion_anomaly") == "severe"),
+        "fixed_exit_gt_warning": sum(1 for item in fixed_exits if item.get("motion_anomaly") in {"warning", "severe"}),
+        "fixed_exit_gt_severe": sum(1 for item in fixed_exits if item.get("motion_anomaly") == "severe"),
         "largest_fixed_entry_jump_m": max((item["horizontal_m"] for item in fixed_entries), default=0.0),
         "largest_fixed_exit_jump_m": max((item["horizontal_m"] for item in fixed_exits), default=0.0),
         "fixed_entry_jumps": fixed_entries,
@@ -724,30 +887,58 @@ def _transition_jump_item(left: SolutionEpoch, right: SolutionEpoch, segment_sta
     vertical = None
     if left.height_m is not None and right.height_m is not None:
         vertical = abs(right.height_m - left.height_m)
+    dt = max(0.0, (right.time - left.time).total_seconds())
+    horizontal = _haversine_m(left.lat, left.lon, right.lat, right.lon)
+    implied_speed = (horizontal / dt) if dt else None
+    max_speed = getattr(_transition_jump_item, "_max_speed_mps", 45.0)
+    anomaly = "none"
+    if implied_speed is not None:
+        if implied_speed > max_speed * 1.8:
+            anomaly = "severe"
+        elif implied_speed > max_speed * 1.25:
+            anomaly = "warning"
     return {
         "time": right.time.isoformat(),
         "segment_start_index": segment_start_index,
         "from_quality": left.quality,
         "to_quality": right.quality,
-        "horizontal_m": _haversine_m(left.lat, left.lon, right.lat, right.lon),
+        "dt_s": dt,
+        "horizontal_m": horizontal,
+        "implied_speed_mps": implied_speed,
         "vertical_m": vertical,
+        "motion_anomaly": anomaly,
     }
 
 
-def _residual_summary(stat: _StatAccumulator | None, _segments: list[Segment]) -> dict[str, object]:
+def _residual_summary(stat: _StatAccumulator | None, epochs: list[SolutionEpoch]) -> dict[str, object]:
     if stat is None or stat.parsed_sat_lines == 0:
         return _empty_residual_summary()
+    by_quality: dict[str, dict[str, list[float]]] = {quality: {"carrier": [], "code": []} for quality in QUALITY_ORDER}
+    for time, residuals in stat.residuals_by_time.items():
+        nearest = _nearest_epoch(epochs, time)
+        if nearest is None:
+            continue
+        by_quality[nearest.quality]["carrier"].extend(residuals.get("carrier", []))
+        by_quality[nearest.quality]["code"].extend(residuals.get("code", []))
+    quality_aligned = any(values["carrier"] or values["code"] for values in by_quality.values())
     return {
         "available": True,
+        "quality_aligned": quality_aligned,
         "carrier_abs_m": {
             "global": _stats(stat.carrier_residual_abs_m),
-            "fixed_p95": None,
-            "float_p95": None,
+            "fixed_p95": _stats(by_quality["fixed"]["carrier"])["p95"],
+            "float_p95": _stats(by_quality["float"]["carrier"])["p95"],
+            "dgps_p95": _stats(by_quality["dgps"]["carrier"])["p95"],
         },
         "code_abs_m": {
             "global": _stats(stat.code_residual_abs_m),
-            "fixed_p95": None,
-            "float_p95": None,
+            "fixed_p95": _stats(by_quality["fixed"]["code"])["p95"],
+            "float_p95": _stats(by_quality["float"]["code"])["p95"],
+            "dgps_p95": _stats(by_quality["dgps"]["code"])["p95"],
+        },
+        "by_quality": {
+            quality: {"carrier_abs_m": _stats(values["carrier"]), "code_abs_m": _stats(values["code"])}
+            for quality, values in by_quality.items()
         },
         "top_satellites_by_high_residual_count": _top_counts(stat.top_residuals_by_sat),
     }
@@ -759,11 +950,34 @@ def _slip_summary(stat: _StatAccumulator, epochs: list[SolutionEpoch]) -> dict[s
     duration_min = 0.0
     if epochs:
         duration_min = max(0.0, (epochs[-1].time - epochs[0].time).total_seconds() / 60.0)
+    slip_epoch_indexes: set[int] = set()
+    for time, _, _, _ in stat.slip_events:
+        nearest = _nearest_epoch(epochs, time)
+        if nearest is not None:
+            try:
+                slip_epoch_indexes.add(epochs.index(nearest))
+            except ValueError:
+                pass
+    epochs_with_slip_pct = (100.0 * len(slip_epoch_indexes) / len(epochs)) if epochs and slip_epoch_indexes else None
+    fixed_count = sum(1 for epoch in epochs if epoch.quality == "fixed")
+    fixed_with_recent = 0
+    if fixed_count and slip_epoch_indexes:
+        slip_times = [epochs[index].time for index in slip_epoch_indexes]
+        for epoch in epochs:
+            if epoch.quality != "fixed":
+                continue
+            if any(0 <= (epoch.time - slip_time).total_seconds() <= 10.0 for slip_time in slip_times):
+                fixed_with_recent += 1
     return {
         "available": True,
+        "raw_slip_flags_total": stat.slip_count,
+        "raw_slip_flags_per_min": (stat.slip_count / duration_min) if duration_min else 0.0,
+        "deduplicated_slip_events_total": len(stat.slip_events),
+        "epochs_with_slip": len(slip_epoch_indexes) if slip_epoch_indexes else None,
+        "fixed_epochs_with_recent_slip_pct": (100.0 * fixed_with_recent / fixed_count) if fixed_count and slip_epoch_indexes else None,
         "events_total": stat.slip_count,
         "events_per_min": (stat.slip_count / duration_min) if duration_min else 0.0,
-        "epochs_with_slip_pct": None,
+        "epochs_with_slip_pct": epochs_with_slip_pct,
         "top_satellites": _top_counts(stat.slips_by_sat),
     }
 
@@ -772,6 +986,17 @@ def _rejection_summary(stat: _StatAccumulator) -> dict[str, object]:
     if stat.parsed_sat_lines == 0:
         return {"available": False, "count": None, "top_satellites": []}
     return {"available": True, "count": stat.rejected_count, "top_satellites": _top_counts(stat.rejections_by_sat)}
+
+
+def _nearest_epoch(epochs: list[SolutionEpoch], time: datetime, *, max_dt_s: float = 0.51) -> SolutionEpoch | None:
+    """Return the nearest solution epoch within a bounded time tolerance."""
+
+    if not epochs:
+        return None
+    nearest = min(epochs, key=lambda epoch: abs((epoch.time - time).total_seconds()))
+    if abs((nearest.time - time).total_seconds()) <= max_dt_s:
+        return nearest
+    return None
 
 
 def write_quality_json(path: Path, analysis: QualityAnalysis) -> None:
@@ -801,15 +1026,18 @@ def format_quality_text(analysis: QualityAnalysis) -> str:
         )
     lines.append(f"  missing: {float(time_summary['missing_time_s']):8.1f} s ({float(time_summary['missing_pct']):5.1f}%)")
     lines.append("")
-    lines.append("Fixed quality:")
+    lines.append("Fixed QC confidence:")
     lines.append(
-        f"  trusted:     {float(suspicion['trusted_fixed_time_s']):8.1f} s, {float(suspicion['trusted_fixed_distance_m']) / 1000.0:7.3f} km"
+        f"  supported:   {float(suspicion['qc_supported_fixed_time_s']):8.1f} s, {float(suspicion['qc_supported_fixed_distance_m']) / 1000.0:7.3f} km"
     )
     lines.append(
-        f"  provisional: {float(suspicion['provisional_fixed_time_s']):8.1f} s, {float(suspicion['provisional_fixed_distance_m']) / 1000.0:7.3f} km"
+        f"  provisional: {float(suspicion['qc_provisional_fixed_time_s']):8.1f} s, {float(suspicion['qc_provisional_fixed_distance_m']) / 1000.0:7.3f} km"
     )
     lines.append(
-        f"  suspect:     {float(suspicion['suspect_fixed_time_s']):8.1f} s, {float(suspicion['suspect_fixed_distance_m']) / 1000.0:7.3f} km"
+        f"  suspect:     {float(suspicion['qc_suspect_fixed_time_s']):8.1f} s, {float(suspicion['qc_suspect_fixed_distance_m']) / 1000.0:7.3f} km"
+    )
+    lines.append(
+        f"  unknown:     {float(suspicion['qc_unknown_fixed_time_s']):8.1f} s, {float(suspicion['qc_unknown_fixed_distance_m']) / 1000.0:7.3f} km"
     )
     fixed = data["segments"]["fixed"]  # type: ignore[index]
     lines.append("")
@@ -822,10 +1050,13 @@ def format_quality_text(analysis: QualityAnalysis) -> str:
     return "\n".join(lines)
 
 
-def format_quality_markdown(analysis: QualityAnalysis) -> str:
+def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool = False) -> str:
     """Return Markdown RTK quality report."""
 
     data = analysis.as_dict()
+    suspicion = data["false_fix_suspicion"]  # type: ignore[index]
+    raw_fixed_time = float(suspicion.get("raw_fixed_time_s", 0.0)) if isinstance(suspicion, dict) else 0.0
+    raw_fixed_distance = float(suspicion.get("raw_fixed_distance_m", 0.0)) if isinstance(suspicion, dict) else 0.0
     lines = [
         "# RTK Solution Quality Report",
         "",
@@ -857,21 +1088,117 @@ def format_quality_markdown(analysis: QualityAnalysis) -> str:
     lines.extend(
         [
             "",
-            "## 4. Trusted / Provisional / Suspect Fixed",
+            "## 4. Fixed Confidence Classification",
             "",
             "Suspect fixed is heuristic evidence, not proof of a false fix.",
             "",
-            json.dumps(data["false_fix_suspicion"], indent=2, sort_keys=True),
+            "| Class | Time s | Time % of raw fixed | Distance km | Distance % of raw fixed |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for label, time_key, dist_key in (
+        ("supported", "qc_supported_fixed_time_s", "qc_supported_fixed_distance_m"),
+        ("provisional", "qc_provisional_fixed_time_s", "qc_provisional_fixed_distance_m"),
+        ("suspect", "qc_suspect_fixed_time_s", "qc_suspect_fixed_distance_m"),
+        ("unknown", "qc_unknown_fixed_time_s", "qc_unknown_fixed_distance_m"),
+    ):
+        seconds = float(suspicion.get(time_key, 0.0)) if isinstance(suspicion, dict) else 0.0
+        meters = float(suspicion.get(dist_key, 0.0)) if isinstance(suspicion, dict) else 0.0
+        lines.append(f"| {label} | {_fmt(seconds)} | {_fmt_pct(seconds, raw_fixed_time)} | {_fmt(meters / 1000.0)} | {_fmt_pct(meters, raw_fixed_distance)} |")
+    reasons = suspicion.get("reasons", {}) if isinstance(suspicion, dict) else {}
+    lines.extend(["", "| Reason | Affected fixed time s | Interpretation | Evidence status |", "| --- | ---: | --- | --- |"])
+    if isinstance(reasons, dict):
+        for reason, seconds in sorted(reasons.items()):
+            lines.append(f"| {reason} | {_fmt_any(seconds)} | {_reason_interpretation(reason)} | {_reason_status(reason, data)} |")
+    lines.extend(
+        [
             "",
             "## 5. Residual Summary",
             "",
-            json.dumps(data["residuals"], indent=2, sort_keys=True),
+            "| Scope | Carrier median m | Carrier p95 m | Carrier p99 m | Carrier max m | Code median m | Code p95 m | Code p99 m | Code max m |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    residuals = data["residuals"]  # type: ignore[index]
+    if isinstance(residuals, dict):
+        carrier_global = residuals.get("carrier_abs_m", {}).get("global", {}) if isinstance(residuals.get("carrier_abs_m"), dict) else {}
+        code_global = residuals.get("code_abs_m", {}).get("global", {}) if isinstance(residuals.get("code_abs_m"), dict) else {}
+        lines.append(_residual_table_row("all", carrier_global, code_global))
+        by_quality = residuals.get("by_quality", {})
+        if isinstance(by_quality, dict):
+            for quality in ("fixed", "float", "dgps"):
+                item = by_quality.get(quality, {})
+                if isinstance(item, dict):
+                    lines.append(_residual_table_row(quality, item.get("carrier_abs_m", {}), item.get("code_abs_m", {})))
+        if residuals.get("quality_aligned") is False:
+            lines.append("")
+            lines.append("WARNING: STAT residuals parsed globally but not aligned to solution quality states; residuals are not used for hard fixed-epoch suspicion.")
+    lines.extend(
+        [
             "",
             "## 6. Slip / Rejection Summary",
             "",
-            json.dumps({"slips": data["slips"], "rejections": data["rejections"]}, indent=2, sort_keys=True),
+            "| Metric | Value |",
+            "| --- | ---: |",
+        ]
+    )
+    slips = data["slips"]  # type: ignore[index]
+    rejections = data["rejections"]  # type: ignore[index]
+    if isinstance(slips, dict):
+        for key in ("raw_slip_flags_total", "raw_slip_flags_per_min", "deduplicated_slip_events_total", "epochs_with_slip", "epochs_with_slip_pct", "fixed_epochs_with_recent_slip_pct"):
+            lines.append(f"| {key.replace('_', ' ')} | {_fmt_any(slips.get(key))} |")
+    if isinstance(rejections, dict):
+        lines.append(f"| observation rejections | {_fmt_any(rejections.get('count'))} |")
+    lines.extend(
+        [
             "",
-            "## 7. RTKLIB Trace Diagnostics",
+            "## 7. Motion And Baseline Context",
+            "",
+            "| Metric | Value |",
+            "| --- | ---: |",
+        ]
+    )
+    motion = data.get("motion", {})
+    if isinstance(motion, dict):
+        for key in ("requested_profile", "inferred_profile", "median_speed_mps", "p95_speed_mps", "max_speed_mps", "max_speed_threshold_mps"):
+            lines.append(f"| {key.replace('_', ' ')} | {_fmt_any(motion.get(key))} |")
+    dropout = data.get("dropout_reacquisition", {})
+    if isinstance(dropout, dict):
+        lines.append(f"| likely occlusion events | {_fmt_any(dropout.get('likely_occlusion_events'))} |")
+        lines.append(f"| median outage s | {_fmt_any(dropout.get('median_outage_s'))} |")
+        lines.append(f"| max outage s | {_fmt_any(dropout.get('max_outage_s'))} |")
+    baseline = data.get("baseline_summary", {})
+    if isinstance(baseline, dict):
+        lines.append(f"| baseline available | {baseline.get('available')} |")
+        lines.append(f"| baseline note | {baseline.get('interpretation', baseline.get('reason', 'n/a'))} |")
+    lines.extend(
+        [
+            "",
+            "## 8. Quality By Route Distance",
+            "",
+            "| Start km | End km | Fixed s | Float s | DGPS s | Invalid/missing s |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    route_bins = data.get("route_bins", [])
+    if isinstance(route_bins, list) and route_bins:
+        for item in route_bins[:20]:
+            if not isinstance(item, dict):
+                continue
+            quality_time = item.get("quality_time_s", {})
+            if not isinstance(quality_time, dict):
+                quality_time = {}
+            lines.append(
+                f"| {_fmt_any(item.get('start_km'))} | {_fmt_any(item.get('end_km'))} | "
+                f"{_fmt_any(quality_time.get('fixed'))} | {_fmt_any(quality_time.get('float'))} | "
+                f"{_fmt_any(quality_time.get('dgps'))} | {_fmt_any(quality_time.get('invalid'))} |"
+            )
+    else:
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a |")
+    lines.extend(
+        [
+            "",
+            "## 9. RTKLIB Trace Diagnostics",
             "",
         ]
     )
@@ -883,8 +1210,10 @@ def format_quality_markdown(analysis: QualityAnalysis) -> str:
                 f"- Trace mode: `{trace.get('source')}`",
                 f"- Effective trace level: `{trace.get('effective_level')}`",
                 f"- Trace retained: {'yes' if trace.get('retained') else 'no'}",
-                f"- Bytes parsed: {trace.get('bytes_read')}",
-                f"- Lines parsed: {trace.get('lines_read')}",
+                f"- Trace file size bytes: {trace.get('trace_file_size_bytes', trace.get('bytes_read'))}",
+                f"- Trace bytes read: {trace.get('trace_bytes_read', trace.get('bytes_read'))}",
+                f"- Trace lines read: {trace.get('trace_lines_read', trace.get('lines_read'))}",
+                f"- Trace truncated: {trace.get('trace_truncated', False)}",
                 "",
                 "| Event category | Count |",
                 "| --- | ---: |",
@@ -914,7 +1243,7 @@ def format_quality_markdown(analysis: QualityAnalysis) -> str:
                 f"- `.stat` files deleted after successful analysis: {len(deleted) if isinstance(deleted, list) else 0}",
             ]
         )
-    lines.extend(["", "## 8. Top Warnings And Interpretation", ""])
+    lines.extend(["", "## 10. Top Warnings And Interpretation", ""])
     warnings = data.get("warnings", [])
     if warnings:
         lines.extend(f"- WARNING: {warning}" for warning in warnings)  # type: ignore[union-attr]
@@ -923,14 +1252,67 @@ def format_quality_markdown(analysis: QualityAnalysis) -> str:
     lines.extend(
         [
             "",
-            "## 9. Suggested Next Actions",
+            "## 11. Suggested Next Actions",
             "",
-            "- Optimise on trusted fixed time and trusted fixed distance, not raw fixed percentage alone.",
+            "- Optimise on QC-supported fixed time and QC-supported fixed distance, not raw fixed percentage alone.",
             "- Inspect missing/no-output time before comparing configurations.",
             "- Use STAT residual/slip evidence when available before treating short fixed islands as reliable.",
         ]
     )
+    if include_raw_json:
+        lines.extend(["", "## 12. Raw JSON Appendix", "", "```json", json.dumps(data, indent=2, sort_keys=True, default=str), "```"])
     return "\n".join(lines) + "\n"
+
+
+def _fmt(value: float) -> str:
+    return f"{value:,.3f}" if abs(value) < 10 else f"{value:,.1f}"
+
+
+def _fmt_pct(value: float, denominator: float) -> str:
+    return f"{_pct(value, denominator):.1f}%"
+
+
+def _fmt_any(value: object) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return _fmt(value)
+    return str(value)
+
+
+def _residual_table_row(scope: str, carrier: object, code: object) -> str:
+    c = carrier if isinstance(carrier, dict) else {}
+    k = code if isinstance(code, dict) else {}
+    return (
+        f"| {scope} | {_fmt_any(c.get('median'))} | {_fmt_any(c.get('p95'))} | {_fmt_any(c.get('p99'))} | {_fmt_any(c.get('max'))} | "
+        f"{_fmt_any(k.get('median'))} | {_fmt_any(k.get('p95'))} | {_fmt_any(k.get('p99'))} | {_fmt_any(k.get('max'))} |"
+    )
+
+
+def _reason_interpretation(reason: str) -> str:
+    mapping = {
+        "short_time_segment": "short fixed island",
+        "short_distance_while_moving": "short moving segment",
+        "recent_slip": "deduplicated recent slip evidence",
+        "high_residual": "time-aligned residual outlier",
+        "transition_jump": "speed-normalised motion anomaly",
+        "incomplete_diagnostics": "confidence limited by incomplete diagnostics",
+    }
+    return mapping.get(reason, "diagnostic context")
+
+
+def _reason_status(reason: str, data: dict[str, object]) -> str:
+    if reason == "recent_slip":
+        slips = data.get("slips", {})
+        return "aligned" if isinstance(slips, dict) and slips.get("epochs_with_slip_pct") is not None else "not time-aligned"
+    if reason == "high_residual":
+        residuals = data.get("residuals", {})
+        return "aligned" if isinstance(residuals, dict) and residuals.get("quality_aligned") else "global only"
+    return "available"
 
 
 def _empty_time_summary() -> dict[str, object]:
@@ -955,14 +1337,27 @@ def _empty_time_summary() -> dict[str, object]:
 def _empty_residual_summary() -> dict[str, object]:
     return {
         "available": False,
+        "quality_aligned": False,
         "carrier_abs_m": {"global": _stats([]), "fixed_p95": None, "float_p95": None},
         "code_abs_m": {"global": _stats([]), "fixed_p95": None, "float_p95": None},
+        "by_quality": {},
         "top_satellites_by_high_residual_count": [],
     }
 
 
 def _empty_slip_summary() -> dict[str, object]:
-    return {"available": False, "events_total": None, "events_per_min": None, "epochs_with_slip_pct": None, "top_satellites": []}
+    return {
+        "available": False,
+        "raw_slip_flags_total": None,
+        "raw_slip_flags_per_min": None,
+        "deduplicated_slip_events_total": None,
+        "epochs_with_slip": None,
+        "fixed_epochs_with_recent_slip_pct": None,
+        "events_total": None,
+        "events_per_min": None,
+        "epochs_with_slip_pct": None,
+        "top_satellites": [],
+    }
 
 
 def _top_warnings(
@@ -979,7 +1374,13 @@ def _top_warnings(
         )
     suspect = float(suspicion.get("suspect_fixed_time_pct", 0.0))
     if suspect > 10.0:
-        warnings.append(f"{suspect:.1f}% of fixed time is classified as suspect fixed")
+        warnings.append(f"{suspect:.1f}% of fixed time has local suspect-fix evidence")
+    unknown = float(suspicion.get("qc_unknown_fixed_time_s", 0.0))
+    raw_fixed = float(suspicion.get("raw_fixed_time_s", 0.0))
+    if raw_fixed and unknown / raw_fixed > 0.25:
+        warnings.append(
+            f"Fixed confidence could not be established for {100.0 * unknown / raw_fixed:.1f}% because residual/slip diagnostics are incomplete."
+        )
     if int(transitions.get("fixed_entry_gt_warning", 0)) > 0:
         warnings.append(f"{transitions['fixed_entry_gt_warning']} fixed-entry jumps exceed the warning threshold")
     if residuals.get("available") is False:

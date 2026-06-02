@@ -86,6 +86,89 @@ def test_pipeline_quality_cleanup_deletes_generated_stat_after_json(tmp_path: Pa
     assert str(stat) in text
 
 
+def test_pipeline_quality_cleanup_keeps_stat_by_default(tmp_path: Path):
+    out_dir = tmp_path
+    basename = "rover"
+    solution = out_dir / f"{basename}-rtk.pos"
+    stat = out_dir / f"{basename}-rtk.stat"
+    _write_pos(solution)
+    stat.write_text("$SAT,2026/05/30,05:02:10.000,G01\n", encoding="ascii")
+    args = argparse.Namespace(
+        quality_analyze=True,
+        quality_out_md=None,
+        quality_out_json=None,
+        quality_clean_stat=False,
+        quality_trace="off",
+        rtklib_trace_level=None,
+        trusted_fixed_min_duration_s=10.0,
+        trusted_fixed_min_distance_m=20.0,
+        provisional_fixed_min_duration_s=3.0,
+        recent_slip_window_s=10.0,
+        transition_jump_warning_m=1.0,
+        transition_jump_severe_m=3.0,
+        vertical_jump_warning_m=1.5,
+        carrier_residual_warning_m=0.20,
+        carrier_residual_severe_m=0.50,
+        code_residual_warning_m=5.0,
+        code_residual_severe_m=10.0,
+        low_used_signals_warning=12,
+        low_snr_warning_dbhz=35.0,
+        gap_split_s=2.0,
+        stationary_speed_threshold_mps=0.3,
+        output_format=["pos"],
+    )
+
+    cli._run_quality_analysis_if_requested(args, out_dir, basename, [])
+
+    assert stat.exists()
+    text = (out_dir / f"{basename}-rtk.quality.json").read_text(encoding="utf-8")
+    assert '"stat_cleanup_requested": false' in text
+    assert '"stat_files_deleted": []' in text
+
+
+def test_pipeline_quality_cleanup_skips_delete_when_analysis_fails(tmp_path: Path, monkeypatch):
+    out_dir = tmp_path
+    basename = "rover"
+    solution = out_dir / f"{basename}-rtk.pos"
+    stat = out_dir / f"{basename}-rtk.stat"
+    _write_pos(solution)
+    stat.write_text("$SAT,2026/05/30,05:02:10.000,G01\n", encoding="ascii")
+
+    def fail_analysis(**_kwargs):
+        raise RuntimeError("analysis failed")
+
+    monkeypatch.setattr(cli, "analyze_rtk_quality", fail_analysis)
+    args = argparse.Namespace(
+        quality_analyze=True,
+        quality_out_md=None,
+        quality_out_json=None,
+        quality_clean_stat=True,
+        quality_trace="off",
+        rtklib_trace_level=None,
+        trusted_fixed_min_duration_s=10.0,
+        trusted_fixed_min_distance_m=20.0,
+        provisional_fixed_min_duration_s=3.0,
+        recent_slip_window_s=10.0,
+        transition_jump_warning_m=1.0,
+        transition_jump_severe_m=3.0,
+        vertical_jump_warning_m=1.5,
+        carrier_residual_warning_m=0.20,
+        carrier_residual_severe_m=0.50,
+        code_residual_warning_m=5.0,
+        code_residual_severe_m=10.0,
+        low_used_signals_warning=12,
+        low_snr_warning_dbhz=35.0,
+        gap_split_s=2.0,
+        stationary_speed_threshold_mps=0.3,
+        output_format=["pos"],
+    )
+
+    with pytest.raises(RuntimeError, match="analysis failed"):
+        cli._run_quality_analysis_if_requested(args, out_dir, basename, [])
+
+    assert stat.exists()
+
+
 def test_existing_trace_mode_requires_trace_path():
     args = argparse.Namespace(quality_trace="existing", trace=None, rtklib_trace_level=None)
 

@@ -88,7 +88,7 @@ def test_stationary_fixed_segment_not_suspect_for_low_distance(tmp_path: Path):
     assert suspicion["reasons"]["short_distance_while_moving"] == 0.0
 
 
-def test_short_moving_fixed_segment_is_suspect_for_low_distance(tmp_path: Path):
+def test_short_moving_fixed_segment_is_provisional_for_low_distance(tmp_path: Path):
     path = tmp_path / "short.pos"
     path.write_text(
         "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 2 16\n"
@@ -100,17 +100,18 @@ def test_short_moving_fixed_segment_is_suspect_for_low_distance(tmp_path: Path):
     analysis = analyze_rtk_quality(solution_path=path)
     suspicion = analysis.as_dict()["false_fix_suspicion"]
 
-    assert suspicion["suspect_fixed_time_s"] > 0.0
+    assert suspicion["qc_provisional_fixed_time_s"] > 0.0
+    assert suspicion["qc_suspect_fixed_time_s"] == 0.0
     assert suspicion["reasons"]["short_distance_while_moving"] > 0.0
 
 
-def test_missing_output_and_transition_jump_are_reported(tmp_path: Path):
+def test_missing_output_and_impossible_transition_jump_are_reported(tmp_path: Path):
     path = tmp_path / "gap.pos"
     path.write_text(
         "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 2 16\n"
         "2026/05/30 05:00:01.000 50.000001 14.000000 250.0 2 16\n"
-        "2026/05/30 05:00:02.000 50.000002 14.000000 250.0 2 16\n"
-        "2026/05/30 05:00:07.000 50.001000 14.000000 250.0 1 16\n",
+        "2026/05/30 05:00:10.000 50.000002 14.000000 250.0 2 16\n"
+        "2026/05/30 05:00:10.200 50.000720 14.000000 250.0 1 16\n",
         encoding="ascii",
     )
 
@@ -119,6 +120,44 @@ def test_missing_output_and_transition_jump_are_reported(tmp_path: Path):
 
     assert data["time_summary"]["missing_time_s"] > 0.0
     assert data["transition_jumps"]["fixed_entry_gt_warning"] == 1
+    assert data["transition_jumps"]["fixed_entry_jumps"][0]["motion_anomaly"] == "severe"
+
+
+def test_highway_motion_does_not_create_transition_false_warning(tmp_path: Path):
+    path = tmp_path / "highway.pos"
+    lines = []
+    for index in range(10):
+        quality = 1 if index < 4 or index >= 6 else 2
+        # About 7.2 m per 0.2 s, i.e. 36 m/s. This is normal highway motion.
+        lat = 50.0 + index * 0.0000647
+        seconds = index * 0.2
+        lines.append(f"2026/05/30 05:00:{seconds:06.3f} {lat:.7f} 14.0000000 250.0 {quality} 16\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+    analysis = analyze_rtk_quality(solution_path=path, thresholds=QualityThresholds(motion_profile="highway"))
+    data = analysis.as_dict()
+
+    assert data["motion"]["inferred_profile"] == "highway"
+    assert data["transition_jumps"]["fixed_entry_gt_warning"] == 0
+    assert data["false_fix_suspicion"]["qc_suspect_fixed_time_s"] == 0.0
+
+
+def test_bridge_like_dropout_reacquisition_is_reported_without_suspect_fix(tmp_path: Path):
+    path = tmp_path / "bridge.pos"
+    path.write_text(
+        "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n"
+        "2026/05/30 05:00:01.000 50.000100 14.000000 250.0 1 16\n"
+        "2026/05/30 05:00:02.000 50.000200 14.000000 250.0 2 16\n"
+        "2026/05/30 05:00:03.000 50.000300 14.000000 250.0 2 16\n"
+        "2026/05/30 05:00:04.000 50.000400 14.000000 250.0 1 16\n"
+        "2026/05/30 05:00:05.000 50.000500 14.000000 250.0 1 16\n",
+        encoding="ascii",
+    )
+
+    data = analyze_rtk_quality(solution_path=path).as_dict()
+
+    assert data["dropout_reacquisition"]["likely_occlusion_events"] == 1
+    assert data["transition_jumps"]["fixed_entry_gt_warning"] == 0
 
 
 def test_stat_parser_is_tolerant_and_reports_unavailable_metrics(tmp_path: Path):
@@ -164,7 +203,31 @@ def test_quality_analyze_cli_writes_json_and_markdown(tmp_path: Path):
 
     assert rc == 0
     assert json.loads(out_json.read_text(encoding="utf-8"))["inputs"]["solution_type"] == "nmea"
-    assert "RTK Solution Quality Report" in out_md.read_text(encoding="utf-8")
+    markdown = out_md.read_text(encoding="utf-8")
+    assert "RTK Solution Quality Report" in markdown
+    assert "Fixed Confidence Classification" in markdown
+    assert "Residual Summary" in markdown
+    assert "Slip / Rejection Summary" in markdown
+    assert "Motion And Baseline Context" in markdown
+    assert "```json" not in markdown
+
+
+def test_incomplete_diagnostics_limit_qc_confidence_without_forcing_suspect(tmp_path: Path):
+    solution = _write_minimal_pos(tmp_path)
+    stat = tmp_path / "unaligned.stat"
+    stat.write_text(
+        "$SAT,2419,450000.0,G01,1,45,120,0.30,2.5,1,42,0,1,0,0,0,1\n",
+        encoding="ascii",
+    )
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat).as_dict()
+
+    assert data["residuals"]["available"] is True
+    assert data["residuals"]["quality_aligned"] is False
+    assert data["residuals"]["carrier_abs_m"]["fixed_p95"] is None
+    assert data["false_fix_suspicion"]["qc_unknown_fixed_time_s"] >= 0.0
+    assert data["false_fix_suspicion"]["qc_suspect_fixed_time_s"] == 0.0
+    assert any("not aligned" in warning for warning in data["warnings"])
 
 
 def test_pipeline_quality_analyze_invokes_analyzer(tmp_path: Path, monkeypatch):

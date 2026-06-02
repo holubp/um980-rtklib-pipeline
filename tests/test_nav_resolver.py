@@ -87,6 +87,9 @@ def test_best_per_system_fills_missing_systems_from_lower_priority_sources(tmp_p
     assert resolution.system_sources["E"].role == "base"
     assert resolution.system_sources["C"].role == "rover"
     assert resolution.system_sources["R"].role == "external"
+    assert resolution.system_reasons["G"] == "preferred-source+coverage"
+    assert resolution.system_reasons["C"] == "base-missing"
+    assert resolution.system_reasons["R"] == "base-and-rover-missing"
 
 
 def test_merge_all_keeps_all_valid_nav_candidates(tmp_path: Path) -> None:
@@ -103,6 +106,8 @@ def test_merge_all_keeps_all_valid_nav_candidates(tmp_path: Path) -> None:
     )
 
     assert [candidate.path for candidate in resolution.selected] == [base, rover, external]
+    assert {candidate.role for candidate in resolution.selected} == {"base", "rover", "external"}
+    assert set(resolution.system_reasons.values()) == {"all-usable-inputs-included"}
 
 
 def test_nav_systems_missing_from_base_obs_are_reported_not_useful(tmp_path: Path) -> None:

@@ -115,6 +115,17 @@ BASE_PROVIDER_CHOICES = ("bev-nrt", "bkg-euref-nrt", "bkg-euref-highrate", "bkg-
 BASE_RATE_HIGH = "1s"
 BASE_RATE_LOW = "30s"
 HIGH_RATE_ARCHIVE_MARGIN_S = 300
+DUPLICATE_SINGLE_VALUE_OPTIONS = {
+    "--nav-source",
+    "--nav-merge",
+    "--crx2rnx",
+    "--quality-trace",
+    "--rtklib-trace-level",
+    "--rtkconf",
+    "--output-format",
+    "--base-resolution",
+    "--base-rinex-version",
+}
 RTK_POS_MODE_CODES = {
     "single": "0",
     "dgps": "1",
@@ -176,6 +187,94 @@ def _csv_items(value: object) -> list[str]:
             items.extend(_csv_items(item))
         return items
     return [str(value).strip().lower()]
+
+
+def _parse_float_csv(value: object | None) -> list[float]:
+    """Parse comma-separated floats from a CLI value."""
+
+    return [float(item) for item in _csv_items(value)]
+
+
+def _scan_duplicate_options(argv: list[str]) -> dict[str, list[tuple[int, str]]]:
+    """Find repeated single-value options before argparse collapses them."""
+
+    seen: dict[str, list[tuple[int, str]]] = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        option, inline_value = (token.split("=", 1) if "=" in token else (token, None))
+        if option in DUPLICATE_SINGLE_VALUE_OPTIONS:
+            option_index = index
+            if inline_value is not None:
+                value = inline_value
+            elif index + 1 < len(argv):
+                value = argv[index + 1]
+                index += 1
+            else:
+                value = "<missing>"
+            seen.setdefault(option, []).append((option_index, value))
+        index += 1
+    return {option: values for option, values in seen.items() if len(values) > 1}
+
+
+def _emit_duplicate_option_warnings(args: argparse.Namespace) -> None:
+    """Warn about duplicate single-value CLI options when verbose/debug is on."""
+
+    duplicates = getattr(args, "_duplicate_options", {})
+    if getattr(args, "_duplicate_options_reported", False):
+        return
+    if not duplicates or not (getattr(args, "verbose", False) or getattr(args, "debug", False)):
+        return
+    setattr(args, "_duplicate_options_reported", True)
+    for option, values in sorted(duplicates.items()):
+        last_value = values[-1][1]
+        previous = ", ".join(value for _, value in values[:-1])
+        if getattr(args, "debug", False):
+            positions = ", ".join(f"{position}:{value}" for position, value in values)
+            logging.warning(
+                "option %s specified multiple times; using last value: %s; previous values: %s; positions: %s",
+                option,
+                last_value,
+                previous,
+                positions,
+            )
+        else:
+            logging.warning(
+                "option %s specified multiple times; using last value: %s; previous values: %s",
+                option,
+                last_value,
+                previous,
+            )
+
+
+def _effective_trace_level_for_summary(args: argparse.Namespace) -> str:
+    mode = getattr(args, "quality_trace", "off")
+    if mode in {"temporary", "keep"}:
+        value = getattr(args, "rtklib_trace_level", None)
+        return str(3 if value is None else value)
+    return "none"
+
+
+def _log_effective_run_summary(args: argparse.Namespace) -> None:
+    """Log one compact effective run configuration block."""
+
+    if not logging.getLogger().isEnabledFor(logging.INFO):
+        return
+    logging.info("effective run configuration:")
+    for key, value in (
+        ("station", getattr(args, "station", None)),
+        ("base_resolution", getattr(args, "base_resolution", None)),
+        ("base_rinex_version", getattr(args, "base_rinex_version", None)),
+        ("nav_source", getattr(args, "nav_source", None)),
+        ("nav_merge", getattr(args, "nav_merge", None)),
+        ("rtkconf", getattr(args, "rtkconf", None)),
+        ("output_format", ",".join(_rtklib_output_formats(args)) if hasattr(args, "output_format") else None),
+        ("quality_trace", getattr(args, "quality_trace", "off")),
+        ("effective_trace_level", _effective_trace_level_for_summary(args)),
+        ("stat_cleanup", bool(getattr(args, "quality_clean_stat", False))),
+    ):
+        if value is not None:
+            logging.info("  %s=%s", key, value)
 
 
 def _apply_solution_hz(nmea: dict[str, float], hz: object | None) -> None:
@@ -335,6 +434,14 @@ def _add_quality_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--low-snr-warning-dbHz", dest="low_snr_warning_dbhz", type=float, default=35.0)
     parser.add_argument("--gap-split-s", type=float, default=2.0)
     parser.add_argument("--stationary-speed-threshold-mps", type=float, default=0.3)
+    parser.add_argument("--quality-motion-profile", choices=["auto", "static", "walking", "cycling", "vehicle", "highway"], default="auto")
+    parser.add_argument("--quality-max-speed-mps", type=float)
+    parser.add_argument("--quality-max-accel-mps2", type=float)
+    parser.add_argument("--quality-transition-window-s", type=float, default=2.0)
+    parser.add_argument("--quality-route-bin-km", type=float, default=10.0)
+    parser.add_argument("--quality-no-route-bins", action="store_true")
+    parser.add_argument("--quality-baseline-bins", default="0,10,20,30,40,50,75,100,150")
+    parser.add_argument("--quality-md-raw-json", action="store_true")
 
 
 def _add_quality_trace_args(parser: argparse.ArgumentParser, *, standalone: bool = False) -> None:
@@ -345,7 +452,14 @@ def _add_quality_trace_args(parser: argparse.ArgumentParser, *, standalone: bool
     parser.add_argument("--rtklib-trace-file", help="Retained RTKLIB trace destination for --quality-trace keep.")
     if standalone:
         parser.add_argument("--rtklib-trace-level", type=int, choices=range(0, 6), metavar="0..5")
-    parser.add_argument("--rtklib-trace-max-bytes", type=int, help="Reserved cap for future trace parsing safeguards.")
+    parser.add_argument(
+        "--quality-trace-max-bytes",
+        "--rtklib-trace-max-bytes",
+        dest="quality_trace_max_bytes",
+        type=int,
+        default=0,
+        help="Maximum RTKLIB trace bytes to parse; 0 parses the full trace with streaming reads.",
+    )
     parser.add_argument(
         "--rtklib-trace-cleanup",
         choices=["always", "on-success", "never"],
@@ -354,6 +468,8 @@ def _add_quality_trace_args(parser: argparse.ArgumentParser, *, standalone: bool
     )
     parser.add_argument(
         "--quality-clean-stat",
+        "--quality-stat-cleanup",
+        dest="quality_clean_stat",
         action="store_true",
         help=(
             "Delete generated RTKLIB .stat files after successful quality analysis. "
@@ -400,21 +516,27 @@ def _quality_thresholds_from_args(args: argparse.Namespace) -> QualityThresholds
     """Build RTK quality-analysis thresholds from CLI arguments."""
 
     return QualityThresholds(
-        trusted_fixed_min_duration_s=args.trusted_fixed_min_duration_s,
-        trusted_fixed_min_distance_m=args.trusted_fixed_min_distance_m,
-        provisional_fixed_min_duration_s=args.provisional_fixed_min_duration_s,
-        recent_slip_window_s=args.recent_slip_window_s,
-        transition_jump_warning_m=args.transition_jump_warning_m,
-        transition_jump_severe_m=args.transition_jump_severe_m,
-        vertical_jump_warning_m=args.vertical_jump_warning_m,
-        carrier_residual_warning_m=args.carrier_residual_warning_m,
-        carrier_residual_severe_m=args.carrier_residual_severe_m,
-        code_residual_warning_m=args.code_residual_warning_m,
-        code_residual_severe_m=args.code_residual_severe_m,
-        low_used_signals_warning=args.low_used_signals_warning,
-        low_snr_warning_dbhz=args.low_snr_warning_dbhz,
-        gap_split_s=args.gap_split_s,
-        stationary_speed_threshold_mps=args.stationary_speed_threshold_mps,
+        trusted_fixed_min_duration_s=getattr(args, "trusted_fixed_min_duration_s", 10.0),
+        trusted_fixed_min_distance_m=getattr(args, "trusted_fixed_min_distance_m", 20.0),
+        provisional_fixed_min_duration_s=getattr(args, "provisional_fixed_min_duration_s", 3.0),
+        recent_slip_window_s=getattr(args, "recent_slip_window_s", 10.0),
+        transition_jump_warning_m=getattr(args, "transition_jump_warning_m", 1.0),
+        transition_jump_severe_m=getattr(args, "transition_jump_severe_m", 3.0),
+        vertical_jump_warning_m=getattr(args, "vertical_jump_warning_m", 1.5),
+        carrier_residual_warning_m=getattr(args, "carrier_residual_warning_m", 0.20),
+        carrier_residual_severe_m=getattr(args, "carrier_residual_severe_m", 0.50),
+        code_residual_warning_m=getattr(args, "code_residual_warning_m", 5.0),
+        code_residual_severe_m=getattr(args, "code_residual_severe_m", 10.0),
+        low_used_signals_warning=getattr(args, "low_used_signals_warning", 12),
+        low_snr_warning_dbhz=getattr(args, "low_snr_warning_dbhz", 35.0),
+        gap_split_s=getattr(args, "gap_split_s", 2.0),
+        stationary_speed_threshold_mps=getattr(args, "stationary_speed_threshold_mps", 0.3),
+        motion_profile=getattr(args, "quality_motion_profile", "auto"),
+        max_speed_mps=getattr(args, "quality_max_speed_mps", None),
+        max_accel_mps2=getattr(args, "quality_max_accel_mps2", None),
+        transition_window_s=getattr(args, "quality_transition_window_s", 2.0),
+        route_bin_km=None if getattr(args, "quality_no_route_bins", False) else getattr(args, "quality_route_bin_km", 10.0),
+        baseline_bins=_parse_float_csv(getattr(args, "quality_baseline_bins", "0,10,20,30,40,50,75,100,150")),
     )
 
 
@@ -428,6 +550,7 @@ def _configure_cli_logging(args: argparse.Namespace) -> None:
     """Configure CLI logging from common arguments."""
 
     configure_logging(_verbose_enabled(args), args.log_file, debug=_debug_enabled(args))
+    _emit_duplicate_option_warnings(args)
 
 
 def _processing_window_from_args(args: argparse.Namespace) -> ProcessingWindow:
@@ -1443,12 +1566,6 @@ def _validate_quality_trace_args(args: argparse.Namespace, *, standalone: bool =
         logging.warning("RTKLIB trace level 1 is likely too sparse for useful quality diagnostics")
     if level >= 4:
         logging.warning("RTKLIB trace level %d may create very large trace files", level)
-    logging.info(
-        "quality_trace=%s requested_rtklib_trace_level=%s effective_rtklib_trace_level=%s",
-        mode,
-        trace_level if trace_level is not None else "<unset>",
-        level,
-    )
     return level
 
 
@@ -1529,6 +1646,7 @@ def _run_rtklib_with_optional_auto_qc(
             trace_level=effective_trace_level,
             trace_file=Path(args.rtklib_trace_file) if getattr(args, "rtklib_trace_file", None) else None,
             trace_cleanup=getattr(args, "rtklib_trace_cleanup", "always"),
+            trace_max_bytes=max(0, int(getattr(args, "quality_trace_max_bytes", 0) or 0)),
         )
     if trace_mode != "off":
         raise ValueError("--quality-trace temporary/keep is not supported with --auto-sat-qc")
@@ -1762,7 +1880,7 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
         trace_summary=trace_summary,
         cleanup=cleanup,
     )
-    md_path.write_text(format_quality_markdown(analysis), encoding="utf-8")
+    md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
     write_quality_json(json_path, analysis)
     deleted_stats: list[str] = []
     if getattr(args, "quality_clean_stat", False) and stat is not None:
@@ -1777,7 +1895,7 @@ def _run_quality_analysis_if_requested(args: argparse.Namespace, out_dir: Path, 
                 "stat_files_kept": [],
             },
         )
-        md_path.write_text(format_quality_markdown(analysis), encoding="utf-8")
+        md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
         write_quality_json(json_path, analysis)
     logging.info("wrote RTK quality analysis: markdown=%s json=%s", md_path, json_path)
 
@@ -2223,8 +2341,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         analysis_path = out_dir / f"{base}.analysis.json"
         write_analysis_json(analysis_path, analysis)
         logging.info("wrote analysis JSON: %s", analysis_path)
+        _print_analysis_summary(analysis)
     _log_analysis_warnings(analysis)
-    _print_analysis_summary(analysis)
     return 0
 
 
@@ -2307,9 +2425,8 @@ def cmd_extract(args: argparse.Namespace) -> int:
         analysis_path = out_dir / f"{base}.analysis.json"
         write_analysis_json(analysis_path, analysis)
         logging.info("wrote analysis JSON: %s", analysis_path)
-    _log_analysis_warnings(analysis)
-    if args.verbose:
         _print_analysis_summary(analysis)
+    _log_analysis_warnings(analysis)
     return 0
 
 
@@ -2378,9 +2495,8 @@ def cmd_rinex(args: argparse.Namespace) -> int:
         analysis_path = out_dir / f"{base}.analysis.json"
         write_analysis_json(analysis_path, analysis)
         logging.info("wrote analysis JSON: %s", analysis_path)
-    _log_analysis_warnings(analysis)
-    if args.verbose:
         _print_analysis_summary(analysis)
+    _log_analysis_warnings(analysis)
     return 0
 
 
@@ -2509,12 +2625,12 @@ def cmd_quality_analyze(args: argparse.Namespace) -> int:
         write_quality_json(Path(args.out_json), analysis)
         logging.info("wrote quality JSON: %s", args.out_json)
     if args.out_md:
-        Path(args.out_md).write_text(format_quality_markdown(analysis), encoding="utf-8")
+        Path(args.out_md).write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
         logging.info("wrote quality Markdown: %s", args.out_md)
     rendered = (
         json.dumps(analysis.as_dict(), indent=2, sort_keys=True, default=str)
         if args.format == "json"
-        else format_quality_markdown(analysis)
+        else format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False)))
         if args.format == "markdown"
         else format_quality_text(analysis)
     )
@@ -2672,6 +2788,16 @@ def _log_nav_resolution(resolution, *, source: str, merge: str) -> None:
             candidate.path,
             ",".join(sorted(getattr(candidate, "systems", set()))) or "none",
         )
+    if merge == "all":
+        logging.info("NAV merge policy all: all usable NAV inputs are included")
+    for system, candidate in sorted(getattr(resolution, "system_sources", {}).items()):
+        logging.info(
+            "NAV merge %s=%s reason=%s path=%s",
+            system,
+            getattr(candidate, "role", "unknown"),
+            getattr(resolution, "system_reasons", {}).get(system, "selected"),
+            candidate.path,
+        )
     rover_obs_systems = getattr(resolution, "rover_obs_systems", set())
     base_obs_systems = getattr(resolution, "base_obs_systems", set())
     if rover_obs_systems or base_obs_systems:
@@ -2779,6 +2905,7 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
+    _log_effective_run_summary(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = args.basename or Path(args.rover_log).stem
     rover_nav = []
@@ -2860,6 +2987,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
+    _log_effective_run_summary(args)
     if getattr(args, "base_rtcm", None) and args.download_base:
         raise ValueError("--base-rtcm and --download-base are mutually exclusive; choose one base source")
     logging.info("pipeline step 1/3: extract receiver products")
@@ -3383,7 +3511,10 @@ def main(argv: list[str] | None = None) -> int:
     """
 
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    duplicate_options = _scan_duplicate_options(raw_argv)
+    args = parser.parse_args(raw_argv)
+    setattr(args, "_duplicate_options", duplicate_options)
     try:
         return args.func(args)
     except Exception as exc:

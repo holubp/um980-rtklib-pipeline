@@ -94,6 +94,7 @@ class NavResolution:
     missing_systems: set[str]
     selected_systems: set[str] = field(default_factory=set)
     system_sources: dict[str, NavCandidate] = field(default_factory=dict)
+    system_reasons: dict[str, str] = field(default_factory=dict)
     rover_obs_systems: set[str] = field(default_factory=set)
     base_obs_systems: set[str] = field(default_factory=set)
     usable_rtk_systems: set[str] = field(default_factory=set)
@@ -125,6 +126,14 @@ class NavResolution:
             "base_obs_systems": sorted(self.base_obs_systems),
             "usable_rtk_systems": sorted(self.usable_rtk_systems),
             "nav_systems_not_useful": sorted(self.nav_systems_not_useful),
+            "system_sources": {
+                system: {
+                    "path": str(candidate.path),
+                    "role": candidate.role,
+                    "reason": self.system_reasons.get(system, "selected"),
+                }
+                for system, candidate in sorted(self.system_sources.items())
+            },
             "warnings": self.warnings,
         }
 
@@ -296,11 +305,14 @@ def resolve_nav_sources(
     if merge_policy == "all":
         selected = sorted(usable, key=lambda item: (item.priority, str(item.path)))
         system_sources = _best_system_sources(selected)
+        system_reasons = {system: "all-usable-inputs-included" for system in system_sources}
     elif merge_policy == "off":
         selected = [sorted(usable, key=lambda item: (item.priority, str(item.path)))[0]]
         system_sources = _best_system_sources(selected)
+        system_reasons = {system: "single-highest-priority-candidate" for system in system_sources}
     elif merge_policy == "best-per-system":
         system_sources = _best_system_sources(usable)
+        system_reasons = _best_system_reasons(usable, system_sources)
         selected = []
         for candidate in system_sources.values():
             if candidate not in selected:
@@ -316,6 +328,7 @@ def resolve_nav_sources(
         base_obs_systems=base_obs_systems,
         warnings=warnings,
         system_sources=system_sources,
+        system_reasons=system_reasons,
     )
 
 
@@ -328,6 +341,25 @@ def _best_system_sources(candidates: Sequence[NavCandidate]) -> dict[str, NavCan
     return selected_by_system
 
 
+def _best_system_reasons(candidates: Sequence[NavCandidate], selected: dict[str, NavCandidate]) -> dict[str, str]:
+    """Explain deterministic best-per-system source choices."""
+
+    reasons: dict[str, str] = {}
+    for system, candidate in selected.items():
+        same_system = [item for item in candidates if system in item.systems and item.usable]
+        if candidate.role == "base":
+            reasons[system] = "preferred-source+coverage"
+        elif any(item.role == "base" for item in same_system):
+            reasons[system] = "higher-priority-source"
+        elif candidate.role == "rover":
+            reasons[system] = "base-missing"
+        elif candidate.role == "external":
+            reasons[system] = "base-and-rover-missing"
+        else:
+            reasons[system] = "highest-priority-source"
+    return reasons
+
+
 def _resolution(
     *,
     candidates: list[NavCandidate],
@@ -337,6 +369,7 @@ def _resolution(
     base_obs_systems: set[str] | None,
     warnings: list[str],
     system_sources: dict[str, NavCandidate] | None = None,
+    system_reasons: dict[str, str] | None = None,
 ) -> NavResolution:
     selected_systems = set().union(*(candidate.systems for candidate in selected)) if selected else set()
     selected_systems.discard("Unknown")
@@ -365,6 +398,7 @@ def _resolution(
         missing_systems=missing,
         selected_systems=selected_systems,
         system_sources=system_sources or _best_system_sources(selected),
+        system_reasons=system_reasons or {},
         rover_obs_systems=rover_systems,
         base_obs_systems=base_systems,
         usable_rtk_systems=usable_rtk_systems,

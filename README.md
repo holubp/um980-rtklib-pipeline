@@ -461,6 +461,32 @@ converted with RTKLIB `convbin -r rtcm3` into a base OBS/NAV pair and then fed
 to the existing RTKLIB pipeline. If both converted base NAV and rover/downloaded
 NAV are available, normal `--nav-merge` selection applies.
 
+## Effective Run And NAV Diagnostics
+
+Verbose pipeline/postprocess runs print one compact effective configuration
+block near startup. It includes the selected station, base resolution and RINEX
+version, NAV source/merge policy, RTKLIB config, output format, quality trace
+mode, effective trace level, and whether generated `.stat` cleanup is enabled.
+If a single-value option is specified more than once, argparse still uses the
+last value, but `-v` warns explicitly:
+
+```text
+WARNING: option --nav-merge specified multiple times; using last value: all; previous values: best-per-system
+```
+
+With `-d`, the warning also includes argument positions. This is intended to
+catch accidental command lines such as `--nav-merge best-per-system` followed
+later by `--nav-merge all`.
+
+NAV logs distinguish available broadcast ephemerides from receiver diagnostics.
+`--nav-merge best-per-system` reports the deterministic source selected per
+constellation, for example `GPS=base` because the preferred source has coverage
+or `GAL=rover` because the base source is missing that system. `--nav-merge all`
+states that all usable NAV inputs are passed and lists the contributing files.
+ION/UTC families are reported as available or diagnostic-only unless they were
+actually emitted into a supported RINEX NAV header; availability alone is not
+reported as emission.
+
 RTK2Go and other public casters are treated as generic NTRIP casters. To inspect
 a caster without adding RTK2Go-specific assumptions:
 
@@ -574,13 +600,15 @@ pipeline command is extended to do so.
 ## RTK Quality Analysis
 
 Use `quality-analyze` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
-solution together with an optional `.stat` file. The analyser reports raw
-fixed/float/DGPS/single percentages, but also segment duration, segment
-distance, missing/no-output time, fixed-entry jumps, and a heuristic
-trusted/provisional/suspect fixed split. Suspect fixed is not proof of a false
-fix; it highlights fixed islands that deserve inspection because they are very
-short, near a transition jump, close to a slip, or have high residuals when
-`.stat` evidence is available.
+solution together with an optional `.stat` file. The analyser keeps raw RTK
+state summaries separate from QC confidence. Raw fixed/float/DGPS/single
+percentages are reported unchanged, while fixed epochs are additionally
+classified as supported, provisional, suspect, or unknown based on local
+evidence. Suspect fixed is heuristic evidence, not proof of a false fix.
+Residuals or slip flags are used as hard evidence only when they can be
+time-aligned and deduplicated against solution epochs; otherwise fixed
+confidence is reported as unknown/limited instead of forcing all fixed time to
+suspect.
 
 ```bash
 PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \
@@ -596,7 +624,25 @@ mainly useful while moving; a long stationary fixed segment can have near-zero
 distance and still be valid, so the analyser does not mark low-distance fixed
 segments suspect unless median speed exceeds the stationary threshold.
 
-Optimise processing on trusted fixed time/distance and missing/no-output time,
+Motion-aware checks use an inferred profile by default and can be overridden:
+
+```bash
+--quality-motion-profile highway
+--quality-max-speed-mps 60
+--quality-transition-window-s 2
+```
+
+This keeps normal highway motion, such as 7-8 m between 5 Hz epochs at about
+130 km/h, from being treated as a transition jump. Bridge-like
+fixed-to-float/missing-to-fixed patterns are reported as dropout/reacquisition
+events unless the local dynamics or time-aligned diagnostics are implausible.
+The JSON and Markdown reports also include route-distance bins by default
+(`--quality-route-bin-km 10`, or `--quality-no-route-bins`). Baseline bins are
+reported when base coordinates are available; growing baseline distance is
+context for expected ambiguity-resolution degradation, not by itself suspect
+evidence.
+
+Optimise processing on QC-supported fixed time/distance and missing/no-output time,
 not raw fixed percentage alone. Some RTKLIB settings can look better by simply
 suppressing bad epochs; the report therefore estimates expected epoch interval,
 missing epochs, missing time, longest output gap, and quality percentages both
@@ -636,15 +682,19 @@ then deletes the trace. Use level 2 for a smaller trace:
 --quality-trace temporary --rtklib-trace-level 2
 ```
 
+Trace parsing is streaming and reads the full trace by default before cleanup.
+Use `--quality-trace-max-bytes N` only when you intentionally want to cap trace
+analysis; the JSON then records `trace_truncated=true`. Level 4 and above can
+create very large files, so use them only for manual debugging.
+
 Use keep mode only for manual debugging:
 
 ```bash
 --quality-trace keep --rtklib-trace-file rnx2rtkp.trace
 ```
 
-Trace level 0 is rejected for trace generation. Level 4 and above are allowed
-with a strong warning because they can create very large files. Existing traces
-can be analysed without rerunning RTKLIB:
+Trace level 0 is rejected for trace generation. Existing traces can be analysed
+without rerunning RTKLIB:
 
 ```bash
 PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \
@@ -663,6 +713,8 @@ extracted and written:
 ```bash
 --quality-analyze --quality-clean-stat
 ```
+
+`--quality-stat-cleanup` is accepted as the same opt-in flag.
 
 Standalone `quality-analyze --stat existing.stat --quality-clean-stat` is
 refused so archived user-supplied `.stat` files are not deleted accidentally.

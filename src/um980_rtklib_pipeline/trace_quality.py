@@ -35,12 +35,14 @@ TRACE_COUNTERS = (
 _RATIO_RE = re.compile(r"\bratio\s*(?:=|:)\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
-def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20) -> dict[str, object]:
+def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20, max_bytes: int = 0) -> dict[str, object]:
     """Return bounded aggregate diagnostics for an RTKLIB trace file.
 
     Args:
         path: RTKLIB trace file.
         max_example_lines: Maximum stored example lines per category.
+        max_bytes: Optional maximum bytes to parse. Zero means parse the full
+            file with streaming reads.
 
     Returns:
         Stable JSON-compatible trace summary.
@@ -50,6 +52,8 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20) -> dict[str
     examples: dict[str, list[str]] = {}
     ratios: list[float] = []
     lines_read = 0
+    bytes_read = 0
+    truncated = False
     parser_warnings: list[str] = []
     try:
         stat = path.stat()
@@ -70,6 +74,11 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20) -> dict[str
 
     with path.open("r", encoding="ascii", errors="ignore") as handle:
         for raw_line in handle:
+            encoded_len = len(raw_line.encode("ascii", errors="ignore"))
+            if max_bytes > 0 and bytes_read + encoded_len > max_bytes:
+                truncated = True
+                break
+            bytes_read += encoded_len
             lines_read += 1
             line = raw_line.strip()
             if not line:
@@ -85,13 +94,19 @@ def analyze_rtklib_trace(path: Path, *, max_example_lines: int = 20) -> dict[str
                 _add_example(examples, "ar_ratio_lines", line, max_example_lines)
 
     parser_warnings.append("Trace events counted globally but not time-aligned to solution epochs.")
+    if truncated:
+        parser_warnings.append(f"Trace parsing stopped at --quality-trace-max-bytes={max_bytes}.")
     return {
         "available": True,
         "source": None,
         "generated_temporarily": False,
         "retained": None,
         "path": str(path),
-        "bytes_read": stat.st_size,
+        "trace_file_size_bytes": stat.st_size,
+        "trace_bytes_read": bytes_read,
+        "trace_lines_read": lines_read,
+        "trace_truncated": truncated,
+        "bytes_read": bytes_read,
         "lines_read": lines_read,
         "parser_warnings": parser_warnings,
         "counters": counters,

@@ -509,6 +509,7 @@ def run_rnx2rtkp(
     trace_level: int | None = None,
     trace_file: Path | None = None,
     trace_cleanup: Literal["always", "on-success", "never"] = "always",
+    trace_max_bytes: int = 0,
 ) -> RtklibCommand:
     """Validate, prepare, and optionally run `rnx2rtkp`.
 
@@ -592,6 +593,7 @@ def run_rnx2rtkp(
         logging.info("RTKLIB wrapper: %s", wrapper_file)
         logging.info("RTKLIB stdout log: %s", stdout_log)
         logging.info("RTKLIB stderr log: %s", stderr_log)
+    rtklib_error: RuntimeError | None = None
     if not dry_run:
         logging.debug("executing RTKLIB argv: %r", args)
         result = subprocess.run(args, check=False, capture_output=True, text=True, cwd=run_cwd)
@@ -601,17 +603,21 @@ def run_rnx2rtkp(
             stderr = result.stderr.strip()
             stdout = result.stdout.strip()
             detail = stderr or stdout or "no stdout/stderr output captured"
-            raise RuntimeError(
+            rtklib_error = RuntimeError(
                 f"rnx2rtkp failed with exit code {result.returncode}: {detail}\n"
                 f"command: {format_command(args)}\n"
                 f"stdout log: {stdout_log}\n"
                 f"stderr log: {stderr_log}\n"
                 f"wrapper: {wrapper_file}"
             )
-        _recover_output_from_stdout(output_file, result.stdout)
-        _warn_about_rtklib_result(output_file, result.stderr)
-        if not output_file.exists():
-            _raise_missing_rtklib_output(output_file, stdout_log, stderr_log, wrapper_file, args)
+        else:
+            _recover_output_from_stdout(output_file, result.stdout)
+            _warn_about_rtklib_result(output_file, result.stderr)
+            if not output_file.exists():
+                try:
+                    _raise_missing_rtklib_output(output_file, stdout_log, stderr_log, wrapper_file, args)
+                except RuntimeError as exc:
+                    rtklib_error = exc
     trace_summary: dict[str, object] | None = None
     selected_trace: Path | None = None
     trace_retained = False
@@ -625,7 +631,7 @@ def run_rnx2rtkp(
                 shutil.move(str(selected_trace), retained_path)
                 selected_trace = retained_path
                 trace_retained = True
-            trace_summary = analyze_rtklib_trace(selected_trace)
+            trace_summary = analyze_rtklib_trace(selected_trace, max_bytes=trace_max_bytes)
             trace_summary.update(
                 {
                     "source": trace_mode,
@@ -633,6 +639,7 @@ def run_rnx2rtkp(
                     "retained": trace_retained,
                     "path": str(selected_trace) if trace_retained else None,
                     "effective_level": effective_trace_level,
+                    "trace_deleted": trace_mode == "temporary" and trace_cleanup in {"always", "on-success"},
                 }
             )
             logging.info(
@@ -651,6 +658,8 @@ def run_rnx2rtkp(
             logging.info("temporary RTKLIB trace directory retained by policy: %s", trace_dir)
         if cleanup_trace_dir:
             shutil.rmtree(trace_dir, ignore_errors=True)
+    if rtklib_error is not None:
+        raise rtklib_error
     return RtklibCommand(
         args,
         output_file,
