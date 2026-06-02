@@ -13,6 +13,7 @@ from um980_rtklib_pipeline.quality import (
     SolutionEpoch,
     analyze_rtk_quality,
     compute_segments,
+    format_quality_markdown,
     parse_solution_epochs,
     parse_stat_file,
 )
@@ -287,6 +288,36 @@ def test_trace_events_align_to_solution_epochs_and_quality_states(tmp_path: Path
     assert data["false_fix_suspicion"]["evidence_sources"]["trace_low_ar_ratio"] == ["trace"]
 
 
+def test_time_of_day_trace_events_align_to_solution_date(tmp_path: Path):
+    solution = tmp_path / "trace-tod.pos"
+    solution.write_text(
+        "2026/05/30 05:10:30.000 50.000000 14.000000 250.0 1 18\n"
+        "2026/05/30 05:10:31.000 50.000010 14.000000 250.0 1 18\n",
+        encoding="ascii",
+    )
+    trace_summary = {
+        "available": True,
+        "events": {
+            "event_time_aggregates": [
+                {
+                    "time": "1970-01-01T05:10:30.400000+00:00",
+                    "time_basis": "time_of_day",
+                    "counts": {"ambiguity_validation_failed": 1, "ar_ratio": 1},
+                    "ar_ratio_min": 2.0,
+                    "ar_threshold": 3.0,
+                }
+            ]
+        },
+    }
+
+    data = analyze_rtk_quality(solution_path=solution, trace_summary=trace_summary).as_dict()
+
+    assert data["trace"]["alignment"]["available"] is True
+    assert data["trace"]["alignment"]["trace_events_aligned"] == 2
+    assert data["false_fix_suspicion"]["reasons"]["trace_ambiguity_validation_failed"] > 0.0
+    assert data["false_fix_suspicion"]["reason_details"]["trace_ambiguity_validation_failed"]["aligned"] is True
+
+
 def test_global_unaligned_trace_does_not_mark_fixed_suspect(tmp_path: Path):
     solution = _write_minimal_pos(tmp_path)
     trace_summary = {
@@ -325,6 +356,29 @@ def test_baseline_summary_uses_standalone_base_llh(tmp_path: Path):
     assert data["baseline_summary"]["available"] is True
     assert data["baseline_summary"]["max_distance_km"] is not None
     assert data["baseline_summary"]["quality_by_baseline_bin"]
+
+
+def test_baseline_bins_and_markdown_include_quality_evolution(tmp_path: Path):
+    path = tmp_path / "baseline.pos"
+    path.write_text(
+        "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 18\n"
+        "2026/05/30 05:00:01.000 50.000100 14.000000 250.0 1 18\n"
+        "2026/05/30 05:00:02.000 50.000200 14.000000 250.0 2 18\n",
+        encoding="ascii",
+    )
+
+    analysis = analyze_rtk_quality(solution_path=path, base_llh=(50.0, 14.0, 250.0))
+    data = analysis.as_dict()
+    bins = data["baseline_summary"]["quality_by_baseline_bin"]
+    populated = [item for item in bins if item["populated"]]
+
+    assert populated
+    assert populated[0]["elapsed_time_s"] > 0.0
+    assert "fixed_pct_of_elapsed" in populated[0]
+    assert "trace_low_ar_count" in populated[0]
+    markdown = format_quality_markdown(analysis)
+    assert "## 8. Quality By Base-Rover Distance" in markdown
+    assert "Empty baseline bins omitted" in markdown
 
 
 def test_large_stat_slip_summary_uses_deduplicated_epoch_alignment(tmp_path: Path):

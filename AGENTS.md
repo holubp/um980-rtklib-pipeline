@@ -102,6 +102,15 @@
 - Trace diagnostics may produce global counters, but QC confidence may only use
   trace evidence after timestamp alignment to solution epochs. Keep
   trace-specific reasons separate from STAT reasons.
+- RTKLIB trace timestamps may be time-of-day only; quality analysis must anchor
+  them to solution dates before local QC use. Baseline and route bins must keep
+  empty bins in JSON and may omit them only in Markdown.
+- Pipeline reproducibility artifacts must remain append-only and useful after
+  partial runs: rerun scripts, commands Markdown, and pipeline manifests should
+  record the exact step commands and whether outputs were reused.
+- The public UM980 stream API is `um980_rtklib_pipeline.um980_stream`; keep it
+  stable for external tooling and classify command responses separately from
+  NMEA, Unicore ASCII, Unicore binary, and noise records.
 - The standalone RTK quality command is `quality`; `quality-analyze` is only a
   deprecated compatibility alias. The pipeline flag remains `--quality-analyze`.
 - Never delete RTKLIB `.stat` files by default. `.stat` cleanup is only allowed

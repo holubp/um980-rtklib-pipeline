@@ -175,6 +175,7 @@ class _StatAccumulator:
     top_residuals_by_sat: dict[str, int] = field(default_factory=dict)
     slips_by_sat: dict[str, int] = field(default_factory=dict)
     rejections_by_sat: dict[str, int] = field(default_factory=dict)
+    rejections_by_time: dict[datetime, int] = field(default_factory=dict)
     parse_elapsed_s: float = 0.0
     truncated: bool = False
     truncate_reason: str | None = None
@@ -332,10 +333,21 @@ def analyze_rtk_quality(
     motion = _motion_summary(epochs, limits)
     transitions = _transition_summary(epochs, segments, limits, motion)
     dropout = _dropout_reacquisition_summary(epochs, segments, limits)
+    trace_align_started = time.perf_counter()
     aligned_trace = _align_trace_summary(trace_summary, epoch_index, limits.trace_align_tolerance_s)
+    trace_align_elapsed_s = time.perf_counter() - trace_align_started
     suspicion = _false_fix_suspicion(segments, epochs, stat, transitions, residuals, slips, aligned_trace, limits)
-    baseline_summary = _baseline_summary(epochs, limits, base_ecef_xyz_m=base_ecef_xyz_m, base_llh=base_llh)
-    route_bins = _route_bins(epochs, limits)
+    baseline_summary = _baseline_summary(
+        epochs,
+        segments,
+        stat,
+        aligned_trace,
+        suspicion,
+        limits,
+        base_ecef_xyz_m=base_ecef_xyz_m,
+        base_llh=base_llh,
+    )
+    route_bins = _route_bins(epochs, segments, stat, aligned_trace, suspicion, limits)
     if residuals.get("available") and residuals.get("quality_aligned") is False:
         warnings.append("STAT residuals parsed globally but not aligned to solution quality states; residuals not used for hard fixed-epoch suspicion.")
     if slips.get("available") and slips.get("epochs_with_slip_pct") is None:
@@ -360,11 +372,24 @@ def analyze_rtk_quality(
     performance = {
         "solution_parse_elapsed_s": solution_parse_elapsed_s,
         "stat_parse_elapsed_s": stat.parse_elapsed_s if stat else 0.0,
+        "stat_lines_per_s": (stat.stat_lines / stat.parse_elapsed_s) if stat and stat.parse_elapsed_s > 0 else None,
         "stat_lines_read": stat.stat_lines if stat else 0,
         "sat_lines_parsed": stat.parsed_sat_lines if stat else 0,
         "raw_slip_flags": stat.slip_count if stat else 0,
         "dedup_slip_events": len(stat.slip_events) if stat else 0,
         "unique_slip_epochs": len({event[0] for event in stat.slip_events}) if stat else 0,
+        "trace_parse_elapsed_s": aligned_trace.get("trace_parse_elapsed_s") if isinstance(aligned_trace, dict) else 0.0,
+        "trace_lines_per_s": (
+            float(aligned_trace.get("trace_lines_read", 0) or 0) / float(aligned_trace.get("trace_parse_elapsed_s", 0) or 0)
+            if isinstance(aligned_trace, dict) and float(aligned_trace.get("trace_parse_elapsed_s", 0) or 0) > 0
+            else None
+        ),
+        "trace_align_elapsed_s": trace_align_elapsed_s,
+        "event_alignment_cache_size": (
+            aligned_trace.get("alignment", {}).get("unique_trace_times_mapped")
+            if isinstance(aligned_trace, dict) and isinstance(aligned_trace.get("alignment"), dict)
+            else 0
+        ),
     }
     return QualityAnalysis(
         inputs={
@@ -690,6 +715,7 @@ def _parse_sat_stat_line(line: str, stat: _StatAccumulator) -> bool:
         stat.slips_by_sat[sat] = stat.slips_by_sat.get(sat, 0) + 1
     if rejected:
         stat.rejected_count += 1
+        stat.rejections_by_time[time] = stat.rejections_by_time.get(time, 0) + 1
         stat.rejections_by_sat[sat] = stat.rejections_by_sat.get(sat, 0) + 1
     return True
 
@@ -876,20 +902,17 @@ def _align_trace_summary(
         if not isinstance(item, dict):
             continue
         time_text = item.get("time")
+        time_basis = item.get("time_basis")
         counts = item.get("counts", {})
         if not isinstance(time_text, str) or not isinstance(counts, dict):
             continue
         event_total = sum(int(value) for value in counts.values() if isinstance(value, int | float))
         if event_total <= 0:
             continue
-        if time_text not in cache:
-            try:
-                when = datetime.fromisoformat(time_text)
-            except ValueError:
-                cache[time_text] = None
-            else:
-                cache[time_text] = epoch_index.nearest_index(when, max_dt_s=tolerance_s)
-        nearest_index = cache[time_text]
+        cache_key = f"{time_basis or 'absolute'}:{time_text}"
+        if cache_key not in cache:
+            cache[cache_key] = _nearest_trace_epoch_index(time_text, str(time_basis or "absolute"), epoch_index, tolerance_s)
+        nearest_index = cache[cache_key]
         if nearest_index is None:
             unaligned_events += event_total
             continue
@@ -937,8 +960,39 @@ def _align_trace_summary(
     return enriched
 
 
+def _nearest_trace_epoch_index(time_text: str, time_basis: str, epoch_index: EpochIndex, tolerance_s: float) -> int | None:
+    """Resolve a trace event timestamp against solution epochs."""
+
+    try:
+        parsed = datetime.fromisoformat(time_text)
+    except ValueError:
+        return None
+    if time_basis != "time_of_day":
+        return epoch_index.nearest_index(parsed, max_dt_s=tolerance_s)
+    if not epoch_index.epochs:
+        return None
+    tod = parsed.timetz().replace(tzinfo=None)
+    base_date = epoch_index.epochs[0].time.astimezone(UTC).date()
+    best_index: int | None = None
+    best_delta = float("inf")
+    for day_offset in (-1, 0, 1):
+        candidate = datetime.combine(base_date + timedelta(days=day_offset), tod, tzinfo=UTC)
+        index = epoch_index.nearest_index(candidate, max_dt_s=tolerance_s)
+        if index is None:
+            continue
+        delta = abs(epoch_index.times_s[index] - _timestamp_s(candidate))
+        if delta < best_delta:
+            best_delta = delta
+            best_index = index
+    return best_index
+
+
 def _baseline_summary(
     epochs: list[SolutionEpoch],
+    segments: list[Segment],
+    stat: _StatAccumulator | None,
+    trace_summary: dict[str, object] | None,
+    suspicion: dict[str, object],
     thresholds: QualityThresholds,
     *,
     base_ecef_xyz_m: tuple[float, float, float] | None,
@@ -954,11 +1008,24 @@ def _baseline_summary(
         }
     base_lat, base_lon, base_height = base_position
     distances: list[float] = []
+    epoch_bin_values: list[float | None] = []
     for epoch in epochs:
         if epoch.lat is None or epoch.lon is None:
+            epoch_bin_values.append(None)
             continue
-        distances.append(_haversine_m(base_lat, base_lon, epoch.lat, epoch.lon) / 1000.0)
-    bins = _baseline_quality_bins(epochs, base_lat, base_lon, thresholds.baseline_bins)
+        distance_km = _haversine_m(base_lat, base_lon, epoch.lat, epoch.lon) / 1000.0
+        distances.append(distance_km)
+        epoch_bin_values.append(distance_km)
+    bins = _quality_bins_for_ranges(
+        epochs,
+        segments,
+        thresholds,
+        thresholds.baseline_bins,
+        epoch_bin_values,
+        stat=stat,
+        trace_summary=trace_summary,
+        suspicion=suspicion,
+    )
     return {
         "available": bool(distances),
         "base_llh": {"lat": base_lat, "lon": base_lon, "height_m": base_height},
@@ -973,67 +1040,261 @@ def _baseline_summary(
     }
 
 
-def _baseline_quality_bins(
+def _quality_bins_for_ranges(
     epochs: list[SolutionEpoch],
-    base_lat: float,
-    base_lon: float,
-    bins_km: list[float],
+    segments: list[Segment],
+    thresholds: QualityThresholds,
+    ranges: list[float],
+    epoch_values_km: list[float | None],
+    *,
+    stat: _StatAccumulator | None,
+    trace_summary: dict[str, object] | None,
+    suspicion: dict[str, object],
 ) -> list[dict[str, object]]:
-    if len(bins_km) < 2:
+    if len(ranges) < 2:
         return []
     result: list[dict[str, object]] = []
-    for start, end in zip(bins_km, bins_km[1:], strict=False):
+    for start, end in zip(ranges, ranges[1:], strict=False):
         result.append(
             {
                 "start_km": start,
                 "end_km": end,
+                "populated": False,
                 "quality_time_s": {quality: 0.0 for quality in QUALITY_ORDER},
+                "quality_distance_km": {quality: 0.0 for quality in QUALITY_ORDER},
                 "epoch_count": 0,
+                "elapsed_time_s": 0.0,
+                "emitted_time_s": 0.0,
+                "missing_time_s": 0.0,
+                "track_distance_km": 0.0,
+                "fixed_time_s": 0.0,
+                "float_time_s": 0.0,
+                "dgps_time_s": 0.0,
+                "single_time_s": 0.0,
+                "invalid_time_s": 0.0,
+                "fixed_pct_of_elapsed": 0.0,
+                "fixed_pct_of_emitted": 0.0,
+                "fixed_distance_km": 0.0,
+                "float_distance_km": 0.0,
+                "dgps_distance_km": 0.0,
+                "fixed_distance_pct": 0.0,
+                "float_distance_pct": 0.0,
+                "dgps_distance_pct": 0.0,
+                "fixed_segment_count": 0,
+                "fixed_segment_median_s": None,
+                "fixed_segment_p95_s": None,
+                "fixed_segment_max_s": None,
+                "qc_supported_fixed_time_s": 0.0,
+                "qc_provisional_fixed_time_s": 0.0,
+                "qc_suspect_fixed_time_s": 0.0,
+                "qc_unknown_fixed_time_s": 0.0,
+                "stat_slip_epochs_pct": None,
+                "stat_rejection_count": 0,
+                "stat_carrier_p95_by_quality": {},
+                "trace_low_ar_count": 0,
+                "trace_slip_count": 0,
+                "trace_rejection_count": 0,
+                "trace_residual_outlier_count": 0,
             }
         )
-    for left, right in zip(epochs, epochs[1:], strict=False):
-        if left.lat is None or left.lon is None:
+    epoch_to_bin: dict[int, int] = {}
+    for index, value in enumerate(epoch_values_km):
+        if value is None:
             continue
-        distance_km = _haversine_m(base_lat, base_lon, left.lat, left.lon) / 1000.0
+        bin_index = _range_index(value, ranges)
+        if bin_index is not None:
+            epoch_to_bin[index] = bin_index
+    for index, (left, right) in enumerate(zip(epochs, epochs[1:], strict=False)):
+        bin_index = epoch_to_bin.get(index)
+        if bin_index is None:
+            continue
+        item = result[bin_index]
         dt = max(0.0, (right.time - left.time).total_seconds())
-        for item in result:
-            if float(item["start_km"]) <= distance_km < float(item["end_km"]):
-                quality_time = item["quality_time_s"]
-                if isinstance(quality_time, dict):
-                    quality_time[left.quality] = float(quality_time.get(left.quality, 0.0)) + dt
-                item["epoch_count"] = int(item.get("epoch_count", 0)) + 1
-                break
+        emitted_dt = min(dt, thresholds.gap_split_s) if dt <= thresholds.gap_split_s * 10 else 0.0
+        step_km = (
+            _haversine_m(left.lat, left.lon, right.lat, right.lon) / 1000.0
+            if left.lat is not None and left.lon is not None and right.lat is not None and right.lon is not None
+            else 0.0
+        )
+        item["populated"] = True
+        item["epoch_count"] = int(item.get("epoch_count", 0)) + 1
+        item["elapsed_time_s"] = float(item.get("elapsed_time_s", 0.0)) + dt
+        item["emitted_time_s"] = float(item.get("emitted_time_s", 0.0)) + emitted_dt
+        item["missing_time_s"] = float(item.get("missing_time_s", 0.0)) + max(0.0, dt - emitted_dt)
+        item["track_distance_km"] = float(item.get("track_distance_km", 0.0)) + step_km
+        quality_time = item["quality_time_s"]
+        quality_distance = item["quality_distance_km"]
+        if isinstance(quality_time, dict):
+            quality_time[left.quality] = float(quality_time.get(left.quality, 0.0)) + emitted_dt
+        if isinstance(quality_distance, dict):
+            quality_distance[left.quality] = float(quality_distance.get(left.quality, 0.0)) + step_km
+    _add_segment_bin_metrics(result, ranges, epoch_values_km, segments, suspicion)
+    _add_stat_bin_metrics(result, stat, epochs, epoch_to_bin)
+    _add_trace_bin_metrics(result, trace_summary, epoch_to_bin)
+    for item in result:
+        quality_time = item.get("quality_time_s", {})
+        quality_distance = item.get("quality_distance_km", {})
+        if not isinstance(quality_time, dict):
+            quality_time = {}
+        if not isinstance(quality_distance, dict):
+            quality_distance = {}
+        elapsed = float(item.get("elapsed_time_s", 0.0) or 0.0)
+        emitted = float(item.get("emitted_time_s", 0.0) or 0.0)
+        track = float(item.get("track_distance_km", 0.0) or 0.0)
+        item["fixed_time_s"] = float(quality_time.get("fixed", 0.0) or 0.0)
+        item["float_time_s"] = float(quality_time.get("float", 0.0) or 0.0)
+        item["dgps_time_s"] = float(quality_time.get("dgps", 0.0) or 0.0)
+        item["single_time_s"] = float(quality_time.get("single", 0.0) or 0.0)
+        item["invalid_time_s"] = float(quality_time.get("invalid", 0.0) or 0.0)
+        item["fixed_pct_of_elapsed"] = _pct(float(item["fixed_time_s"]), elapsed)
+        item["fixed_pct_of_emitted"] = _pct(float(item["fixed_time_s"]), emitted)
+        item["fixed_distance_km"] = float(quality_distance.get("fixed", 0.0) or 0.0)
+        item["float_distance_km"] = float(quality_distance.get("float", 0.0) or 0.0)
+        item["dgps_distance_km"] = float(quality_distance.get("dgps", 0.0) or 0.0)
+        item["fixed_distance_pct"] = _pct(float(item["fixed_distance_km"]), track)
+        item["float_distance_pct"] = _pct(float(item["float_distance_km"]), track)
+        item["dgps_distance_pct"] = _pct(float(item["dgps_distance_km"]), track)
     return result
 
 
-def _route_bins(epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> list[dict[str, object]]:
+def _range_index(value: float, ranges: list[float]) -> int | None:
+    for index, (start, end) in enumerate(zip(ranges, ranges[1:], strict=False)):
+        if start <= value < end:
+            return index
+    return None
+
+
+def _add_segment_bin_metrics(
+    bins: list[dict[str, object]],
+    ranges: list[float],
+    epoch_values_km: list[float | None],
+    segments: list[Segment],
+    suspicion: dict[str, object],
+) -> None:
+    fixed_durations: dict[int, list[float]] = {index: [] for index in range(len(bins))}
+    for segment in segments:
+        value = epoch_values_km[segment.start_index] if segment.start_index < len(epoch_values_km) else None
+        if value is None:
+            continue
+        bin_index = _range_index(value, ranges)
+        if bin_index is None or segment.quality != "fixed":
+            continue
+        fixed_durations[bin_index].append(segment.duration_s)
+    raw_fixed = float(suspicion.get("raw_fixed_time_s", 0.0) or 0.0)
+    shares = {
+        "qc_supported_fixed_time_s": float(suspicion.get("qc_supported_fixed_time_s", 0.0) or 0.0) / raw_fixed if raw_fixed else 0.0,
+        "qc_provisional_fixed_time_s": float(suspicion.get("qc_provisional_fixed_time_s", 0.0) or 0.0) / raw_fixed if raw_fixed else 0.0,
+        "qc_suspect_fixed_time_s": float(suspicion.get("qc_suspect_fixed_time_s", 0.0) or 0.0) / raw_fixed if raw_fixed else 0.0,
+        "qc_unknown_fixed_time_s": float(suspicion.get("qc_unknown_fixed_time_s", 0.0) or 0.0) / raw_fixed if raw_fixed else 0.0,
+    }
+    for index, durations in fixed_durations.items():
+        item = bins[index]
+        quality_time = item.get("quality_time_s", {})
+        fixed_time = float(quality_time.get("fixed", 0.0) or 0.0) if isinstance(quality_time, dict) else 0.0
+        item["fixed_segment_count"] = len(durations)
+        item["fixed_segment_median_s"] = _percentile(durations, 50)
+        item["fixed_segment_p95_s"] = _percentile(durations, 95)
+        item["fixed_segment_max_s"] = max(durations) if durations else None
+        for key, share in shares.items():
+            item[key] = fixed_time * share
+
+
+def _add_stat_bin_metrics(
+    bins: list[dict[str, object]],
+    stat: _StatAccumulator | None,
+    epochs: list[SolutionEpoch],
+    epoch_to_bin: dict[int, int],
+) -> None:
+    if stat is None or not epochs:
+        return
+    epoch_index = EpochIndex.build(epochs)
+    slip_epoch_bins: dict[int, set[int]] = {index: set() for index in range(len(bins))}
+    for time, *_rest in stat.slip_events:
+        nearest = epoch_index.nearest_index(time)
+        if nearest is None:
+            continue
+        bin_index = epoch_to_bin.get(nearest)
+        if bin_index is not None:
+            slip_epoch_bins[bin_index].add(nearest)
+    for time, count in stat.rejections_by_time.items():
+        nearest = epoch_index.nearest_index(time)
+        if nearest is None:
+            continue
+        bin_index = epoch_to_bin.get(nearest)
+        if bin_index is not None:
+            bins[bin_index]["stat_rejection_count"] = int(bins[bin_index].get("stat_rejection_count", 0)) + int(count)
+    residuals_by_bin: dict[int, dict[str, dict[str, list[float]]]] = {
+        index: {quality: {"carrier": []} for quality in QUALITY_ORDER} for index in range(len(bins))
+    }
+    for time, residuals in stat.residuals_by_time.items():
+        nearest = epoch_index.nearest_index(time)
+        if nearest is None:
+            continue
+        bin_index = epoch_to_bin.get(nearest)
+        if bin_index is None:
+            continue
+        residuals_by_bin[bin_index][epochs[nearest].quality]["carrier"].extend(residuals.get("carrier", []))
+    for index, item in enumerate(bins):
+        epoch_count = int(item.get("epoch_count", 0) or 0)
+        item["stat_slip_epochs_pct"] = _pct(len(slip_epoch_bins[index]), epoch_count) if epoch_count else None
+        item["stat_carrier_p95_by_quality"] = {
+            quality: _percentile(values["carrier"], 95)
+            for quality, values in residuals_by_bin[index].items()
+            if values["carrier"]
+        }
+
+
+def _add_trace_bin_metrics(
+    bins: list[dict[str, object]],
+    trace_summary: dict[str, object] | None,
+    epoch_to_bin: dict[int, int],
+) -> None:
+    trace_by_epoch = _trace_alignment_by_epoch(trace_summary)
+    for epoch_index, item in trace_by_epoch.items():
+        bin_index = epoch_to_bin.get(epoch_index)
+        if bin_index is None:
+            continue
+        counts = item.get("counts", {})
+        if not isinstance(counts, dict):
+            continue
+        bins[bin_index]["trace_low_ar_count"] = int(bins[bin_index].get("trace_low_ar_count", 0)) + int(counts.get("ar_ratio", 0) or 0)
+        bins[bin_index]["trace_slip_count"] = int(bins[bin_index].get("trace_slip_count", 0)) + int(counts.get("cycle_slip", 0) or 0)
+        bins[bin_index]["trace_rejection_count"] = int(bins[bin_index].get("trace_rejection_count", 0)) + int(counts.get("observation_rejection", 0) or 0)
+        bins[bin_index]["trace_residual_outlier_count"] = int(bins[bin_index].get("trace_residual_outlier_count", 0)) + int(counts.get("residual_outlier", 0) or 0)
+
+
+def _route_bins(
+    epochs: list[SolutionEpoch],
+    segments: list[Segment],
+    stat: _StatAccumulator | None,
+    trace_summary: dict[str, object] | None,
+    suspicion: dict[str, object],
+    thresholds: QualityThresholds,
+) -> list[dict[str, object]]:
     if thresholds.route_bin_km is None or thresholds.route_bin_km <= 0:
         return []
-    bins: list[dict[str, object]] = []
     bin_m = thresholds.route_bin_km * 1000.0
-    current_start = 0.0
-    quality_time: dict[str, float] = {quality: 0.0 for quality in QUALITY_ORDER}
     distance = 0.0
+    epoch_values: list[float | None] = []
     for left, right in zip(epochs, epochs[1:], strict=False):
+        epoch_values.append(distance / 1000.0)
         if left.lat is None or left.lon is None or right.lat is None or right.lon is None:
             continue
-        step = _haversine_m(left.lat, left.lon, right.lat, right.lon)
-        dt = max(0.0, (right.time - left.time).total_seconds())
-        while distance + step >= current_start + bin_m and step > 0:
-            bins.append(
-                {
-                    "start_km": current_start / 1000.0,
-                    "end_km": (current_start + bin_m) / 1000.0,
-                    "quality_time_s": dict(quality_time),
-                }
-            )
-            current_start += bin_m
-            quality_time = {quality: 0.0 for quality in QUALITY_ORDER}
-        quality_time[left.quality] = quality_time.get(left.quality, 0.0) + dt
-        distance += step
+        distance += _haversine_m(left.lat, left.lon, right.lat, right.lon)
     if epochs:
-        bins.append({"start_km": current_start / 1000.0, "end_km": distance / 1000.0, "quality_time_s": dict(quality_time)})
-    return bins
+        epoch_values.append(distance / 1000.0)
+    max_km = max(epoch_values) if epoch_values else 0.0
+    ranges = [index * thresholds.route_bin_km for index in range(int(max_km // thresholds.route_bin_km) + 2)]
+    return _quality_bins_for_ranges(
+        epochs,
+        segments,
+        thresholds,
+        ranges,
+        epoch_values,
+        stat=stat,
+        trace_summary=trace_summary,
+        suspicion=suspicion,
+    )
 
 
 def _false_fix_suspicion(
@@ -1054,9 +1315,13 @@ def _false_fix_suspicion(
         "short_distance_while_moving": 0.0,
         "recent_slip": 0.0,
         "high_residual": 0.0,
+        "stat_recent_slip": 0.0,
+        "stat_high_residual": 0.0,
+        "stat_rejection_burst": 0.0,
         "transition_jump": 0.0,
         "incomplete_diagnostics": 0.0,
         "trace_low_ar_ratio": 0.0,
+        "trace_ambiguity_validation_failed": 0.0,
         "trace_recent_slip": 0.0,
         "trace_residual_outlier": 0.0,
         "trace_rejection_burst": 0.0,
@@ -1068,9 +1333,13 @@ def _false_fix_suspicion(
         "short_distance_while_moving": ["solution"],
         "recent_slip": ["stat"],
         "high_residual": ["stat"],
+        "stat_recent_slip": ["stat"],
+        "stat_high_residual": ["stat"],
+        "stat_rejection_burst": ["stat"],
         "transition_jump": ["solution"],
         "incomplete_diagnostics": ["stat"],
         "trace_low_ar_ratio": ["trace"],
+        "trace_ambiguity_validation_failed": ["trace"],
         "trace_recent_slip": ["trace"],
         "trace_residual_outlier": ["trace"],
         "trace_rejection_burst": ["trace"],
@@ -1104,9 +1373,9 @@ def _false_fix_suspicion(
         ):
             flags.append("short_distance_while_moving")
         if stat_slip_times_s and slips_hard and _has_recent_slip(stat_slip_times_s, segment, thresholds.recent_slip_window_s):
-            flags.append("recent_slip")
+            flags.extend(["recent_slip", "stat_recent_slip"])
         if residuals_hard and _segment_high_residual(stat, segment, thresholds):
-            flags.append("high_residual")
+            flags.extend(["high_residual", "stat_high_residual"])
         if segment.start_index in fixed_entry_warning_indexes:
             flags.append("transition_jump")
         flags.extend(_trace_flags_for_segment(segment, trace_by_epoch))
@@ -1118,8 +1387,9 @@ def _false_fix_suspicion(
             reasons["incomplete_diagnostics"] += segment.duration_s
         severe = (
             "transition_jump" in flags
-            or ("recent_slip" in flags and "short_time_segment" in flags)
+            or ("stat_recent_slip" in flags and "short_time_segment" in flags)
             or ("trace_low_ar_ratio" in flags and "short_time_segment" in flags)
+            or ("trace_ambiguity_validation_failed" in flags and "short_time_segment" in flags)
             or ("trace_residual_outlier" in flags and "short_time_segment" in flags)
         )
         if severe:
@@ -1136,6 +1406,7 @@ def _false_fix_suspicion(
             trusted_distance += segment.distance_m
     total_fixed_time = trusted_time + provisional_time + suspect_time + unknown_time
     total_fixed_distance = trusted_distance + provisional_distance + suspect_distance + unknown_distance
+    reason_details = _reason_details(reasons, evidence_sources, total_fixed_time, total_fixed_distance, residuals, slips, trace_summary)
     return {
         "qc_confidence_available": total_fixed_time > 0.0,
         "raw_fixed_time_s": total_fixed_time,
@@ -1162,8 +1433,40 @@ def _false_fix_suspicion(
         "provisional_fixed_distance_pct": (100.0 * provisional_distance / total_fixed_distance) if total_fixed_distance else 0.0,
         "suspect_fixed_distance_pct": (100.0 * suspect_distance / total_fixed_distance) if total_fixed_distance else 0.0,
         "reasons": reasons,
+        "reason_details": reason_details,
         "evidence_sources": evidence_sources,
     }
+
+
+def _reason_details(
+    reasons: dict[str, float],
+    evidence_sources: dict[str, list[str]],
+    total_fixed_time: float,
+    total_fixed_distance: float,
+    residuals: dict[str, object],
+    slips: dict[str, object],
+    trace_summary: dict[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    details: dict[str, dict[str, object]] = {}
+    trace_alignment = trace_summary.get("alignment", {}) if isinstance(trace_summary, dict) else {}
+    for reason, affected_time in reasons.items():
+        sources = evidence_sources.get(reason, [])
+        aligned = True
+        if "trace" in sources:
+            aligned = bool(isinstance(trace_alignment, dict) and trace_alignment.get("available"))
+        elif reason in {"recent_slip", "stat_recent_slip"}:
+            aligned = slips.get("epochs_with_slip_pct") is not None
+        elif reason in {"high_residual", "stat_high_residual"}:
+            aligned = bool(residuals.get("quality_aligned"))
+        affected_distance = total_fixed_distance * affected_time / total_fixed_time if total_fixed_time else 0.0
+        details[reason] = {
+            "source": "+".join(sources) if sources else "unknown",
+            "aligned": aligned,
+            "affected_fixed_time_s": affected_time,
+            "affected_fixed_distance_m": affected_distance,
+            "affected_epoch_count": None,
+        }
+    return details
 
 
 def _trace_alignment_by_epoch(trace_summary: dict[str, object] | None) -> dict[int, dict[str, object]]:
@@ -1200,6 +1503,8 @@ def _trace_flags_for_segment(segment: Segment, trace_by_epoch: dict[int, dict[st
             threshold = float(ar_threshold) if ar_threshold is not None else 3.0
             if float(ar_ratio) < threshold:
                 flags.add("trace_low_ar_ratio")
+        if int(counts.get("ambiguity_validation_failed", 0) or 0):
+            flags.add("trace_ambiguity_validation_failed")
         if int(counts.get("cycle_slip", 0) or 0) or int(counts.get("lli", 0) or 0):
             flags.add("trace_recent_slip")
         if int(counts.get("residual_outlier", 0) or 0):
@@ -1419,7 +1724,12 @@ def format_quality_text(analysis: QualityAnalysis) -> str:
     return "\n".join(lines)
 
 
-def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool = False) -> str:
+def format_quality_markdown(
+    analysis: QualityAnalysis,
+    *,
+    include_raw_json: bool = False,
+    show_empty_baseline_bins: bool = False,
+) -> str:
     """Return Markdown RTK quality report."""
 
     data = analysis.as_dict()
@@ -1543,10 +1853,35 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
     lines.extend(
         [
             "",
-            "## 8. Quality By Route Distance",
+            "## 8. Quality By Base-Rover Distance",
             "",
-            "| Start km | End km | Fixed s | Float s | DGPS s | Invalid/missing s |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Baseline km | Epochs | Track km | Fixed s / % | Float s / % | DGPS s / % | Missing s / % | Fixed km / % | Fixed segs | Median fixed seg s | Trace low AR / slips / outliers |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    baseline_bins = baseline.get("quality_by_baseline_bin", []) if isinstance(baseline, dict) else []
+    baseline_rows = []
+    if isinstance(baseline_bins, list):
+        for item in baseline_bins:
+            if isinstance(item, dict) and (show_empty_baseline_bins or item.get("populated")):
+                baseline_rows.append(item)
+    if baseline_rows:
+        for item in baseline_rows:
+            lines.append(_quality_bin_markdown_row(item, label=f"{_fmt_any(item.get('start_km'))}-{_fmt_any(item.get('end_km'))}"))
+        if not show_empty_baseline_bins:
+            lines.append("")
+            lines.append("Empty baseline bins omitted; full bins are in JSON.")
+    elif isinstance(baseline, dict) and baseline.get("available"):
+        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | n/a | n/a |")
+    else:
+        lines.append("| unavailable | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | n/a | n/a |")
+    lines.extend(
+        [
+            "",
+            "## 9. Quality By Route Distance",
+            "",
+            "| Route km | Epochs | Track km | Fixed s / % | Float s / % | DGPS s / % | Missing s / % | Fixed km / % | Fixed segs | Median fixed seg s | Trace low AR / slips / outliers |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     route_bins = data.get("route_bins", [])
@@ -1554,20 +1889,13 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
         for item in route_bins[:20]:
             if not isinstance(item, dict):
                 continue
-            quality_time = item.get("quality_time_s", {})
-            if not isinstance(quality_time, dict):
-                quality_time = {}
-            lines.append(
-                f"| {_fmt_any(item.get('start_km'))} | {_fmt_any(item.get('end_km'))} | "
-                f"{_fmt_any(quality_time.get('fixed'))} | {_fmt_any(quality_time.get('float'))} | "
-                f"{_fmt_any(quality_time.get('dgps'))} | {_fmt_any(quality_time.get('invalid'))} |"
-            )
+            lines.append(_quality_bin_markdown_row(item, label=f"{_fmt_any(item.get('start_km'))}-{_fmt_any(item.get('end_km'))}"))
     else:
-        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a |")
+        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | n/a | n/a |")
     lines.extend(
         [
             "",
-            "## 9. RTKLIB Trace Diagnostics",
+            "## 10. RTKLIB Trace Diagnostics",
             "",
         ]
     )
@@ -1637,7 +1965,7 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
                 f"- `.stat` files deleted after successful analysis: {len(deleted) if isinstance(deleted, list) else 0}",
             ]
         )
-    lines.extend(["", "## 10. Top Warnings And Interpretation", ""])
+    lines.extend(["", "## 11. Top Warnings And Interpretation", ""])
     warnings = data.get("warnings", [])
     if warnings:
         lines.extend(f"- WARNING: {warning}" for warning in warnings)  # type: ignore[union-attr]
@@ -1646,7 +1974,7 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
     lines.extend(
         [
             "",
-            "## 11. Suggested Next Actions",
+            "## 12. Suggested Next Actions",
             "",
             "- Optimise on QC-supported fixed time and QC-supported fixed distance, not raw fixed percentage alone.",
             "- Inspect missing/no-output time before comparing configurations.",
@@ -1654,8 +1982,33 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
         ]
     )
     if include_raw_json:
-        lines.extend(["", "## 12. Raw JSON Appendix", "", "```json", json.dumps(data, indent=2, sort_keys=True, default=str), "```"])
+        lines.extend(["", "## 13. Raw JSON Appendix", "", "```json", json.dumps(data, indent=2, sort_keys=True, default=str), "```"])
     return "\n".join(lines) + "\n"
+
+
+def _quality_bin_markdown_row(item: dict[str, object], *, label: str) -> str:
+    elapsed = float(item.get("elapsed_time_s", 0.0) or 0.0)
+    emitted = float(item.get("emitted_time_s", 0.0) or 0.0)
+    missing = float(item.get("missing_time_s", 0.0) or 0.0)
+    fixed = float(item.get("fixed_time_s", 0.0) or 0.0)
+    flt = float(item.get("float_time_s", 0.0) or 0.0)
+    dgps = float(item.get("dgps_time_s", 0.0) or 0.0)
+    fixed_km = float(item.get("fixed_distance_km", 0.0) or 0.0)
+    track_km = float(item.get("track_distance_km", 0.0) or 0.0)
+    trace = (
+        f"{_fmt_any(item.get('trace_low_ar_count'))} / "
+        f"{_fmt_any(item.get('trace_slip_count'))} / "
+        f"{_fmt_any(item.get('trace_residual_outlier_count'))}"
+    )
+    return (
+        f"| {label} | {_fmt_any(item.get('epoch_count'))} | {_fmt_any(track_km)} | "
+        f"{_fmt_any(fixed)} / {_fmt_pct(fixed, elapsed)} | "
+        f"{_fmt_any(flt)} / {_fmt_pct(flt, emitted)} | "
+        f"{_fmt_any(dgps)} / {_fmt_pct(dgps, emitted)} | "
+        f"{_fmt_any(missing)} / {_fmt_pct(missing, elapsed)} | "
+        f"{_fmt_any(fixed_km)} / {_fmt_pct(fixed_km, track_km)} | "
+        f"{_fmt_any(item.get('fixed_segment_count'))} | {_fmt_any(item.get('fixed_segment_median_s'))} | {trace} |"
+    )
 
 
 def _fmt(value: float) -> str:
@@ -1693,19 +2046,33 @@ def _reason_interpretation(reason: str) -> str:
         "short_distance_while_moving": "short moving segment",
         "recent_slip": "deduplicated recent slip evidence",
         "high_residual": "time-aligned residual outlier",
+        "stat_recent_slip": "deduplicated recent STAT slip evidence",
+        "stat_high_residual": "time-aligned STAT residual outlier",
+        "stat_rejection_burst": "time-aligned STAT rejection burst",
         "transition_jump": "speed-normalised motion anomaly",
         "incomplete_diagnostics": "confidence limited by incomplete diagnostics",
+        "trace_low_ar_ratio": "time-aligned low trace AR ratio",
+        "trace_ambiguity_validation_failed": "time-aligned trace ambiguity validation failure",
+        "trace_recent_slip": "time-aligned trace slip evidence",
+        "trace_residual_outlier": "time-aligned trace residual outlier",
+        "trace_rejection_burst": "time-aligned trace rejection burst",
+        "trace_base_rover_dt": "time-aligned trace base/rover time issue",
+        "trace_warning_or_error": "time-aligned trace warning/error",
     }
     return mapping.get(reason, "diagnostic context")
 
 
 def _reason_status(reason: str, data: dict[str, object]) -> str:
-    if reason == "recent_slip":
+    if reason in {"recent_slip", "stat_recent_slip"}:
         slips = data.get("slips", {})
         return "aligned" if isinstance(slips, dict) and slips.get("epochs_with_slip_pct") is not None else "not time-aligned"
-    if reason == "high_residual":
+    if reason in {"high_residual", "stat_high_residual"}:
         residuals = data.get("residuals", {})
         return "aligned" if isinstance(residuals, dict) and residuals.get("quality_aligned") else "global only"
+    if reason.startswith("trace_"):
+        trace = data.get("trace", {})
+        alignment = trace.get("alignment", {}) if isinstance(trace, dict) else {}
+        return "aligned" if isinstance(alignment, dict) and alignment.get("available") else "global only"
     return "available"
 
 

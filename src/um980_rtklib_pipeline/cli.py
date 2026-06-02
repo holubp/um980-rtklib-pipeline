@@ -128,6 +128,16 @@ DUPLICATE_SINGLE_VALUE_OPTIONS = {
     "--base-resolution",
     "--base-rinex-version",
 }
+PIPELINE_STEPS = (
+    "parse_rover",
+    "extract_receiver_products",
+    "write_rinex_obs",
+    "extract_rover_nav",
+    "resolve_base",
+    "run_rtklib",
+    "quality",
+    "cleanup",
+)
 RTK_POS_MODE_CODES = {
     "single": "0",
     "dgps": "1",
@@ -445,6 +455,7 @@ def _add_quality_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quality-baseline-bins", default="0,10,20,30,40,50,75,100,150")
     parser.add_argument("--quality-trace-align-tolerance-s", type=float, default=0.5)
     parser.add_argument("--quality-md-raw-json", action="store_true")
+    parser.add_argument("--quality-md-show-empty-baseline-bins", action="store_true")
     parser.add_argument("--quality-stat-max-lines", type=int, default=0, help="Maximum RTKLIB .stat lines to parse; 0 is unlimited.")
     parser.add_argument("--quality-stat-max-seconds", type=float, default=0.0, help="Maximum wall-clock seconds to spend parsing .stat; 0 is unlimited.")
     parser.add_argument("--quality-fast", action="store_true", help="Skip expensive STAT detail parsing while keeping raw solution summaries.")
@@ -501,6 +512,10 @@ def _add_rerun_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--emit-run-script", nargs="?", const="auto", help="Write rerun shell script; optional PATH or 'auto'.")
     parser.add_argument("--no-emit-run-script", action="store_true", help="Disable automatic rerun script emission.")
     parser.add_argument("--dry-run-plan", action="store_true", help="Print planned phases/commands without running RTKLIB.")
+    parser.add_argument("--from-step", choices=PIPELINE_STEPS, help="Reuse earlier pipeline outputs and run from this step onward.")
+    parser.add_argument("--only-step", choices=PIPELINE_STEPS, help="Run only one composable pipeline step.")
+    parser.add_argument("--skip-existing", action="store_true", help="Reuse existing outputs for selected pipeline steps when present.")
+    parser.add_argument("--force-step", choices=PIPELINE_STEPS, action="append", default=[], help="Regenerate this step even when --skip-existing is set.")
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -551,6 +566,16 @@ def _quality_thresholds_from_args(args: argparse.Namespace) -> QualityThresholds
         route_bin_km=None if getattr(args, "quality_no_route_bins", False) else getattr(args, "quality_route_bin_km", 10.0),
         baseline_bins=_parse_float_csv(getattr(args, "quality_baseline_bins", "0,10,20,30,40,50,75,100,150")),
         trace_align_tolerance_s=getattr(args, "quality_trace_align_tolerance_s", 0.5),
+    )
+
+
+def _format_quality_markdown_from_args(args: argparse.Namespace, analysis) -> str:
+    """Render quality Markdown with CLI-controlled optional sections."""
+
+    return format_quality_markdown(
+        analysis,
+        include_raw_json=bool(getattr(args, "quality_md_raw_json", False)),
+        show_empty_baseline_bins=bool(getattr(args, "quality_md_show_empty_baseline_bins", False)),
     )
 
 
@@ -767,6 +792,94 @@ def _append_rerun_command(args: argparse.Namespace, title: str, command: list[st
             Path(commands_md).read_text(encoding="utf-8") + f"## {title}\n\n```bash\n{rendered}\n```\n\n",
             encoding="utf-8",
         )
+
+
+def _init_pipeline_manifest(args: argparse.Namespace, out_dir: Path, basename: str) -> None:
+    """Initialise a lightweight pipeline step manifest."""
+
+    path = out_dir / f"{basename}.pipeline-manifest.json"
+    manifest = {
+        "basename": basename,
+        "cwd": str(Path.cwd()),
+        "original_command": _quote_command(["PYTHONPATH=src", "python", "-m", "um980_rtklib_pipeline.cli", *getattr(args, "_original_argv", [])]),
+        "steps": [],
+    }
+    setattr(args, "_pipeline_manifest_path", path)
+    setattr(args, "_pipeline_manifest", manifest)
+    _write_pipeline_manifest(args)
+
+
+def _write_pipeline_manifest(args: argparse.Namespace) -> None:
+    path = getattr(args, "_pipeline_manifest_path", None)
+    manifest = getattr(args, "_pipeline_manifest", None)
+    if path is None or not isinstance(manifest, dict):
+        return
+    Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+
+
+def _record_pipeline_step(
+    args: argparse.Namespace,
+    name: str,
+    *,
+    inputs: list[Path | str] | None = None,
+    outputs: list[Path | str] | None = None,
+    command: list[str] | str | None = None,
+    dependencies: list[str] | None = None,
+    status: str = "planned",
+    elapsed_s: float | None = None,
+    reused: bool = False,
+) -> None:
+    manifest = getattr(args, "_pipeline_manifest", None)
+    if not isinstance(manifest, dict):
+        return
+    steps = manifest.setdefault("steps", [])
+    if not isinstance(steps, list):
+        return
+    entry = {
+        "name": name,
+        "inputs": [str(item) for item in inputs or []],
+        "outputs": [str(item) for item in outputs or []],
+        "command": _quote_command(command) if isinstance(command, list) else command,
+        "dependencies": dependencies or [],
+        "status": status,
+        "elapsed_s": elapsed_s,
+        "reused": reused,
+    }
+    for index, existing in enumerate(steps):
+        if isinstance(existing, dict) and existing.get("name") == name and existing.get("status") == "planned":
+            merged = {**existing, **{key: value for key, value in entry.items() if value not in (None, [], "")}}
+            merged["status"] = status
+            merged["reused"] = reused
+            steps[index] = merged
+            break
+    else:
+        steps.append(entry)
+    _write_pipeline_manifest(args)
+
+
+def _step_order_index(step: str) -> int:
+    try:
+        return PIPELINE_STEPS.index(step)
+    except ValueError:
+        return len(PIPELINE_STEPS)
+
+
+def _should_run_pipeline_step(args: argparse.Namespace, step: str) -> bool:
+    only = getattr(args, "only_step", None)
+    if only:
+        return step == only
+    start = getattr(args, "from_step", None)
+    if start and _step_order_index(step) < _step_order_index(start):
+        return False
+    return True
+
+
+def _forced_step(args: argparse.Namespace, step: str) -> bool:
+    return step in set(getattr(args, "force_step", []) or [])
+
+
+def _existing_outputs(paths: list[Path]) -> bool:
+    return bool(paths) and all(path.exists() and path.stat().st_size > 0 for path in paths)
 
 
 def _load_records(path: Path):
@@ -2046,7 +2159,7 @@ def _run_quality_analysis_if_requested(
     )
     _log_quality_performance(analysis)
     with _time_phase(args, "quality_report_write"):
-        md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
+        md_path.write_text(_format_quality_markdown_from_args(args, analysis), encoding="utf-8")
         write_quality_json(json_path, analysis)
     deleted_stats: list[str] = []
     if getattr(args, "quality_clean_stat", False) and stat is not None:
@@ -2062,7 +2175,7 @@ def _run_quality_analysis_if_requested(
             },
         )
         with _time_phase(args, "quality_report_write_after_cleanup"):
-            md_path.write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
+            md_path.write_text(_format_quality_markdown_from_args(args, analysis), encoding="utf-8")
             write_quality_json(json_path, analysis)
     logging.info("wrote RTK quality analysis: markdown=%s json=%s", md_path, json_path)
 
@@ -2180,6 +2293,8 @@ def _quality_rerun_command(args: argparse.Namespace, solution: Path, stat: Path 
             command.extend([option, str(value)])
     if getattr(args, "quality_fast", False):
         command.append("--quality-fast")
+    if getattr(args, "quality_md_show_empty_baseline_bins", False):
+        command.append("--quality-md-show-empty-baseline-bins")
     return command
 
 
@@ -2901,12 +3016,12 @@ def cmd_quality_analyze(args: argparse.Namespace) -> int:
         write_quality_json(Path(args.out_json), analysis)
         logging.info("wrote quality JSON: %s", args.out_json)
     if args.out_md:
-        Path(args.out_md).write_text(format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False))), encoding="utf-8")
+        Path(args.out_md).write_text(_format_quality_markdown_from_args(args, analysis), encoding="utf-8")
         logging.info("wrote quality Markdown: %s", args.out_md)
     rendered = (
         json.dumps(analysis.as_dict(), indent=2, sort_keys=True, default=str)
         if args.format == "json"
-        else format_quality_markdown(analysis, include_raw_json=bool(getattr(args, "quality_md_raw_json", False)))
+        else _format_quality_markdown_from_args(args, analysis)
         if args.format == "markdown"
         else format_quality_text(analysis)
     )
@@ -3275,15 +3390,65 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(args.rover_log, args.basename)
     _init_rerun_artifacts(args, out_dir, base)
-    logging.info("pipeline step 1/3: extract receiver products")
-    cmd_extract(args)
-    logging.info("pipeline step 2/3: generate rover RINEX and navigation files")
-    cmd_rinex(args)
     rover_obs = out_dir / f"{base}.direct.obs"
+    _init_pipeline_manifest(args, out_dir, base)
+    _record_pipeline_step(
+        args,
+        "extract_receiver_products",
+        inputs=[args.rover_log],
+        outputs=[out_dir / f"{base}.solution.csv", out_dir / f"{base}.solution.nmea"],
+        command=["python", "-m", "um980_rtklib_pipeline.cli", "extract", str(args.rover_log), "--out-dir", str(out_dir), "--basename", base],
+        status="planned",
+    )
+    _record_pipeline_step(
+        args,
+        "write_rinex_obs",
+        inputs=[args.rover_log],
+        outputs=[rover_obs, out_dir / f"{base}.rover-gps.nav"],
+        command=["python", "-m", "um980_rtklib_pipeline.cli", "rinex", str(args.rover_log), "--out-dir", str(out_dir), "--basename", base],
+        dependencies=["extract_receiver_products"],
+        status="planned",
+    )
+    _record_pipeline_step(args, "resolve_base", inputs=[rover_obs], outputs=[], dependencies=["write_rinex_obs"], status="planned")
+    _record_pipeline_step(args, "run_rtklib", inputs=[rover_obs], outputs=[_rtklib_output_file(out_dir, base, _rtklib_output_formats(args)[0])], dependencies=["resolve_base"], status="planned")
+    _record_pipeline_step(args, "quality", inputs=[_rtklib_output_file(out_dir, base, _rtklib_output_formats(args)[0])], outputs=[out_dir / f"{base}-rtk.quality.json", out_dir / f"{base}-rtk.quality.md"], dependencies=["run_rtklib"], status="planned")
+    if getattr(args, "dry_run_plan", False):
+        logging.info("dry-run plan written: %s", getattr(args, "_pipeline_manifest_path", None))
+        return 0
+    if _should_run_pipeline_step(args, "extract_receiver_products"):
+        extract_outputs = [out_dir / f"{base}.solution.csv", out_dir / f"{base}.solution.nmea"]
+        if getattr(args, "skip_existing", False) and not _forced_step(args, "extract_receiver_products") and _existing_outputs(extract_outputs):
+            logging.info("pipeline step extract_receiver_products: reusing existing outputs")
+            _record_pipeline_step(args, "extract_receiver_products", inputs=[args.rover_log], outputs=extract_outputs, status="skipped", reused=True)
+        else:
+            started = time.perf_counter()
+            logging.info("pipeline step 1/3: extract receiver products")
+            cmd_extract(args)
+            _record_pipeline_step(args, "extract_receiver_products", inputs=[args.rover_log], outputs=extract_outputs, status="generated", elapsed_s=time.perf_counter() - started)
+    if getattr(args, "only_step", None) == "extract_receiver_products":
+        return 0
+    if _should_run_pipeline_step(args, "write_rinex_obs"):
+        rinex_outputs = [rover_obs, out_dir / f"{base}.rover-gps.nav"]
+        if getattr(args, "skip_existing", False) and not _forced_step(args, "write_rinex_obs") and _existing_outputs([rover_obs]):
+            logging.info("pipeline step write_rinex_obs: reusing existing outputs")
+            _record_pipeline_step(args, "write_rinex_obs", inputs=[args.rover_log], outputs=rinex_outputs, status="skipped", reused=True)
+        else:
+            started = time.perf_counter()
+            logging.info("pipeline step 2/3: generate rover RINEX and navigation files")
+            cmd_rinex(args)
+            _record_pipeline_step(args, "write_rinex_obs", inputs=[args.rover_log], outputs=rinex_outputs, status="generated", elapsed_s=time.perf_counter() - started)
+    if getattr(args, "only_step", None) == "write_rinex_obs":
+        return 0
+    if getattr(args, "only_step", None) == "quality":
+        setattr(args, "quality_analyze", True)
+        _run_quality_analysis_if_requested(args, out_dir, base, [], base_ecef=None, base_llh=None)
+        _record_pipeline_step(args, "quality", inputs=[_rtklib_output_file(out_dir, base, _rtklib_output_formats(args)[0])], outputs=[out_dir / f"{base}-rtk.quality.json"], status="generated")
+        return 0
     base_obs = [Path(item) for item in args.base_obs or []]
     converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
     base_obs.extend(converted_base_obs)
     if args.station and args.download_base:
+        base_started = time.perf_counter()
         logging.info("pipeline base download: deriving time span from %s", rover_obs)
         rover_span = read_rinex_obs_time_span(rover_obs)
         if rover_span.start is None or rover_span.end is None:
@@ -3304,6 +3469,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
             )
             with _time_phase(args, "base_download_staging"):
                 base_obs.extend(_download_base_files_for_window(args, rover_span.start - margin, rover_span.end + margin))
+        _record_pipeline_step(args, "resolve_base", inputs=[rover_obs], outputs=base_obs, status="generated", elapsed_s=time.perf_counter() - base_started)
     should_run_rtklib = bool(
         args.run_rtklib
         or args.rtkconf
@@ -3367,6 +3533,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     if getattr(args, "analysis_json", False):
         _write_rtklib_inventory_analysis(out_dir, base, inventory)
     with _time_phase(args, "rtklib_run", output_formats=",".join(_rtklib_output_formats(args))):
+        rtklib_started = time.perf_counter()
         commands = _run_rtklib_output_formats(
             args=args,
             rnx2rtkp=rnx2rtkp,
@@ -3379,7 +3546,11 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
             base_ecef=base_ecef,
             base_llh=base_llh,
         )
+    _record_pipeline_step(args, "run_rtklib", inputs=[rover_obs, *base_obs, *nav_files], outputs=[_rtklib_output_file(out_dir, base, fmt) for fmt in _rtklib_output_formats(args)], status="generated", elapsed_s=time.perf_counter() - rtklib_started)
+    quality_started = time.perf_counter()
     _run_quality_analysis_if_requested(args, out_dir, base, commands, base_ecef=base_ecef, base_llh=base_llh)
+    if getattr(args, "quality_analyze", False):
+        _record_pipeline_step(args, "quality", inputs=[_rtklib_output_file(out_dir, base, _rtklib_output_formats(args)[0])], outputs=[out_dir / f"{base}-rtk.quality.json", out_dir / f"{base}-rtk.quality.md"], status="generated", elapsed_s=time.perf_counter() - quality_started)
     for command in commands:
         print(format_command(command.args))
     return 0

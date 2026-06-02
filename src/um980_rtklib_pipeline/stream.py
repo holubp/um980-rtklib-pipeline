@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-RecordKind = Literal["nmea", "unicore_ascii", "unicore_binary", "noise"]
+RecordKind = Literal["nmea", "command_response", "unicore_ascii", "unicore_binary", "noise"]
 BINARY_MESSAGE_TYPES = {
     4: "BDSIONB",
     8: "GPSIONB",
@@ -48,6 +48,7 @@ KNOWN_NMEA_SENTENCE_TYPES = {
 }
 KNOWN_PROPRIETARY_NMEA_TYPES = {"ADRNAVA", "PPPNAVA"}
 NMEA_LINE_RE = re.compile(rb"^\$([A-Z0-9]{5}|P[A-Z0-9]{3,}|ADRNAVA|PPPNAVA)(?:,[ -~]*)?(?:\*[0-9A-Fa-f]{2})?\r?\n?$")
+COMMAND_RESPONSE_LINE_RE = re.compile(rb"^\$[A-Za-z][A-Za-z0-9_]*(?:,[ -~]*)?response:[ -~]*(?:\*[0-9A-Fa-f]{2})?\r?\n?$")
 UNICORE_ASCII_LINE_RE = re.compile(rb"^#[A-Z0-9]+(?:,[ -~]*)?;[ -~]*(?:\*[0-9A-Fa-f]{8})?\r?\n?$")
 UNICORE_BINARY_CRC32_POLY = 0xEDB88320
 
@@ -57,8 +58,8 @@ class StreamRecord:
     """One demultiplexed record from a mixed UM980 serial stream.
 
     Attributes:
-        kind: Record family (`nmea`, `unicore_ascii`, `unicore_binary`, or
-            `noise`).
+        kind: Record family (`nmea`, `command_response`, `unicore_ascii`,
+            `unicore_binary`, or `noise`).
         offset: Byte offset in the input stream.
         raw: Original bytes for the record.
         text: Decoded text for ASCII records.
@@ -92,6 +93,7 @@ class StreamDiagnostics:
 
     input_bytes: int = 0
     valid_nmea_records: int = 0
+    command_response_records: int = 0
     invalid_nmea_records: int = 0
     unicore_ascii_records: int = 0
     unicore_binary_records: int = 0
@@ -122,6 +124,7 @@ class StreamDiagnostics:
         return {
             "input_bytes": self.input_bytes,
             "valid_nmea_records": self.valid_nmea_records,
+            "command_response_records": self.command_response_records,
             "invalid_nmea_records": self.invalid_nmea_records,
             "invalid_nmea_by_reason": dict(self.invalid_nmea_by_reason),
             "unicore_ascii_records": self.unicore_ascii_records,
@@ -215,6 +218,19 @@ def is_plausible_nmea_line(line: bytes) -> bool:
     if len(msg_type) != 5:
         return False
     if msg_type[-3:] not in KNOWN_NMEA_SENTENCE_TYPES:
+        return False
+    ok = nmea_checksum_ok(line)
+    return ok is not False
+
+
+def is_plausible_command_response_line(line: bytes) -> bool:
+    """Return true when a line is a receiver command response."""
+
+    if not line.startswith(b"$") or len(line) > 4096 or not COMMAND_RESPONSE_LINE_RE.match(line):
+        return False
+    try:
+        line.decode("ascii")
+    except UnicodeDecodeError:
         return False
     ok = nmea_checksum_ok(line)
     return ok is not False
@@ -386,6 +402,15 @@ def parse_stream(data: bytes, *, progress: bool = False) -> tuple[list[StreamRec
                     noise_start = pos
                 break
             raw = data[pos : end + 1]
+            if is_plausible_command_response_line(raw):
+                flush_noise(pos)
+                text = raw.decode("ascii", errors="replace").strip()
+                ok = nmea_checksum_ok(raw)
+                msg_type = record_message_type(text, "$")
+                diagnostics.command_response_records += 1
+                records.append(StreamRecord("command_response", pos, raw, text, msg_type, ok))
+                pos = end + 1
+                continue
             if not is_plausible_nmea_line(raw):
                 diagnostics.note_rejection("nmea", "invalid_structure_or_checksum", pos, raw)
                 if noise_start is None:

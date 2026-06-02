@@ -733,9 +733,14 @@ create very large files, so use them only for manual debugging.
 
 When timestamps are recognised in trace lines, trace events are aligned to
 solution epochs using `--quality-trace-align-tolerance-s` (default `0.5`).
+RTKLIB trace lines that contain only a time-of-day, such as
+`2 05:10:30.40: ambiguity validation failed (...)`, are anchored to the
+solution date during quality analysis, with day rollover handled against nearby
+solution epochs.
 Only time-aligned trace evidence can contribute local QC reasons such as
-`trace_low_ar_ratio`, `trace_recent_slip`, or `trace_residual_outlier`; global
-trace counters are diagnostic only.
+`trace_low_ar_ratio`, `trace_ambiguity_validation_failed`,
+`trace_recent_slip`, or `trace_residual_outlier`; global trace counters are
+diagnostic only.
 
 Use keep mode only for manual debugging:
 
@@ -768,6 +773,51 @@ extracted and written:
 Standalone `quality --stat existing.stat --quality-clean-stat` is
 refused so archived user-supplied `.stat` files are not deleted accidentally.
 Cleanup status is recorded in the quality JSON and Markdown report.
+
+### Baseline And Route Quality Bins
+
+When base coordinates are available, the quality JSON includes
+`baseline_summary.quality_by_baseline_bin` for the default bins
+`0,10,20,30,40,50,75,100,150` km. Each bin reports elapsed/emitted/missing
+time, travelled distance, raw quality time and distance percentages, fixed
+segment duration statistics, QC confidence totals, and aligned STAT/trace
+evidence counts. The Markdown report renders a compact
+`Quality By Base-Rover Distance` table and omits empty bins by default; use
+`--quality-md-show-empty-baseline-bins` to include them. Route-distance bins
+expose the same core metrics through `route_bins`.
+
+### Reproducible Pipeline Steps
+
+Verbose pipeline runs write `<basename>.pipeline-manifest.json` alongside the
+rerun shell script and command Markdown. The manifest records planned and
+completed steps, inputs, outputs, dependencies, elapsed time, and whether an
+output was reused. The current safe step boundaries are:
+
+```text
+extract_receiver_products, write_rinex_obs, resolve_base, run_rtklib, quality
+```
+
+Use `--dry-run-plan` to write the manifest without parsing the rover or running
+RTKLIB. Use `--from-step STEP`, `--only-step STEP`, `--skip-existing`, and
+`--force-step STEP` to reuse existing products at those command boundaries.
+
+### UM980 Stream Parser API
+
+For tools that need parser-level diagnostics without running the full pipeline,
+use the documented facade:
+
+```python
+from pathlib import Path
+from um980_rtklib_pipeline.um980_stream import parse_file
+
+result = parse_file(Path("rover.ubx"))
+print(result.diagnostics.as_dict())
+```
+
+The public API exposes `parse_bytes`, `parse_file`, `iter_records`,
+`summarize_records`, `ParseResult`, parser warning/error shapes, and a
+Unicore A/B-suffix message registry. Command responses such as
+`$command,...,response: OK*XX` are classified separately from live NMEA.
 
 `postprocess` passes a base reference position to RTKLIB when one is available.
 Use `--base-ecef X Y Z` or `--base-llh LAT LON HEIGHT` for an explicit

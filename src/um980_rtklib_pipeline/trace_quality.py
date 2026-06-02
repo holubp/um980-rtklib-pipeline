@@ -16,6 +16,7 @@ from typing import Iterable
 
 TRACE_COUNTERS = (
     "ar_ratio_lines",
+    "ambiguity_validation_failed_lines",
     "ambiguity_fix_lines",
     "ambiguity_hold_lines",
     "ambiguity_reset_lines",
@@ -37,13 +38,19 @@ MAX_TRACE_EVENT_TIME_BUCKETS = 50_000
 
 _RATIO_RE = re.compile(r"\bratio\s*(?:=|:)\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 _THRESHOLD_RE = re.compile(r"\b(?:thres|threshold)\s*(?:=|:)\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+_NB_RE = re.compile(r"\bnb\s*(?:=|:)\s*(\d+)", re.IGNORECASE)
+_NX_RE = re.compile(r"\bnx\s*(?:=|:)\s*(\d+)", re.IGNORECASE)
+_S1_RE = re.compile(r"\bs1\s*(?:=|:)\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+_S2_RE = re.compile(r"\bs2\s*(?:=|:)\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 _DT_RE = re.compile(r"\bdt\s*=\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 _SAT_RE = re.compile(r"\b([GRECJIS]\d{2})\b")
 _OBS_RE = re.compile(r"\b([CLDS]\d[A-Z]?)\b")
 _TIMESTAMP_RE = re.compile(r"\b(\d{4})[/-](\d{2})[/-](\d{2})[ T](\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
+_TIME_OF_DAY_RE = re.compile(r"^\s*(?:\d+\s+)?(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?):")
 
 _CATEGORY_TO_EVENT = {
     "ar_ratio_lines": "ar_ratio",
+    "ambiguity_validation_failed_lines": "ambiguity_validation_failed",
     "ambiguity_fix_lines": "ambiguity_fix",
     "ambiguity_hold_lines": "ambiguity_hold",
     "ambiguity_reset_lines": "ambiguity_reset",
@@ -214,10 +221,14 @@ def _process_line(
     ratio_values = list(_extract_ratios(line))
     if ratio_values:
         matched.add("ar_ratio_lines")
-    timestamp = _extract_timestamp(line)
+    timestamp, time_basis = _extract_timestamp(line)
     sat = _extract_satellite(line)
     observable = _extract_observable(line)
     threshold = _first_float(_THRESHOLD_RE, line)
+    nb = _first_int(_NB_RE, line)
+    nx = _first_int(_NX_RE, line)
+    s1 = _first_float(_S1_RE, line)
+    s2 = _first_float(_S2_RE, line)
     dt = _first_float(_DT_RE, line)
     for category in matched:
         counters[category] += 1
@@ -234,12 +245,17 @@ def _process_line(
                 timestamp.isoformat(),
                 {
                     "time": timestamp.isoformat(),
+                    "time_basis": time_basis,
                     "counts": {},
                     "sats": {},
                     "observables": {},
                     "ar_ratio_min": None,
                     "ar_ratio_max": None,
                     "ar_threshold": None,
+                    "nb": None,
+                    "nx": None,
+                    "s1": None,
+                    "s2": None,
                     "base_rover_dt_s": None,
                     "examples": [],
                 },
@@ -258,6 +274,14 @@ def _process_line(
                 examples_bucket.append(line[:240])
             if threshold is not None:
                 bucket["ar_threshold"] = threshold
+            if nb is not None:
+                bucket["nb"] = nb
+            if nx is not None:
+                bucket["nx"] = nx
+            if s1 is not None:
+                bucket["s1"] = s1
+            if s2 is not None:
+                bucket["s2"] = s2
             if dt is not None:
                 bucket["base_rover_dt_s"] = dt
     for value in ratio_values:
@@ -276,6 +300,8 @@ def _classify_line(lower: str) -> set[str]:
     if "lambda" in lower:
         categories.add("lambda_lines")
     if any(token in lower for token in ("resamb", "ambiguity", "amb ")):
+        if "validation failed" in lower or ("validation" in lower and "fail" in lower):
+            categories.add("ambiguity_validation_failed_lines")
         if "fix" in lower:
             categories.add("ambiguity_fix_lines")
         if "hold" in lower:
@@ -317,11 +343,18 @@ def _extract_ratios(line: str) -> Iterable[float]:
             continue
 
 
-def _extract_timestamp(line: str) -> datetime | None:
+def _extract_timestamp(line: str) -> tuple[datetime | None, str | None]:
     match = _TIMESTAMP_RE.search(line)
-    if not match:
-        return None
-    year, month, day, hour, minute, second = match.groups()
+    if match:
+        year, month, day, hour, minute, second = match.groups()
+        basis = "absolute"
+    else:
+        tod_match = _TIME_OF_DAY_RE.search(line)
+        if not tod_match:
+            return None, None
+        year, month, day = "1970", "01", "01"
+        hour, minute, second = tod_match.groups()
+        basis = "time_of_day"
     try:
         second_float = float(second)
         whole_second = int(second_float)
@@ -338,9 +371,9 @@ def _extract_timestamp(line: str) -> datetime | None:
             whole_second,
             microsecond,
             tzinfo=UTC,
-        )
+        ), basis
     except ValueError:
-        return None
+        return None, None
 
 
 def _extract_satellite(line: str) -> str | None:
@@ -359,6 +392,16 @@ def _first_float(pattern: re.Pattern[str], line: str) -> float | None:
         return None
     try:
         return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _first_int(pattern: re.Pattern[str], line: str) -> int | None:
+    match = pattern.search(line)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
     except ValueError:
         return None
 

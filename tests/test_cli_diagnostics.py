@@ -201,6 +201,22 @@ def test_quality_rerun_command_includes_trace_and_base_options(tmp_path: Path) -
     assert "--base-llh" in command
 
 
+def test_pipeline_dry_run_plan_writes_manifest_without_rover_parse(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+
+    rc = cli.main(["pipeline", str(tmp_path / "missing.ubx"), "--out-dir", str(out_dir), "--basename", "run", "--dry-run-plan"])
+
+    assert rc == 0
+    manifest = out_dir / "run.pipeline-manifest.json"
+    assert manifest.exists()
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    assert [step["name"] for step in data["steps"]][:3] == [
+        "extract_receiver_products",
+        "write_rinex_obs",
+        "resolve_base",
+    ]
+
+
 def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     args = SimpleNamespace(
         verbose=True,

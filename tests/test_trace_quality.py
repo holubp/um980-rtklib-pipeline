@@ -95,6 +95,31 @@ def test_trace_parser_extracts_typed_timestamped_events(tmp_path: Path):
     assert first["sats"]["G01"] >= 1
 
 
+def test_trace_parser_extracts_time_of_day_events(tmp_path: Path):
+    trace = tmp_path / "tod.trace"
+    trace.write_text(
+        "\n".join(
+            [
+                "2 05:10:30.40: ambiguity validation failed (nb=12 ratio=2.1 thres=3.0 s1=1.2 s2=2.3)",
+                "2 05:10:31.00: slip detected GF jump G12 L1 dGF=0.24",
+            ]
+        ),
+        encoding="ascii",
+    )
+
+    summary = analyze_rtklib_trace(trace)
+    events = summary["events"]
+
+    assert events["timestamped_event_times"] == 2
+    assert events["counts_by_type"]["ambiguity_validation_failed"] == 1
+    assert events["counts_by_type"]["cycle_slip"] == 1
+    first = events["event_time_aggregates"][0]
+    assert first["time_basis"] == "time_of_day"
+    assert first["nb"] == 12
+    assert first["ar_ratio_min"] == 2.1
+    assert first["ar_threshold"] == 3.0
+
+
 def test_trace_parser_reads_full_file_by_default_and_marks_caps(tmp_path: Path):
     trace = tmp_path / "large.trace"
     trace.write_text("".join("resamb: ratio=3.2\n" for _ in range(1200)), encoding="ascii")
