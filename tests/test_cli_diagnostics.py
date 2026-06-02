@@ -208,6 +208,69 @@ def test_quality_compare_json_does_not_require_solution(tmp_path: Path, capsys) 
     assert data["warnings"]
 
 
+def test_quality_detail_outputs_are_explicit(tmp_path: Path) -> None:
+    solution = tmp_path / "run.pos"
+    out_json = tmp_path / "quality.json"
+    detail_json = tmp_path / "quality-detail.json"
+    segments_jsonl = tmp_path / "segments.jsonl"
+    solution.write_text(
+        "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n"
+        "2026/05/30 05:00:01.000 50.000100 14.000000 250.0 1 16\n",
+        encoding="ascii",
+    )
+
+    rc = cli.main(
+        [
+            "quality",
+            "--solution",
+            str(solution),
+            "--out-json",
+            str(out_json),
+            "--quality-out-detail-json",
+            str(detail_json),
+            "--quality-out-segments-jsonl",
+            str(segments_jsonl),
+        ]
+    )
+
+    assert rc == 0
+    compact = json.loads(out_json.read_text(encoding="utf-8"))
+    detail = json.loads(detail_json.read_text(encoding="utf-8"))
+    assert "segment_qc" not in compact["long_fixed_metrics"]
+    assert "segment_qc" in detail["long_fixed_metrics"]
+    assert segments_jsonl.exists()
+
+
+def test_quality_compare_subcommand_outputs_multiple_comparisons(tmp_path: Path, capsys) -> None:
+    reports = []
+    for index, fixed_km in enumerate((1.0, 0.5, 2.0)):
+        path = tmp_path / f"report{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "fixed_continuity_summary": {
+                        "raw_fixed_time_s": 10.0,
+                        "raw_fixed_distance_km": fixed_km,
+                        "fixed_time_ge_60s": 0.0,
+                        "fixed_distance_ge_1000m": fixed_km,
+                    },
+                    "track_plausibility": {"track_consistency_score": 0.8, "fixed_internal_jump_count": 0},
+                    "residuals": {"carrier_abs_m": {"fixed_p95": 0.2}},
+                    "rejections": {"count": 10},
+                    "slips": {"raw_slip_flags_total": 10},
+                }
+            ),
+            encoding="utf-8",
+        )
+        reports.append(path)
+
+    rc = cli.main(["quality-compare", *(str(path) for path in reports), "--format", "json"])
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["comparisons"]) == 2
+
+
 def test_quality_rerun_command_includes_trace_and_base_options(tmp_path: Path) -> None:
     solution = tmp_path / "run.pos"
     trace = Path(str(solution) + ".trace")

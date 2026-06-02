@@ -126,6 +126,10 @@
   plausibility, long stable fixed coverage, local trajectory consistency, and
   time-aligned STAT/trace evidence must remain visible so aggressive filters
   cannot look better merely by making diagnostics cleaner.
+- RTK quality reports should lead with usable fixed continuity: fixed time and
+  distance in long segments, N50/N80 continuity, top fixed segments, and
+  trajectory plausibility. Keep default quality JSON compact; write full
+  segment and geometry arrays only through explicit detail-output options.
 - Large RTKLIB `.stat` analysis must remain indexed and bounded: never perform
   a linear nearest-solution-epoch scan inside loops over `$SAT` rows or raw slip
   flags. Deduplicate slip evidence first, align unique STAT epochs with a

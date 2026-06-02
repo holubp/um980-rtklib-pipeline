@@ -634,6 +634,16 @@ coverage; geometry-cost context; and trace-aligned AR/slip/rejection/residual
 evidence. Long smooth fixed segments are reported separately from short chattery
 fixed islands.
 
+The Markdown report now starts its practical interpretation with **Usable Fixed
+Continuity**. This block answers how much fixed solution is available in long,
+stable, trajectory-plausible coverage: fixed time in segments at least
+10/30/60/120 s, fixed distance in segments at least 100/500/1000/2000 m,
+duration/distance N50 and N80, the longest fixed segment, and the top-five
+fixed segment total. N80 means that 80% of fixed time or distance lies in
+segments at least that long. Median segment duration remains in the generic
+segment table, but it is a fragmentation diagnostic only, not a highway-quality
+headline.
+
 ```bash
 PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
   --solution rover_20260531095025-base-rtk.nmea \
@@ -644,6 +654,25 @@ PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
 
 The older standalone subcommand name `quality-analyze` is kept as a deprecated
 compatibility alias. The pipeline flag remains `--quality-analyze`.
+
+Default `quality.json` is intentionally compact: it includes summaries, useful
+fixed continuity, top fixed segments, populated route/baseline bins, residual
+and slip/rejection summaries, trace summaries, warnings, and performance
+counters. Verbose arrays require explicit outputs:
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
+  --solution rover.pos \
+  --stat rover.pos.stat \
+  --out-json rover.quality.json \
+  --quality-out-detail-json rover.quality-detail.json \
+  --quality-out-segments-jsonl rover.fixed-segments.jsonl
+```
+
+Use `--quality-include-all-segments`, `--quality-include-geometry-segments`, or
+`--quality-include-empty-bins` when a single JSON output should include those
+verbose sections. `--quality-trace-examples N` controls the number of bounded
+trace example lines stored per category.
 
 Large `.stat` files are parsed as a single streaming pass. Slip evidence is
 deduplicated and unique STAT epochs are aligned to solution epochs through an
@@ -668,12 +697,19 @@ Two quality JSON reports can be compared directly:
 PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
   --compare-json baseline.quality.json snr35.quality.json \
   --format markdown
+
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-compare \
+  baseline.quality.json el28.quality.json el28-snr35.quality.json \
+  --format markdown
 ```
 
-The comparison reports deltas for fixed coverage, long fixed coverage,
-residuals, rejection/slip cleanliness, and track plausibility. If filtering
-reduces noisy observations but worsens trajectory consistency, the report warns
-that this should not be treated as a quality improvement.
+The comparison reports deltas for raw fixed distance, fixed distance in
+segments >=1 km, fixed time in segments >=60 s, N80 continuity, longest fixed
+segment distance, usable supported/provisional fixed distance, trajectory
+suspect distance, residuals, rejection/slip cleanliness, and track
+plausibility. If filtering reduces noisy observations but worsens trajectory
+consistency, the report warns that this should not be treated as a quality
+improvement.
 
 Distance and time are both reported because they answer different questions.
 Time-based segment length is always relevant. Distance-based segment length is

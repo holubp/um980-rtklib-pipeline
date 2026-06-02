@@ -352,7 +352,7 @@ def test_auto_motion_profile_uses_high_speed_evidence(tmp_path: Path):
 def test_baseline_summary_uses_standalone_base_llh(tmp_path: Path):
     solution = _write_minimal_pos(tmp_path)
 
-    data = analyze_rtk_quality(solution_path=solution, base_llh=(50.0, 14.0, 250.0)).as_dict()
+    data = analyze_rtk_quality(solution_path=solution, base_llh=(50.0, 14.0, 250.0)).as_dict(include_empty_bins=True)
 
     assert data["baseline_summary"]["available"] is True
     assert data["baseline_summary"]["max_distance_km"] is not None
@@ -378,7 +378,7 @@ def test_baseline_bins_and_markdown_include_quality_evolution(tmp_path: Path):
     assert "fixed_pct_of_elapsed" in populated[0]
     assert "trace_low_ar_count" in populated[0]
     markdown = format_quality_markdown(analysis)
-    assert "## 9. Quality By Base-Rover Distance" in markdown
+    assert "## 12. Quality By Base-Rover Distance" in markdown
     assert "Empty baseline bins omitted" in markdown
 
 
@@ -397,7 +397,7 @@ def test_track_plausibility_exposes_bad_fixed_island(tmp_path: Path):
     assert data["track_plausibility"]["fixed_internal_jump_count"] >= 1
     assert data["track_plausibility"]["speed_mps_by_quality"]["fixed"]["max"] > 90.0
     markdown = format_quality_markdown(analyze_rtk_quality(solution_path=path))
-    assert "## 5. Track Plausibility" in markdown
+    assert "## 8. Track Plausibility" in markdown
 
 
 def test_quality_comparison_warns_when_cleaner_but_less_plausible() -> None:
@@ -422,6 +422,75 @@ def test_quality_comparison_warns_when_cleaner_but_less_plausible() -> None:
 
     assert comparison["warnings"]
     assert "reduced noisy observations" in comparison["warnings"][0]
+
+
+def test_fixed_continuity_summary_highlights_long_highway_segment(tmp_path: Path):
+    path = tmp_path / "highway-long.pos"
+    lines = []
+    # 36 m/s for 70 s, sampled once per second: this is useful highway continuity
+    # even if older strict diagnostic confidence stays unavailable.
+    for second in range(71):
+        lat = 50.0 + second * 0.0003235
+        lines.append(f"2026/05/30 05:{second // 60:02d}:{second % 60:02d}.000 {lat:.7f} 14.0000000 250.0 1 18\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+    analysis = analyze_rtk_quality(solution_path=path, thresholds=QualityThresholds(motion_profile="highway"))
+    data = analysis.as_dict()
+
+    continuity = data["fixed_continuity_summary"]
+    assert continuity["raw_fixed_time_s"] >= 70.0
+    assert continuity["fixed_time_ge_60s"] >= 70.0
+    assert continuity["fixed_distance_ge_1000m"] > 2.0
+    assert continuity["longest_fixed_segment_distance_m"] > 2000.0
+    assert "Usable long fixed coverage exists" in continuity["interpretation"]
+    assert data["usable_supported_fixed_time_s"] >= 70.0
+
+    markdown = format_quality_markdown(analysis)
+    assert "## 3. Usable Fixed Continuity" in markdown
+    assert "N80 means 80% of fixed time/distance lies in segments at least this long." in markdown
+    assert "Median segment duration is a fragmentation diagnostic only" in markdown
+    assert "## 4. Top Fixed Segments By Distance" in markdown
+    assert "## 5. Top Fixed Segments By Duration" in markdown
+
+
+def test_fragmented_run_warns_no_useful_long_fixed(tmp_path: Path):
+    path = tmp_path / "fragmented.pos"
+    lines = []
+    for second in range(0, 40, 4):
+        lines.append(f"2026/05/30 05:00:{second:02d}.000 50.{second:06d} 14.0000000 250.0 1 18\n")
+        lines.append(f"2026/05/30 05:00:{second + 1:02d}.000 50.{second + 1:06d} 14.0000000 250.0 1 18\n")
+        lines.append(f"2026/05/30 05:00:{second + 2:02d}.000 50.{second + 2:06d} 14.0000000 250.0 2 18\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+    analysis = analyze_rtk_quality(solution_path=path)
+    data = analysis.as_dict()
+
+    assert data["fixed_continuity_summary"]["fixed_time_ge_30s"] == 0.0
+    assert data["fixed_continuity_summary"]["fixed_distance_ge_500m"] == 0.0
+    assert "No useful long fixed intervals were found" in data["fixed_continuity_summary"]["interpretation"]
+    assert "No useful long fixed intervals were found" in format_quality_markdown(analysis)
+
+
+def test_default_quality_json_is_compact_and_detail_json_expands(tmp_path: Path):
+    path = _write_minimal_pos(tmp_path)
+    analysis = analyze_rtk_quality(solution_path=path)
+    compact = analysis.as_dict()
+    detail = analysis.as_dict(include_all_segments=True)
+
+    assert "segment_qc" not in compact["long_fixed_metrics"]
+    assert "segment_geometry_risk" not in compact["geometry_cost"]
+    assert "segment_qc" in detail["long_fixed_metrics"]
+    assert "segment_geometry_risk" in detail["geometry_cost"]
+
+
+def test_track_consistency_not_computed_uses_null_status(tmp_path: Path):
+    path = _write_minimal_pos(tmp_path)
+    data = analyze_rtk_quality(solution_path=path).as_dict()
+
+    status = data["track_plausibility"]["track_consistency_status"]
+    assert status["status"] in {"ok", "warning", "suspect", "not_computed"}
+    if status["status"] == "not_computed":
+        assert status["score"] is None
 
 
 def test_large_stat_slip_summary_uses_deduplicated_epoch_alignment(tmp_path: Path):

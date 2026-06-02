@@ -560,6 +560,7 @@ def run_rnx2rtkp(
     trace_file: Path | None = None,
     trace_cleanup: Literal["always", "on-success", "never"] = "always",
     trace_max_bytes: int = 0,
+    trace_max_example_lines: int = 20,
 ) -> RtklibCommand:
     """Validate, prepare, and optionally run `rnx2rtkp`.
 
@@ -710,7 +711,11 @@ def run_rnx2rtkp(
                 selected_trace = selected_trace.resolve()
                 trace_retained = True
             parsed_trace_path = selected_trace
-            trace_summary = analyze_rtklib_trace(parsed_trace_path, max_bytes=trace_max_bytes)
+            trace_summary = analyze_rtklib_trace(
+                parsed_trace_path,
+                max_bytes=trace_max_bytes,
+                max_example_lines=max(0, trace_max_example_lines),
+            )
             cleanup_attempted: list[Path] = []
             cleanup_deleted: list[Path] = []
             cleanup_failed: dict[str, str] = {}

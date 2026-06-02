@@ -116,6 +116,17 @@ class QualityAnalysis:
     rejections: dict[str, object]
     transition_jumps: dict[str, object]
     false_fix_suspicion: dict[str, object]
+    fixed_continuity_summary: dict[str, object] = field(default_factory=dict)
+    top_fixed_segments_by_distance: list[dict[str, object]] = field(default_factory=list)
+    top_fixed_segments_by_duration: list[dict[str, object]] = field(default_factory=list)
+    usable_supported_fixed_time_s: float = 0.0
+    usable_supported_fixed_distance_km: float = 0.0
+    usable_provisional_fixed_time_s: float = 0.0
+    usable_provisional_fixed_distance_km: float = 0.0
+    trajectory_suspect_fixed_time_s: float = 0.0
+    trajectory_suspect_fixed_distance_km: float = 0.0
+    strict_supported_fixed_time_s: float = 0.0
+    strict_supported_fixed_distance_km: float = 0.0
     track_plausibility: dict[str, object] = field(default_factory=dict)
     stop_diagnostics: dict[str, object] = field(default_factory=dict)
     long_fixed_metrics: dict[str, object] = field(default_factory=dict)
@@ -129,14 +140,47 @@ class QualityAnalysis:
     cleanup: dict[str, object] | None = None
     performance: dict[str, object] = field(default_factory=dict)
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(
+        self,
+        *,
+        include_all_segments: bool = False,
+        include_geometry_segments: bool = False,
+        include_empty_bins: bool = False,
+    ) -> dict[str, object]:
         """Return stable JSON-friendly analysis data."""
 
+        long_fixed = dict(self.long_fixed_metrics)
+        geometry_cost = dict(self.geometry_cost)
+        baseline_summary = dict(self.baseline_summary)
+        if not include_all_segments:
+            long_fixed.pop("segment_qc", None)
+        if not include_geometry_segments and not include_all_segments:
+            geometry_cost.pop("segment_geometry_risk", None)
+        if not include_empty_bins:
+            bins = baseline_summary.get("quality_by_baseline_bin")
+            if isinstance(bins, list):
+                baseline_summary["quality_by_baseline_bin"] = [
+                    item for item in bins if isinstance(item, dict) and item.get("populated")
+                ]
+            route_bins = [item for item in self.route_bins if item.get("populated")]
+        else:
+            route_bins = self.route_bins
         return {
             "inputs": self.inputs,
             "parser_coverage": self.parser_coverage,
             "time_summary": self.time_summary,
             "distance_summary": self.distance_summary,
+            "fixed_continuity_summary": self.fixed_continuity_summary,
+            "top_fixed_segments_by_distance": self.top_fixed_segments_by_distance,
+            "top_fixed_segments_by_duration": self.top_fixed_segments_by_duration,
+            "usable_supported_fixed_time_s": self.usable_supported_fixed_time_s,
+            "usable_supported_fixed_distance_km": self.usable_supported_fixed_distance_km,
+            "usable_provisional_fixed_time_s": self.usable_provisional_fixed_time_s,
+            "usable_provisional_fixed_distance_km": self.usable_provisional_fixed_distance_km,
+            "trajectory_suspect_fixed_time_s": self.trajectory_suspect_fixed_time_s,
+            "trajectory_suspect_fixed_distance_km": self.trajectory_suspect_fixed_distance_km,
+            "strict_supported_fixed_time_s": self.strict_supported_fixed_time_s,
+            "strict_supported_fixed_distance_km": self.strict_supported_fixed_distance_km,
             "segments": self.segments,
             "residuals": self.residuals,
             "slips": self.slips,
@@ -145,12 +189,12 @@ class QualityAnalysis:
             "false_fix_suspicion": self.false_fix_suspicion,
             "track_plausibility": self.track_plausibility,
             "stop_diagnostics": self.stop_diagnostics,
-            "long_fixed_metrics": self.long_fixed_metrics,
-            "geometry_cost": self.geometry_cost,
+            "long_fixed_metrics": long_fixed,
+            "geometry_cost": geometry_cost,
             "motion": self.motion,
             "dropout_reacquisition": self.dropout_reacquisition,
-            "baseline_summary": self.baseline_summary,
-            "route_bins": self.route_bins,
+            "baseline_summary": baseline_summary,
+            "route_bins": route_bins,
             "trace": self.trace or {"available": False},
             "cleanup": self.cleanup
             or {
@@ -349,6 +393,10 @@ def analyze_rtk_quality(
     track_plausibility = _track_plausibility_summary(epochs, segments, limits, base_position=base_position)
     stop_diagnostics = _stop_diagnostics(epochs, limits)
     long_fixed_metrics = _long_fixed_metrics(segments, track_plausibility)
+    top_fixed_by_distance = _top_fixed_segments(epochs, segments, base_position=base_position, order_by="distance")
+    top_fixed_by_duration = _top_fixed_segments(epochs, segments, base_position=base_position, order_by="duration")
+    fixed_continuity = _fixed_continuity_summary(segments, long_fixed_metrics, top_fixed_by_distance, top_fixed_by_duration)
+    usable_totals = _usable_fixed_totals(segments)
     geometry_cost = _geometry_cost_summary(epochs, segments, stat, aligned_trace, limits)
     baseline_summary = _baseline_summary(
         epochs,
@@ -421,6 +469,17 @@ def analyze_rtk_quality(
         parser_coverage=parser_coverage,
         time_summary=time_summary,
         distance_summary=distance_summary,
+        fixed_continuity_summary=fixed_continuity,
+        top_fixed_segments_by_distance=top_fixed_by_distance,
+        top_fixed_segments_by_duration=top_fixed_by_duration,
+        usable_supported_fixed_time_s=usable_totals["usable_supported_fixed_time_s"],
+        usable_supported_fixed_distance_km=usable_totals["usable_supported_fixed_distance_km"],
+        usable_provisional_fixed_time_s=usable_totals["usable_provisional_fixed_time_s"],
+        usable_provisional_fixed_distance_km=usable_totals["usable_provisional_fixed_distance_km"],
+        trajectory_suspect_fixed_time_s=usable_totals["trajectory_suspect_fixed_time_s"],
+        trajectory_suspect_fixed_distance_km=usable_totals["trajectory_suspect_fixed_distance_km"],
+        strict_supported_fixed_time_s=float(suspicion.get("qc_supported_fixed_time_s", 0.0) or 0.0),
+        strict_supported_fixed_distance_km=float(suspicion.get("qc_supported_fixed_distance_m", 0.0) or 0.0) / 1000.0,
         segments=_segment_summary(segments),
         residuals=residuals,
         slips=slips,
@@ -1004,6 +1063,7 @@ def _track_plausibility_summary(
                 curvature_by_quality.setdefault(epochs[index].quality, []).append(abs(change) / max(float(speeds[index]) * dt, 1e-6))
     consistency = _fixed_island_consistency(epochs, segments, route_km, baseline_km)
     score = _track_consistency_score(anomalies, consistency)
+    status = _track_consistency_status(score, anomalies, consistency)
     return {
         "horizontal_step_m_by_quality": {quality: _stats(values) for quality, values in steps_by_quality.items()},
         "speed_mps_by_quality": {quality: _stats(values) for quality, values in speeds_by_quality.items()},
@@ -1023,6 +1083,7 @@ def _track_plausibility_summary(
         "fixed_track_inconsistent_time_s": consistency["fixed_track_inconsistent_time_s"],
         "fixed_track_inconsistent_distance_m": consistency["fixed_track_inconsistent_distance_m"],
         "track_consistency_score": score,
+        "track_consistency_status": status,
     }
 
 
@@ -1134,13 +1195,29 @@ def _cross_track_offset_m(
     return math.hypot(px - closest_x, py - closest_y)
 
 
-def _track_consistency_score(anomalies: list[dict[str, object]], consistency: dict[str, object]) -> float:
+def _track_consistency_score(anomalies: list[dict[str, object]], consistency: dict[str, object]) -> float | None:
     inconsistent = float(consistency.get("fixed_track_inconsistent_time_s", 0.0) or 0.0)
     consistent = float(consistency.get("fixed_track_consistent_time_s", 0.0) or 0.0)
     total = consistent + inconsistent
+    if total <= 0.0 and not anomalies:
+        return None
     penalty = (inconsistent / total) if total else 0.0
     penalty += min(0.5, 0.05 * len(anomalies))
     return max(0.0, 1.0 - penalty)
+
+
+def _track_consistency_status(
+    score: float | None,
+    anomalies: list[dict[str, object]],
+    consistency: dict[str, object],
+) -> dict[str, object]:
+    if score is None:
+        return {"status": "not_computed", "score": None, "reason": "no local fixed-island anchors or motion anomalies"}
+    if anomalies or float(consistency.get("fixed_track_inconsistent_time_s", 0.0) or 0.0) > 0.0:
+        status = "suspect" if score < 0.5 else "warning"
+    else:
+        status = "ok"
+    return {"status": status, "score": score, "reason": "local trajectory plausibility evidence"}
 
 
 def _stop_diagnostics(epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> dict[str, object]:
@@ -1220,8 +1297,138 @@ def _long_fixed_metrics(segments: list[Segment], track: dict[str, object]) -> di
         "fixed_segment_duration_n80_s": _n_coverage_threshold(durations, 0.80),
         "fixed_segment_distance_n50_m": _n_coverage_threshold(distances, 0.50),
         "fixed_segment_distance_n80_m": _n_coverage_threshold(distances, 0.80),
-        "segment_qc": segment_qc[:50],
+        "segment_qc": segment_qc,
     }
+
+
+def _fixed_continuity_summary(
+    segments: list[Segment],
+    long_fixed: dict[str, object],
+    top_by_distance: list[dict[str, object]],
+    top_by_duration: list[dict[str, object]],
+) -> dict[str, object]:
+    fixed = [segment for segment in segments if segment.quality == "fixed"]
+    raw_time = sum(segment.duration_s for segment in fixed)
+    raw_distance_m = sum(segment.distance_m for segment in fixed)
+    time_thresholds = long_fixed.get("fixed_time_ge_thresholds_s", {})
+    distance_thresholds = long_fixed.get("fixed_distance_ge_thresholds_m", {})
+    fixed_ge_30 = float(time_thresholds.get("30", 0.0) if isinstance(time_thresholds, dict) else 0.0)
+    fixed_ge_60 = float(time_thresholds.get("60", 0.0) if isinstance(time_thresholds, dict) else 0.0)
+    fixed_ge_500m = float(distance_thresholds.get("500", 0.0) if isinstance(distance_thresholds, dict) else 0.0) / 1000.0
+    fixed_ge_1000m = float(distance_thresholds.get("1000", 0.0) if isinstance(distance_thresholds, dict) else 0.0) / 1000.0
+    if fixed_ge_30 <= 0.0 and fixed_ge_500m <= 0.0:
+        interpretation = "No useful long fixed intervals were found."
+    elif fixed_ge_60 > 0.0 or fixed_ge_1000m > 0.0:
+        interpretation = "Usable long fixed coverage exists; inspect top fixed segments and local diagnostics."
+    else:
+        interpretation = "Some fixed continuity exists, but it is mostly short or local; inspect segment tables before comparing configurations."
+    top5_duration = top_by_duration[:5]
+    top5_distance = top_by_distance[:5]
+    return {
+        "raw_fixed_time_s": raw_time,
+        "raw_fixed_distance_km": raw_distance_m / 1000.0,
+        "fixed_time_ge_10s": float(time_thresholds.get("10", 0.0) if isinstance(time_thresholds, dict) else 0.0),
+        "fixed_time_ge_30s": fixed_ge_30,
+        "fixed_time_ge_60s": fixed_ge_60,
+        "fixed_time_ge_120s": float(time_thresholds.get("120", 0.0) if isinstance(time_thresholds, dict) else 0.0),
+        "fixed_distance_ge_100m": float(distance_thresholds.get("100", 0.0) if isinstance(distance_thresholds, dict) else 0.0) / 1000.0,
+        "fixed_distance_ge_500m": fixed_ge_500m,
+        "fixed_distance_ge_1000m": fixed_ge_1000m,
+        "fixed_distance_ge_2000m": float(distance_thresholds.get("2000", 0.0) if isinstance(distance_thresholds, dict) else 0.0) / 1000.0,
+        "fixed_segment_duration_n50_s": long_fixed.get("fixed_segment_duration_n50_s"),
+        "fixed_segment_duration_n80_s": long_fixed.get("fixed_segment_duration_n80_s"),
+        "fixed_segment_distance_n50_m": long_fixed.get("fixed_segment_distance_n50_m"),
+        "fixed_segment_distance_n80_m": long_fixed.get("fixed_segment_distance_n80_m"),
+        "longest_fixed_segment_duration_s": max((segment.duration_s for segment in fixed), default=0.0),
+        "longest_fixed_segment_distance_m": max((segment.distance_m for segment in fixed), default=0.0),
+        "top5_fixed_segments_total_time_s": sum(float(item.get("duration_s", 0.0) or 0.0) for item in top5_duration),
+        "top5_fixed_segments_total_distance_km": sum(float(item.get("distance_km", 0.0) or 0.0) for item in top5_distance),
+        "interpretation": interpretation,
+    }
+
+
+def _top_fixed_segments(
+    epochs: list[SolutionEpoch],
+    segments: list[Segment],
+    *,
+    base_position: tuple[float, float, float] | None,
+    order_by: str,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    route_km = _route_distances_km(epochs)
+    baseline_km = _baseline_distances_km(epochs, base_position)
+    fixed = [segment for segment in segments if segment.quality == "fixed"]
+    key = (lambda item: item.distance_m) if order_by == "distance" else (lambda item: item.duration_s)
+    return [
+        _fixed_segment_record(index, segment, route_km, baseline_km)
+        for index, segment in enumerate(sorted(fixed, key=key, reverse=True)[:limit], start=1)
+    ]
+
+
+def _fixed_segment_record(
+    rank: int,
+    segment: Segment,
+    route_km: list[float],
+    baseline_km: list[float | None],
+) -> dict[str, object]:
+    klass, reasons = _classify_fixed_segment(segment)
+    return {
+        "rank": rank,
+        "start_time": segment.start_time.isoformat(),
+        "end_time": segment.end_time.isoformat(),
+        "duration_s": segment.duration_s,
+        "distance_km": segment.distance_m / 1000.0,
+        "route_start_km": route_km[segment.start_index] if segment.start_index < len(route_km) else None,
+        "route_end_km": route_km[segment.end_index] if segment.end_index < len(route_km) else None,
+        "baseline_start_km": baseline_km[segment.start_index] if segment.start_index < len(baseline_km) else None,
+        "baseline_end_km": baseline_km[segment.end_index] if segment.end_index < len(baseline_km) else None,
+        "median_speed_mps": segment.median_speed_mps,
+        "max_step_m": segment.max_step_m,
+        "usable_class": klass,
+        "qc_class": klass,
+        "main_local_reasons": reasons,
+    }
+
+
+def _classify_fixed_segment(segment: Segment) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    max_step = segment.max_step_m or 0.0
+    if max_step > 100.0:
+        return "trajectory_suspect", ["large_internal_step"]
+    if segment.duration_s >= 60.0 or segment.distance_m >= 1000.0:
+        reasons.append("long_fixed_continuity")
+        return "useful_supported", reasons
+    if segment.duration_s >= 30.0 or segment.distance_m >= 500.0:
+        reasons.append("moderate_fixed_continuity")
+        return "useful_provisional", reasons
+    if segment.duration_s < 10.0 and segment.distance_m < 100.0:
+        return "short_island", ["short_time_and_distance"]
+    return "useful_provisional", ["short_but_nontrivial_fixed_coverage"]
+
+
+def _usable_fixed_totals(segments: list[Segment]) -> dict[str, float]:
+    totals = {
+        "usable_supported_fixed_time_s": 0.0,
+        "usable_supported_fixed_distance_km": 0.0,
+        "usable_provisional_fixed_time_s": 0.0,
+        "usable_provisional_fixed_distance_km": 0.0,
+        "trajectory_suspect_fixed_time_s": 0.0,
+        "trajectory_suspect_fixed_distance_km": 0.0,
+    }
+    for segment in segments:
+        if segment.quality != "fixed":
+            continue
+        klass, _reasons = _classify_fixed_segment(segment)
+        if klass == "useful_supported":
+            totals["usable_supported_fixed_time_s"] += segment.duration_s
+            totals["usable_supported_fixed_distance_km"] += segment.distance_m / 1000.0
+        elif klass == "useful_provisional":
+            totals["usable_provisional_fixed_time_s"] += segment.duration_s
+            totals["usable_provisional_fixed_distance_km"] += segment.distance_m / 1000.0
+        elif klass == "trajectory_suspect":
+            totals["trajectory_suspect_fixed_time_s"] += segment.duration_s
+            totals["trajectory_suspect_fixed_distance_km"] += segment.distance_m / 1000.0
+    return totals
 
 
 def _n_coverage_threshold(values_desc: list[float], fraction: float) -> float | None:
@@ -1285,7 +1492,7 @@ def _geometry_cost_summary(
         "before_after_elevation_mask_counts": None,
         "before_after_snr_mask_counts": None,
         "observations_removed_by_snr_threshold": None,
-        "segment_geometry_risk": segment_risk[:50],
+        "segment_geometry_risk": segment_risk,
     }
 
 
@@ -1525,6 +1732,16 @@ def _quality_bins_for_ranges(
                 "max_speed_mps_by_quality": {},
                 "long_fixed_time_ge_60s": 0.0,
                 "long_fixed_distance_ge_1000m": 0.0,
+                "fixed_time_ge_30s": 0.0,
+                "fixed_time_ge_60s": 0.0,
+                "fixed_distance_ge_500m": 0.0,
+                "fixed_distance_ge_1000m": 0.0,
+                "longest_fixed_segment_s": None,
+                "longest_fixed_segment_km": None,
+                "fixed_segment_distance_n80_m": None,
+                "useful_supported_fixed_km": 0.0,
+                "useful_provisional_fixed_km": 0.0,
+                "trajectory_suspect_fixed_km": 0.0,
                 "track_consistency_score": None,
                 "trace_event_density_per_min": None,
                 "stat_rejection_density_per_min": None,
@@ -1620,6 +1837,7 @@ def _add_segment_bin_metrics(
     suspicion: dict[str, object],
 ) -> None:
     fixed_durations: dict[int, list[float]] = {index: [] for index in range(len(bins))}
+    fixed_distances: dict[int, list[float]] = {index: [] for index in range(len(bins))}
     for segment in segments:
         value = epoch_values_km[segment.start_index] if segment.start_index < len(epoch_values_km) else None
         if value is None:
@@ -1628,10 +1846,34 @@ def _add_segment_bin_metrics(
         if bin_index is None or segment.quality != "fixed":
             continue
         fixed_durations[bin_index].append(segment.duration_s)
+        fixed_distances[bin_index].append(segment.distance_m)
+        klass, _reasons = _classify_fixed_segment(segment)
+        if klass == "useful_supported":
+            bins[bin_index]["useful_supported_fixed_km"] = float(bins[bin_index].get("useful_supported_fixed_km", 0.0) or 0.0) + segment.distance_m / 1000.0
+        elif klass == "useful_provisional":
+            bins[bin_index]["useful_provisional_fixed_km"] = float(bins[bin_index].get("useful_provisional_fixed_km", 0.0) or 0.0) + segment.distance_m / 1000.0
+        elif klass == "trajectory_suspect":
+            bins[bin_index]["trajectory_suspect_fixed_km"] = float(bins[bin_index].get("trajectory_suspect_fixed_km", 0.0) or 0.0) + segment.distance_m / 1000.0
+        bins[bin_index]["longest_fixed_segment_s"] = (
+            segment.duration_s
+            if bins[bin_index]["longest_fixed_segment_s"] is None
+            else max(float(bins[bin_index]["longest_fixed_segment_s"]), segment.duration_s)
+        )
+        bins[bin_index]["longest_fixed_segment_km"] = (
+            segment.distance_m / 1000.0
+            if bins[bin_index]["longest_fixed_segment_km"] is None
+            else max(float(bins[bin_index]["longest_fixed_segment_km"]), segment.distance_m / 1000.0)
+        )
+        if segment.duration_s >= 30.0:
+            bins[bin_index]["fixed_time_ge_30s"] = float(bins[bin_index].get("fixed_time_ge_30s", 0.0) or 0.0) + segment.duration_s
         if segment.duration_s >= 60.0:
             bins[bin_index]["long_fixed_time_ge_60s"] = float(bins[bin_index].get("long_fixed_time_ge_60s", 0.0) or 0.0) + segment.duration_s
+            bins[bin_index]["fixed_time_ge_60s"] = float(bins[bin_index].get("fixed_time_ge_60s", 0.0) or 0.0) + segment.duration_s
+        if segment.distance_m >= 500.0:
+            bins[bin_index]["fixed_distance_ge_500m"] = float(bins[bin_index].get("fixed_distance_ge_500m", 0.0) or 0.0) + segment.distance_m / 1000.0
         if segment.distance_m >= 1000.0:
             bins[bin_index]["long_fixed_distance_ge_1000m"] = float(bins[bin_index].get("long_fixed_distance_ge_1000m", 0.0) or 0.0) + segment.distance_m / 1000.0
+            bins[bin_index]["fixed_distance_ge_1000m"] = float(bins[bin_index].get("fixed_distance_ge_1000m", 0.0) or 0.0) + segment.distance_m / 1000.0
     raw_fixed = float(suspicion.get("raw_fixed_time_s", 0.0) or 0.0)
     shares = {
         "qc_supported_fixed_time_s": float(suspicion.get("qc_supported_fixed_time_s", 0.0) or 0.0) / raw_fixed if raw_fixed else 0.0,
@@ -1647,6 +1889,7 @@ def _add_segment_bin_metrics(
         item["fixed_segment_median_s"] = _percentile(durations, 50)
         item["fixed_segment_p95_s"] = _percentile(durations, 95)
         item["fixed_segment_max_s"] = max(durations) if durations else None
+        item["fixed_segment_distance_n80_m"] = _n_coverage_threshold(sorted(fixed_distances[index], reverse=True), 0.80)
         for key, share in shares.items():
             item[key] = fixed_time * share
         inconsistent = float(item.get("qc_suspect_fixed_time_s", 0.0) or 0.0)
@@ -2129,10 +2372,41 @@ def _rejection_summary(stat: _StatAccumulator) -> dict[str, object]:
     return {"available": True, "count": stat.rejected_count, "top_satellites": _top_counts(stat.rejections_by_sat)}
 
 
-def write_quality_json(path: Path, analysis: QualityAnalysis) -> None:
+def write_quality_json(
+    path: Path,
+    analysis: QualityAnalysis,
+    *,
+    include_all_segments: bool = False,
+    include_geometry_segments: bool = False,
+    include_empty_bins: bool = False,
+) -> None:
     """Write RTK quality analysis JSON."""
 
-    path.write_text(json.dumps(analysis.as_dict(), indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            analysis.as_dict(
+                include_all_segments=include_all_segments,
+                include_geometry_segments=include_geometry_segments,
+                include_empty_bins=include_empty_bins,
+            ),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_quality_segments_jsonl(path: Path, analysis: QualityAnalysis) -> None:
+    """Write full fixed segment detail as JSON Lines."""
+
+    data = analysis.as_dict(include_all_segments=True)
+    segments = data.get("long_fixed_metrics", {}).get("segment_qc", {}) if isinstance(data.get("long_fixed_metrics"), dict) else []
+    lines = []
+    if isinstance(segments, list):
+        lines = [json.dumps(item, sort_keys=True, default=str) for item in segments if isinstance(item, dict)]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def compare_quality_reports(left: dict[str, object], right: dict[str, object]) -> dict[str, object]:
@@ -2181,8 +2455,15 @@ def format_quality_comparison_markdown(comparison: dict[str, object]) -> str:
     if isinstance(deltas, dict) and isinstance(left, dict) and isinstance(right, dict):
         for key in (
             "raw_fixed_time_s",
+            "raw_fixed_distance_km",
             "long_fixed_time_ge_60s",
             "long_fixed_distance_ge_1000m",
+            "fixed_segment_duration_n80_s",
+            "fixed_segment_distance_n80_m",
+            "longest_fixed_segment_distance_m",
+            "usable_supported_fixed_distance_km",
+            "usable_provisional_fixed_distance_km",
+            "trajectory_suspect_fixed_distance_km",
             "track_consistency_score",
             "fixed_internal_jump_count",
             "fixed_islands_with_large_offset_count",
@@ -2200,6 +2481,7 @@ def format_quality_comparison_markdown(comparison: dict[str, object]) -> str:
 
 def _comparison_metrics(report: dict[str, object]) -> dict[str, object]:
     suspicion = report.get("false_fix_suspicion", {})
+    continuity = report.get("fixed_continuity_summary", {})
     residuals = report.get("residuals", {})
     slips = report.get("slips", {})
     rejections = report.get("rejections", {})
@@ -2209,10 +2491,33 @@ def _comparison_metrics(report: dict[str, object]) -> dict[str, object]:
     fixed_distance_thresholds = long_fixed.get("fixed_distance_ge_thresholds_m", {}) if isinstance(long_fixed, dict) else {}
     carrier = residuals.get("carrier_abs_m", {}) if isinstance(residuals, dict) else {}
     return {
-        "raw_fixed_time_s": suspicion.get("raw_fixed_time_s") if isinstance(suspicion, dict) else None,
+        "raw_fixed_time_s": (
+            continuity.get("raw_fixed_time_s")
+            if isinstance(continuity, dict) and continuity.get("raw_fixed_time_s") is not None
+            else suspicion.get("raw_fixed_time_s")
+            if isinstance(suspicion, dict)
+            else None
+        ),
+        "raw_fixed_distance_km": continuity.get("raw_fixed_distance_km") if isinstance(continuity, dict) else None,
         "qc_supported_fixed_time_s": suspicion.get("qc_supported_fixed_time_s") if isinstance(suspicion, dict) else None,
-        "long_fixed_time_ge_60s": fixed_time_thresholds.get("60") if isinstance(fixed_time_thresholds, dict) else None,
-        "long_fixed_distance_ge_1000m": fixed_distance_thresholds.get("1000") if isinstance(fixed_distance_thresholds, dict) else None,
+        "long_fixed_time_ge_60s": (
+            continuity.get("fixed_time_ge_60s")
+            if isinstance(continuity, dict) and continuity.get("fixed_time_ge_60s") is not None
+            else fixed_time_thresholds.get("60")
+            if isinstance(fixed_time_thresholds, dict)
+            else None
+        ),
+        "long_fixed_distance_ge_1000m": (
+            continuity.get("fixed_distance_ge_1000m")
+            if isinstance(continuity, dict) and continuity.get("fixed_distance_ge_1000m") is not None
+            else (fixed_distance_thresholds.get("1000") / 1000.0 if isinstance(fixed_distance_thresholds, dict) and isinstance(fixed_distance_thresholds.get("1000"), int | float) else None)
+        ),
+        "fixed_segment_duration_n80_s": continuity.get("fixed_segment_duration_n80_s") if isinstance(continuity, dict) else None,
+        "fixed_segment_distance_n80_m": continuity.get("fixed_segment_distance_n80_m") if isinstance(continuity, dict) else None,
+        "longest_fixed_segment_distance_m": continuity.get("longest_fixed_segment_distance_m") if isinstance(continuity, dict) else None,
+        "usable_supported_fixed_distance_km": report.get("usable_supported_fixed_distance_km"),
+        "usable_provisional_fixed_distance_km": report.get("usable_provisional_fixed_distance_km"),
+        "trajectory_suspect_fixed_distance_km": report.get("trajectory_suspect_fixed_distance_km"),
         "track_consistency_score": track.get("track_consistency_score") if isinstance(track, dict) else None,
         "fixed_internal_jump_count": track.get("fixed_internal_jump_count") if isinstance(track, dict) else None,
         "fixed_islands_with_large_offset_count": track.get("fixed_islands_with_large_offset_count") if isinstance(track, dict) else None,
@@ -2229,6 +2534,7 @@ def format_quality_text(analysis: QualityAnalysis) -> str:
     time_summary = data["time_summary"]  # type: ignore[index]
     distance_summary = data["distance_summary"]  # type: ignore[index]
     suspicion = data["false_fix_suspicion"]  # type: ignore[index]
+    continuity = data.get("fixed_continuity_summary", {})
     quality_time = time_summary["quality_time_s"]  # type: ignore[index]
     quality_dist = distance_summary["quality_distance_m"]  # type: ignore[index]
     elapsed = float(time_summary["duration_s"])  # type: ignore[index]
@@ -2242,6 +2548,15 @@ def format_quality_text(analysis: QualityAnalysis) -> str:
             f"{meters / 1000.0:7.3f} km ({_pct(meters, total_dist):5.1f}%)"
         )
     lines.append(f"  missing: {float(time_summary['missing_time_s']):8.1f} s ({float(time_summary['missing_pct']):5.1f}%)")
+    lines.append("")
+    lines.append("Usable fixed continuity:")
+    if isinstance(continuity, dict):
+        lines.append(
+            f"  >=60 s: {float(continuity.get('fixed_time_ge_60s', 0.0) or 0.0):8.1f} s, "
+            f">=1 km: {float(continuity.get('fixed_distance_ge_1000m', 0.0) or 0.0):7.3f} km, "
+            f"N80: {continuity.get('fixed_segment_duration_n80_s')} s / {continuity.get('fixed_segment_distance_n80_m')} m"
+        )
+        lines.append(f"  {continuity.get('interpretation', '')}")
     lines.append("")
     lines.append("Fixed QC confidence:")
     lines.append(
@@ -2275,7 +2590,7 @@ def format_quality_markdown(
 ) -> str:
     """Return Markdown RTK quality report."""
 
-    data = analysis.as_dict()
+    data = analysis.as_dict(include_empty_bins=show_empty_baseline_bins)
     suspicion = data["false_fix_suspicion"]  # type: ignore[index]
     raw_fixed_time = float(suspicion.get("raw_fixed_time_s", 0.0)) if isinstance(suspicion, dict) else 0.0
     raw_fixed_distance = float(suspicion.get("raw_fixed_distance_m", 0.0)) if isinstance(suspicion, dict) else 0.0
@@ -2296,11 +2611,66 @@ def format_quality_markdown(
         format_quality_text(analysis),
         "```",
         "",
-        "## 3. Segment Summary",
+        "## 3. Usable Fixed Continuity",
         "",
-        "| Quality | Count | Median duration s | P95 duration s | Max duration s | Median distance m | P95 distance m | Max distance m |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    continuity = data.get("fixed_continuity_summary", {})
+    if isinstance(continuity, dict):
+        lines.extend(
+            [
+                str(continuity.get("interpretation", "")),
+                "",
+                "N80 means 80% of fixed time/distance lies in segments at least this long.",
+                "Median segment duration is a fragmentation diagnostic only; it is not a vehicle/highway quality headline.",
+                "",
+                "| Metric | Value |",
+                "| --- | ---: |",
+                f"| Raw fixed time / distance | {_fmt_any(continuity.get('raw_fixed_time_s'))} s / {_fmt_any(continuity.get('raw_fixed_distance_km'))} km |",
+                f"| Fixed time >=10/30/60/120 s | {_fmt_any(continuity.get('fixed_time_ge_10s'))} / {_fmt_any(continuity.get('fixed_time_ge_30s'))} / {_fmt_any(continuity.get('fixed_time_ge_60s'))} / {_fmt_any(continuity.get('fixed_time_ge_120s'))} |",
+                f"| Fixed distance >=100/500/1000/2000 m | {_fmt_any(continuity.get('fixed_distance_ge_100m'))} / {_fmt_any(continuity.get('fixed_distance_ge_500m'))} / {_fmt_any(continuity.get('fixed_distance_ge_1000m'))} / {_fmt_any(continuity.get('fixed_distance_ge_2000m'))} km |",
+                f"| Fixed duration N50 / N80 | {_fmt_any(continuity.get('fixed_segment_duration_n50_s'))} s / {_fmt_any(continuity.get('fixed_segment_duration_n80_s'))} s |",
+                f"| Fixed distance N50 / N80 | {_fmt_any(continuity.get('fixed_segment_distance_n50_m'))} m / {_fmt_any(continuity.get('fixed_segment_distance_n80_m'))} m |",
+                f"| Longest fixed segment | {_fmt_any(continuity.get('longest_fixed_segment_duration_s'))} s / {_fmt_any(continuity.get('longest_fixed_segment_distance_m'))} m |",
+                f"| Top-5 fixed segment total | {_fmt_any(continuity.get('top5_fixed_segments_total_time_s'))} s / {_fmt_any(continuity.get('top5_fixed_segments_total_distance_km'))} km |",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## 4. Top Fixed Segments By Distance",
+            "",
+            "| Rank | Start | End | Duration s | Distance km | Route km | Baseline km | Median speed m/s | Max step m | Class | Main local reasons |",
+            "| ---: | --- | --- | ---: | ---: | --- | --- | ---: | ---: | --- | --- |",
+        ]
+    )
+    for item in data.get("top_fixed_segments_by_distance", []):  # type: ignore[union-attr]
+        if isinstance(item, dict):
+            lines.append(_fixed_segment_markdown_row(item))
+    if not data.get("top_fixed_segments_by_distance"):
+        lines.append("| n/a | n/a | n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a |")
+    lines.extend(
+        [
+            "",
+            "## 5. Top Fixed Segments By Duration",
+            "",
+            "| Rank | Start | End | Duration s | Distance km | Route km | Baseline km | Median speed m/s | Max step m | Class | Main local reasons |",
+            "| ---: | --- | --- | ---: | ---: | --- | --- | ---: | ---: | --- | --- |",
+        ]
+    )
+    for item in data.get("top_fixed_segments_by_duration", []):  # type: ignore[union-attr]
+        if isinstance(item, dict):
+            lines.append(_fixed_segment_markdown_row(item))
+    if not data.get("top_fixed_segments_by_duration"):
+        lines.append("| n/a | n/a | n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a |")
+    lines.extend(
+        [
+            "",
+            "## 6. Segment Summary",
+            "",
+            "| Quality | Count | Median duration s | P95 duration s | Max duration s | Median distance m | P95 distance m | Max distance m |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
     for quality in ("fixed", "float", "dgps", "single", "invalid"):
         item = data["segments"][quality]  # type: ignore[index]
         lines.append(
@@ -2310,7 +2680,7 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 4. Fixed Confidence Classification",
+            "## 7. Fixed Confidence Classification",
             "",
             "Suspect fixed is heuristic evidence, not proof of a false fix.",
             "Raw fixed percentage and median segment duration are diagnostics, not quality headlines.",
@@ -2336,7 +2706,7 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 5. Track Plausibility",
+            "## 8. Track Plausibility",
             "",
             "| Metric | Value |",
             "| --- | ---: |",
@@ -2388,7 +2758,7 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 6. Residual Summary",
+            "## 9. Residual Summary",
             "",
             "| Scope | Carrier median m | Carrier p95 m | Carrier p99 m | Carrier max m | Code median m | Code p95 m | Code p99 m | Code max m |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -2411,7 +2781,7 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 7. Slip / Rejection Summary",
+            "## 10. Slip / Rejection Summary",
             "",
             "Raw slip flags and rejection totals are observation-cleanliness diagnostics; they are not position-correctness proof.",
             "",
@@ -2429,7 +2799,7 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 8. Motion And Baseline Context",
+            "## 11. Motion And Baseline Context",
             "",
             "| Metric | Value |",
             "| --- | ---: |",
@@ -2451,10 +2821,10 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 9. Quality By Base-Rover Distance",
+            "## 12. Quality By Base-Rover Distance",
             "",
-            "| Baseline km | Epochs | Track km | Fixed s / % | Float s / % | DGPS s / % | Missing s / % | Fixed km / % | Fixed segs | Median fixed seg s | Trace low AR / slips / outliers |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Baseline km | Epochs | Track km | Fixed s / % | Useful >=60s | Useful >=1km | Longest fixed s / km | Fixed segs | Trace low AR / slips / outliers |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     baseline_bins = baseline.get("quality_by_baseline_bin", []) if isinstance(baseline, dict) else []
@@ -2470,16 +2840,16 @@ def format_quality_markdown(
             lines.append("")
             lines.append("Empty baseline bins omitted; full bins are in JSON.")
     elif isinstance(baseline, dict) and baseline.get("available"):
-        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | n/a | n/a |")
+        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | 0 | n/a |")
     else:
-        lines.append("| unavailable | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | n/a | n/a |")
+        lines.append("| unavailable | 0 | 0 | n/a | n/a | n/a | n/a | 0 | n/a |")
     lines.extend(
         [
             "",
-            "## 10. Quality By Route Distance",
+            "## 13. Quality By Route Distance",
             "",
-            "| Route km | Epochs | Track km | Fixed s / % | Float s / % | DGPS s / % | Missing s / % | Fixed km / % | Fixed segs | Median fixed seg s | Trace low AR / slips / outliers |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Route km | Epochs | Track km | Fixed s / % | Useful >=60s | Useful >=1km | Longest fixed s / km | Fixed segs | Trace low AR / slips / outliers |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     route_bins = data.get("route_bins", [])
@@ -2489,11 +2859,11 @@ def format_quality_markdown(
                 continue
             lines.append(_quality_bin_markdown_row(item, label=f"{_fmt_any(item.get('start_km'))}-{_fmt_any(item.get('end_km'))}"))
     else:
-        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | n/a | n/a |")
+        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | 0 | n/a |")
     lines.extend(
         [
             "",
-            "## 11. RTKLIB Trace Diagnostics",
+            "## 14. RTKLIB Trace Diagnostics",
             "",
         ]
     )
@@ -2563,7 +2933,7 @@ def format_quality_markdown(
                 f"- `.stat` files deleted after successful analysis: {len(deleted) if isinstance(deleted, list) else 0}",
             ]
         )
-    lines.extend(["", "## 12. Top Warnings And Interpretation", ""])
+    lines.extend(["", "## 15. Top Warnings And Interpretation", ""])
     warnings = data.get("warnings", [])
     if warnings:
         lines.extend(f"- WARNING: {warning}" for warning in warnings)  # type: ignore[union-attr]
@@ -2572,7 +2942,7 @@ def format_quality_markdown(
     lines.extend(
         [
             "",
-            "## 13. Suggested Next Actions",
+            "## 16. Suggested Next Actions",
             "",
             "- Optimise on QC-supported fixed time and QC-supported fixed distance, not raw fixed percentage alone.",
             "- Inspect missing/no-output time before comparing configurations.",
@@ -2580,7 +2950,7 @@ def format_quality_markdown(
         ]
     )
     if include_raw_json:
-        lines.extend(["", "## 14. Raw JSON Appendix", "", "```json", json.dumps(data, indent=2, sort_keys=True, default=str), "```"])
+        lines.extend(["", "## 17. Raw JSON Appendix", "", "```json", json.dumps(data, indent=2, sort_keys=True, default=str), "```"])
     return "\n".join(lines) + "\n"
 
 
@@ -2591,14 +2961,24 @@ def _quality_stat_scope(value: object, quality: str) -> dict[str, object]:
     return item if isinstance(item, dict) else {}
 
 
+def _fixed_segment_markdown_row(item: dict[str, object]) -> str:
+    route = f"{_fmt_any(item.get('route_start_km'))}-{_fmt_any(item.get('route_end_km'))}"
+    baseline = f"{_fmt_any(item.get('baseline_start_km'))}-{_fmt_any(item.get('baseline_end_km'))}"
+    reasons = item.get("main_local_reasons", [])
+    reason_text = ", ".join(str(reason) for reason in reasons) if isinstance(reasons, list) else str(reasons)
+    return (
+        f"| {_fmt_any(item.get('rank'))} | {item.get('start_time')} | {item.get('end_time')} | "
+        f"{_fmt_any(item.get('duration_s'))} | {_fmt_any(item.get('distance_km'))} | "
+        f"{route} | {baseline} | {_fmt_any(item.get('median_speed_mps'))} | "
+        f"{_fmt_any(item.get('max_step_m'))} | {item.get('usable_class', item.get('qc_class'))} | {reason_text or 'n/a'} |"
+    )
+
+
 def _quality_bin_markdown_row(item: dict[str, object], *, label: str) -> str:
     elapsed = float(item.get("elapsed_time_s", 0.0) or 0.0)
     emitted = float(item.get("emitted_time_s", 0.0) or 0.0)
     missing = float(item.get("missing_time_s", 0.0) or 0.0)
     fixed = float(item.get("fixed_time_s", 0.0) or 0.0)
-    flt = float(item.get("float_time_s", 0.0) or 0.0)
-    dgps = float(item.get("dgps_time_s", 0.0) or 0.0)
-    fixed_km = float(item.get("fixed_distance_km", 0.0) or 0.0)
     track_km = float(item.get("track_distance_km", 0.0) or 0.0)
     trace = (
         f"{_fmt_any(item.get('trace_low_ar_count'))} / "
@@ -2608,11 +2988,9 @@ def _quality_bin_markdown_row(item: dict[str, object], *, label: str) -> str:
     return (
         f"| {label} | {_fmt_any(item.get('epoch_count'))} | {_fmt_any(track_km)} | "
         f"{_fmt_any(fixed)} / {_fmt_pct(fixed, elapsed)} | "
-        f"{_fmt_any(flt)} / {_fmt_pct(flt, emitted)} | "
-        f"{_fmt_any(dgps)} / {_fmt_pct(dgps, emitted)} | "
-        f"{_fmt_any(missing)} / {_fmt_pct(missing, elapsed)} | "
-        f"{_fmt_any(fixed_km)} / {_fmt_pct(fixed_km, track_km)} | "
-        f"{_fmt_any(item.get('fixed_segment_count'))} | {_fmt_any(item.get('fixed_segment_median_s'))} | {trace} |"
+        f"{_fmt_any(item.get('fixed_time_ge_60s'))} | {_fmt_any(item.get('fixed_distance_ge_1000m'))} | "
+        f"{_fmt_any(item.get('longest_fixed_segment_s'))} / {_fmt_any(item.get('longest_fixed_segment_km'))} | "
+        f"{_fmt_any(item.get('fixed_segment_count'))} | {trace} |"
     )
 
 
@@ -2805,7 +3183,7 @@ def _stats(values: list[float]) -> dict[str, float | None]:
 
 
 def _percentages(values: dict[str, float], denominator: float) -> dict[str, float]:
-    return {key: (100.0 * value / denominator) if denominator else 0.0 for key, value in values.items()}
+    return {key: min(100.0, max(0.0, 100.0 * value / denominator)) if denominator else 0.0 for key, value in values.items()}
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -2872,4 +3250,4 @@ def _any_int(values: list[str]) -> bool:
 
 
 def _pct(value: float, denominator: float) -> float:
-    return 100.0 * value / denominator if denominator else 0.0
+    return min(100.0, max(0.0, 100.0 * value / denominator)) if denominator else 0.0

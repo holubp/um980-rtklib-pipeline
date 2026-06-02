@@ -84,6 +84,7 @@ from .quality import (
     format_quality_text,
     write_analysis_json,
     write_quality_json,
+    write_quality_segments_jsonl,
 )
 from .rinex_nav import extract_rover_nav, rover_nav_files
 from .rinex_obs import observations_for_rinex, write_rinex_obs
@@ -458,6 +459,12 @@ def _add_quality_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quality-trace-align-tolerance-s", type=float, default=0.5)
     parser.add_argument("--quality-md-raw-json", action="store_true")
     parser.add_argument("--quality-md-show-empty-baseline-bins", action="store_true")
+    parser.add_argument("--quality-include-empty-bins", action="store_true", help="Include empty baseline/route bins in quality JSON.")
+    parser.add_argument("--quality-include-all-segments", action="store_true", help="Include verbose fixed-segment arrays in quality JSON.")
+    parser.add_argument("--quality-include-geometry-segments", action="store_true", help="Include verbose geometry segment diagnostics in quality JSON.")
+    parser.add_argument("--quality-out-detail-json", help="Write verbose quality JSON with all optional diagnostic arrays.")
+    parser.add_argument("--quality-out-segments-jsonl", help="Write fixed segment detail as JSON Lines.")
+    parser.add_argument("--quality-trace-examples", type=int, default=20, help="Maximum stored RTKLIB trace examples per category.")
     parser.add_argument("--quality-stat-max-lines", type=int, default=0, help="Maximum RTKLIB .stat lines to parse; 0 is unlimited.")
     parser.add_argument("--quality-stat-max-seconds", type=float, default=0.0, help="Maximum wall-clock seconds to spend parsing .stat; 0 is unlimited.")
     parser.add_argument("--quality-fast", action="store_true", help="Skip expensive STAT detail parsing while keeping raw solution summaries.")
@@ -579,6 +586,31 @@ def _format_quality_markdown_from_args(args: argparse.Namespace, analysis) -> st
         include_raw_json=bool(getattr(args, "quality_md_raw_json", False)),
         show_empty_baseline_bins=bool(getattr(args, "quality_md_show_empty_baseline_bins", False)),
     )
+
+
+def _write_quality_outputs(args: argparse.Namespace, analysis, json_path: Path | None = None) -> None:
+    """Write compact and optional detailed quality outputs requested by CLI args."""
+
+    if json_path is not None:
+        write_quality_json(
+            json_path,
+            analysis,
+            include_all_segments=bool(getattr(args, "quality_include_all_segments", False)),
+            include_geometry_segments=bool(getattr(args, "quality_include_geometry_segments", False)),
+            include_empty_bins=bool(getattr(args, "quality_include_empty_bins", False)),
+        )
+    detail_path = getattr(args, "quality_out_detail_json", None)
+    if detail_path:
+        write_quality_json(
+            Path(detail_path),
+            analysis,
+            include_all_segments=True,
+            include_geometry_segments=True,
+            include_empty_bins=True,
+        )
+    segments_path = getattr(args, "quality_out_segments_jsonl", None)
+    if segments_path:
+        write_quality_segments_jsonl(Path(segments_path), analysis)
 
 
 def _format_quality_comparison_text(comparison: dict[str, object]) -> str:
@@ -1916,6 +1948,7 @@ def _run_rtklib_with_optional_auto_qc(
             trace_file=Path(args.rtklib_trace_file) if getattr(args, "rtklib_trace_file", None) else None,
             trace_cleanup=getattr(args, "rtklib_trace_cleanup", "always"),
             trace_max_bytes=max(0, int(getattr(args, "quality_trace_max_bytes", 0) or 0)),
+            trace_max_example_lines=max(0, int(getattr(args, "quality_trace_examples", 20) or 20)),
         )
     if trace_mode != "off":
         raise ValueError("--quality-trace temporary/keep is not supported with --auto-sat-qc")
@@ -2173,7 +2206,7 @@ def _run_quality_analysis_if_requested(
     _log_quality_performance(analysis)
     with _time_phase(args, "quality_report_write"):
         md_path.write_text(_format_quality_markdown_from_args(args, analysis), encoding="utf-8")
-        write_quality_json(json_path, analysis)
+        _write_quality_outputs(args, analysis, json_path)
     deleted_stats: list[str] = []
     if getattr(args, "quality_clean_stat", False) and stat is not None:
         stat.unlink()
@@ -2189,7 +2222,7 @@ def _run_quality_analysis_if_requested(
         )
         with _time_phase(args, "quality_report_write_after_cleanup"):
             md_path.write_text(_format_quality_markdown_from_args(args, analysis), encoding="utf-8")
-            write_quality_json(json_path, analysis)
+            _write_quality_outputs(args, analysis, json_path)
     logging.info("wrote RTK quality analysis: markdown=%s json=%s", md_path, json_path)
 
 
@@ -2209,6 +2242,7 @@ def _trace_summary_for_quality(args: argparse.Namespace, commands: list) -> dict
         summary = analyze_rtklib_trace(
             trace_path,
             max_bytes=max(0, int(getattr(args, "quality_trace_max_bytes", 0) or 0)),
+            max_example_lines=max(0, int(getattr(args, "quality_trace_examples", 20) or 20)),
         )
         summary.update(
             {
@@ -3047,19 +3081,62 @@ def cmd_quality_analyze(args: argparse.Namespace) -> int:
     )
     _log_quality_performance(analysis)
     if args.out_json:
-        write_quality_json(Path(args.out_json), analysis)
+        _write_quality_outputs(args, analysis, Path(args.out_json))
         logging.info("wrote quality JSON: %s", args.out_json)
+    else:
+        _write_quality_outputs(args, analysis, None)
     if args.out_md:
         Path(args.out_md).write_text(_format_quality_markdown_from_args(args, analysis), encoding="utf-8")
         logging.info("wrote quality Markdown: %s", args.out_md)
     rendered = (
-        json.dumps(analysis.as_dict(), indent=2, sort_keys=True, default=str)
+        json.dumps(
+            analysis.as_dict(
+                include_all_segments=bool(getattr(args, "quality_include_all_segments", False)),
+                include_geometry_segments=bool(getattr(args, "quality_include_geometry_segments", False)),
+                include_empty_bins=bool(getattr(args, "quality_include_empty_bins", False)),
+            ),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
         if args.format == "json"
         else _format_quality_markdown_from_args(args, analysis)
         if args.format == "markdown"
         else format_quality_text(analysis)
     )
     if not args.out_json or not args.out_md or args.format != "text":
+        print(rendered)
+    return 0
+
+
+def cmd_quality_compare(args: argparse.Namespace) -> int:
+    """Handle comparison of existing quality JSON reports."""
+
+    _configure_cli_logging(args)
+    if len(args.reports) < 2:
+        raise ValueError("quality-compare requires at least two quality JSON reports")
+    baseline = json.loads(Path(args.reports[0]).read_text(encoding="utf-8"))
+    comparisons = []
+    for report in args.reports[1:]:
+        comparison = compare_quality_reports(baseline, json.loads(Path(report).read_text(encoding="utf-8")))
+        comparisons.append({"report": str(report), "comparison": comparison})
+    result = {"baseline": str(args.reports[0]), "comparisons": comparisons}
+    if args.format == "json":
+        rendered = json.dumps(result, indent=2, sort_keys=True, default=str)
+    elif args.format == "markdown":
+        lines = ["# RTK Quality Comparison", ""]
+        for item in comparisons:
+            lines.extend([f"## {item['report']}", "", format_quality_comparison_markdown(item["comparison"]).strip(), ""])
+        rendered = "\n".join(lines)
+    else:
+        lines = [f"Baseline: {args.reports[0]}"]
+        for item in comparisons:
+            lines.append(f"Compared: {item['report']}")
+            lines.append(_format_quality_comparison_text(item["comparison"]))
+        rendered = "\n".join(lines)
+    if args.out:
+        Path(args.out).write_text(rendered + "\n", encoding="utf-8")
+    else:
         print(rendered)
     return 0
 
@@ -3820,6 +3897,13 @@ def build_parser() -> argparse.ArgumentParser:
         _add_base_position_args(quality)
         _add_common(quality)
         quality.set_defaults(func=cmd_quality_analyze, _quality_alias=quality_name)
+
+    quality_compare = sub.add_parser("quality-compare")
+    quality_compare.add_argument("reports", nargs="+", help="Quality JSON reports; first report is the baseline.")
+    quality_compare.add_argument("--format", choices=["text", "markdown", "json"], default="text")
+    quality_compare.add_argument("--out", help="Optional comparison output path.")
+    _add_common(quality_compare)
+    quality_compare.set_defaults(func=cmd_quality_compare)
 
     opt = sub.add_parser("optimize-settings")
     opt.add_argument("rover_log", nargs="+")
