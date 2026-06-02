@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,6 +155,50 @@ def test_quality_alias_writes_outputs(tmp_path: Path) -> None:
     assert rc == 0
     assert out_json.exists()
     assert out_md.exists()
+
+
+def test_quality_analyze_alias_warns_deprecated(tmp_path: Path, capsys) -> None:
+    solution = tmp_path / "run.pos"
+    out_json = tmp_path / "quality.json"
+    solution.write_text("2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n", encoding="ascii")
+
+    rc = cli.main(["quality-analyze", "--solution", str(solution), "--out-json", str(out_json), "--base-llh", "50", "14", "250"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "quality-analyze' is deprecated" in captured.err
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert data["baseline_summary"]["available"] is True
+
+
+def test_quality_rerun_command_includes_trace_and_base_options(tmp_path: Path) -> None:
+    solution = tmp_path / "run.pos"
+    trace = Path(str(solution) + ".trace")
+    json_path = tmp_path / "quality.json"
+    md_path = tmp_path / "quality.md"
+    solution.write_text("2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n", encoding="ascii")
+    trace.write_text("resamb: ratio=3.2\n", encoding="ascii")
+    args = SimpleNamespace(
+        trace=None,
+        quality_trace_max_bytes=1000,
+        quality_trace_align_tolerance_s=0.25,
+        base_llh=[50.0, 14.0, 250.0],
+        base_ecef=None,
+        quality_stat_max_lines=0,
+        quality_stat_max_seconds=0.0,
+        quality_motion_profile="auto",
+        quality_route_bin_km=10.0,
+        quality_fast=False,
+    )
+
+    command = cli._quality_rerun_command(args, solution, None, json_path, md_path)
+
+    assert command[0] == "PYTHONPATH=src"
+    assert "--trace" in command
+    assert str(trace) in command
+    assert "--quality-trace-max-bytes" in command
+    assert "--quality-trace-align-tolerance-s" in command
+    assert "--base-llh" in command
 
 
 def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:

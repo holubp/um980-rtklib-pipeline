@@ -249,6 +249,84 @@ def test_incomplete_diagnostics_limit_qc_confidence_without_forcing_suspect(tmp_
     assert any("not aligned" in warning for warning in data["warnings"])
 
 
+def test_trace_events_align_to_solution_epochs_and_quality_states(tmp_path: Path):
+    solution = tmp_path / "trace-align.pos"
+    solution.write_text(
+        "2026/05/30 05:02:10.000 50.000000 14.000000 250.0 1 18\n"
+        "2026/05/30 05:02:11.000 50.000010 14.000000 250.0 1 18\n"
+        "2026/05/30 05:02:12.000 50.000020 14.000000 250.0 2 18\n",
+        encoding="ascii",
+    )
+    trace_summary = {
+        "available": True,
+        "events": {
+            "event_time_aggregates": [
+                {
+                    "time": "2026-05-30T05:02:10+00:00",
+                    "counts": {"ar_ratio": 1, "cycle_slip": 1},
+                    "ar_ratio_min": 2.4,
+                    "ar_threshold": 3.0,
+                },
+                {
+                    "time": "2026-05-30T05:02:12+00:00",
+                    "counts": {"observation_rejection": 3},
+                },
+            ]
+        },
+    }
+
+    data = analyze_rtk_quality(solution_path=solution, trace_summary=trace_summary).as_dict()
+    alignment = data["trace"]["alignment"]
+
+    assert alignment["trace_events_aligned"] == 5
+    assert alignment["trace_events_unaligned"] == 0
+    assert alignment["event_counts_by_quality"]["fixed"]["ar_ratio"] == 1
+    assert alignment["event_counts_by_quality"]["fixed"]["cycle_slip"] == 1
+    assert alignment["event_counts_by_quality"]["float"]["observation_rejection"] == 3
+    assert data["false_fix_suspicion"]["reasons"]["trace_low_ar_ratio"] > 0.0
+    assert data["false_fix_suspicion"]["evidence_sources"]["trace_low_ar_ratio"] == ["trace"]
+
+
+def test_global_unaligned_trace_does_not_mark_fixed_suspect(tmp_path: Path):
+    solution = _write_minimal_pos(tmp_path)
+    trace_summary = {
+        "available": True,
+        "counters": {"cycle_slip_lines": 1000, "residual_outlier_lines": 1000},
+        "events": {"event_time_aggregates": []},
+    }
+
+    data = analyze_rtk_quality(solution_path=solution, trace_summary=trace_summary).as_dict()
+
+    assert data["trace"]["alignment"]["trace_events_aligned"] == 0
+    assert data["false_fix_suspicion"]["reasons"]["trace_recent_slip"] == 0.0
+    assert data["false_fix_suspicion"]["reasons"]["trace_residual_outlier"] == 0.0
+
+
+def test_auto_motion_profile_uses_high_speed_evidence(tmp_path: Path):
+    path = tmp_path / "vehicle.pos"
+    lines = []
+    for index in range(30):
+        lat_step = 0.00027 if index < 20 else 0.00002
+        lat = 50.0 + index * lat_step
+        lines.append(f"2026/05/30 05:00:{index:02d}.000 {lat:.7f} 14.0000000 250.0 1 18\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=path).as_dict()
+
+    assert data["motion"]["inferred_profile"] in {"vehicle", "highway"}
+    assert data["motion"]["max_speed_threshold_mps"] >= 45.0
+
+
+def test_baseline_summary_uses_standalone_base_llh(tmp_path: Path):
+    solution = _write_minimal_pos(tmp_path)
+
+    data = analyze_rtk_quality(solution_path=solution, base_llh=(50.0, 14.0, 250.0)).as_dict()
+
+    assert data["baseline_summary"]["available"] is True
+    assert data["baseline_summary"]["max_distance_km"] is not None
+    assert data["baseline_summary"]["quality_by_baseline_bin"]
+
+
 def test_large_stat_slip_summary_uses_deduplicated_epoch_alignment(tmp_path: Path):
     base = gps_week_tow_to_utc_datetime(2419, 450000.0)
     solution = tmp_path / "large.pos"

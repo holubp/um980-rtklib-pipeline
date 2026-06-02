@@ -99,6 +99,7 @@ class QualityThresholds:
     transition_window_s: float = 2.0
     route_bin_km: float | None = 10.0
     baseline_bins: list[float] = field(default_factory=lambda: [0, 10, 20, 30, 40, 50, 75, 100, 150])
+    trace_align_tolerance_s: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -289,6 +290,8 @@ def analyze_rtk_quality(
     stat_max_lines: int = 0,
     stat_max_seconds: float = 0.0,
     fast: bool = False,
+    base_ecef_xyz_m: tuple[float, float, float] | None = None,
+    base_llh: tuple[float, float, float] | None = None,
 ) -> QualityAnalysis:
     """Analyse RTKLIB solution quality from `.nmea`/`.pos` and optional `.stat`.
 
@@ -329,13 +332,20 @@ def analyze_rtk_quality(
     motion = _motion_summary(epochs, limits)
     transitions = _transition_summary(epochs, segments, limits, motion)
     dropout = _dropout_reacquisition_summary(epochs, segments, limits)
-    suspicion = _false_fix_suspicion(segments, epochs, stat, transitions, residuals, slips, limits)
-    baseline_summary = _baseline_summary(epochs, limits)
+    aligned_trace = _align_trace_summary(trace_summary, epoch_index, limits.trace_align_tolerance_s)
+    suspicion = _false_fix_suspicion(segments, epochs, stat, transitions, residuals, slips, aligned_trace, limits)
+    baseline_summary = _baseline_summary(epochs, limits, base_ecef_xyz_m=base_ecef_xyz_m, base_llh=base_llh)
     route_bins = _route_bins(epochs, limits)
     if residuals.get("available") and residuals.get("quality_aligned") is False:
         warnings.append("STAT residuals parsed globally but not aligned to solution quality states; residuals not used for hard fixed-epoch suspicion.")
     if slips.get("available") and slips.get("epochs_with_slip_pct") is None:
         warnings.append("STAT slip flags are not sufficiently time-aligned/deduplicated; raw slip counts are not used for hard fixed-epoch suspicion.")
+    if motion.get("warning"):
+        warnings.append(str(motion["warning"]))
+    if aligned_trace and aligned_trace.get("available") and aligned_trace.get("alignment"):
+        alignment = aligned_trace.get("alignment", {})
+        if isinstance(alignment, dict) and float(alignment.get("trace_alignment_pct", 0.0) or 0.0) < 20.0:
+            warnings.append("Trace events were parsed but alignment coverage is low; global trace counters are not used for hard fixed-epoch suspicion.")
     warnings.extend(_top_warnings(time_summary, suspicion, transitions, residuals, slips))
     parser_coverage = {
         "solution_epochs": len(epochs),
@@ -365,6 +375,8 @@ def analyze_rtk_quality(
             "stat_max_lines": stat_max_lines,
             "stat_max_seconds": stat_max_seconds,
             "quality_fast": fast,
+            "base_ecef_xyz_m": base_ecef_xyz_m,
+            "base_llh": base_llh,
         },
         parser_coverage=parser_coverage,
         time_summary=time_summary,
@@ -380,7 +392,7 @@ def analyze_rtk_quality(
         baseline_summary=baseline_summary,
         route_bins=route_bins,
         warnings=list(dict.fromkeys(warnings)),
-        trace=trace_summary,
+        trace=aligned_trace,
         cleanup=cleanup,
         performance=performance,
     )
@@ -766,10 +778,20 @@ def _motion_summary(epochs: list[SolutionEpoch], thresholds: QualityThresholds) 
         if dt <= 0:
             continue
         speeds.append(_haversine_m(left.lat, left.lon, right.lat, right.lon) / dt)
+    p90 = _percentile(speeds, 90) or 0.0
     p95 = _percentile(speeds, 95) or 0.0
+    p99 = _percentile(speeds, 99) or 0.0
+    max_observed = max(speeds) if speeds else None
+    high_speed_count = sum(1 for speed in speeds if speed > 30.0)
     requested = thresholds.motion_profile
     if requested == "auto":
-        if p95 <= 1.0:
+        if max_observed is not None and max_observed > 45.0 and (p90 > 10.0 or high_speed_count >= 3):
+            profile = "highway"
+        elif p99 > 45.0:
+            profile = "highway"
+        elif p95 > 15.0 or (max_observed is not None and max_observed > 45.0):
+            profile = "vehicle"
+        elif p95 <= 1.0:
             profile = "static"
         elif p95 <= 3.0:
             profile = "walking"
@@ -787,10 +809,18 @@ def _motion_summary(epochs: list[SolutionEpoch], thresholds: QualityThresholds) 
         "requested_profile": requested,
         "inferred_profile": profile,
         "median_speed_mps": _percentile(speeds, 50),
+        "p90_speed_mps": p90,
         "p95_speed_mps": _percentile(speeds, 95),
-        "max_speed_mps": max(speeds) if speeds else None,
+        "p99_speed_mps": p99,
+        "max_speed_mps": max_observed,
+        "high_speed_samples_gt_30_mps": high_speed_count,
         "max_speed_threshold_mps": max_speed,
         "max_accel_threshold_mps2": thresholds.max_accel_mps2,
+        "warning": (
+            f"observed max speed {max_observed:.1f} m/s exceeds inferred profile threshold {max_speed:.1f} m/s"
+            if max_observed is not None and max_observed > max_speed * 1.25
+            else None
+        ),
     }
 
 
@@ -814,13 +844,166 @@ def _dropout_reacquisition_summary(
     }
 
 
-def _baseline_summary(_epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> dict[str, object]:
-    return {
-        "available": False,
-        "reason": "base coordinates not supplied to quality analyzer",
-        "bins_km": thresholds.baseline_bins,
-        "interpretation": "Baseline distance is reported for context when available and is not used by itself to mark fixed epochs suspect.",
+def _align_trace_summary(
+    trace_summary: dict[str, object] | None,
+    epoch_index: EpochIndex,
+    tolerance_s: float,
+) -> dict[str, object] | None:
+    """Return trace summary enriched with solution-epoch alignment data."""
+
+    if not trace_summary or not trace_summary.get("available"):
+        return trace_summary
+    enriched = dict(trace_summary)
+    events = trace_summary.get("events")
+    if not isinstance(events, dict):
+        enriched["alignment"] = {
+            "available": False,
+            "reason": "trace event aggregates unavailable",
+            "trace_events_aligned": 0,
+            "trace_events_unaligned": 0,
+            "trace_alignment_pct": None,
+        }
+        return enriched
+    aggregates = events.get("event_time_aggregates", [])
+    if not isinstance(aggregates, list):
+        aggregates = []
+    aligned_events = 0
+    unaligned_events = 0
+    counts_by_quality = {quality: {} for quality in QUALITY_ORDER}
+    per_epoch: dict[int, dict[str, object]] = {}
+    cache: dict[str, int | None] = {}
+    for item in aggregates:
+        if not isinstance(item, dict):
+            continue
+        time_text = item.get("time")
+        counts = item.get("counts", {})
+        if not isinstance(time_text, str) or not isinstance(counts, dict):
+            continue
+        event_total = sum(int(value) for value in counts.values() if isinstance(value, int | float))
+        if event_total <= 0:
+            continue
+        if time_text not in cache:
+            try:
+                when = datetime.fromisoformat(time_text)
+            except ValueError:
+                cache[time_text] = None
+            else:
+                cache[time_text] = epoch_index.nearest_index(when, max_dt_s=tolerance_s)
+        nearest_index = cache[time_text]
+        if nearest_index is None:
+            unaligned_events += event_total
+            continue
+        aligned_events += event_total
+        epoch = epoch_index.epochs[nearest_index]
+        quality_counts = counts_by_quality.setdefault(epoch.quality, {})
+        epoch_bucket = per_epoch.setdefault(
+            nearest_index,
+            {
+                "epoch_index": nearest_index,
+                "time": epoch.time.isoformat(),
+                "quality": epoch.quality,
+                "counts": {},
+                "trace_ar_ratio": None,
+                "trace_ar_threshold": None,
+                "trace_base_rover_dt": None,
+            },
+        )
+        epoch_counts = epoch_bucket["counts"]
+        for event_type, count in counts.items():
+            if not isinstance(count, int | float):
+                continue
+            quality_counts[event_type] = int(quality_counts.get(event_type, 0)) + int(count)
+            if isinstance(epoch_counts, dict):
+                epoch_counts[event_type] = int(epoch_counts.get(event_type, 0)) + int(count)
+        if item.get("ar_ratio_min") is not None:
+            current = epoch_bucket.get("trace_ar_ratio")
+            value = float(item["ar_ratio_min"])
+            epoch_bucket["trace_ar_ratio"] = value if current is None else min(float(current), value)
+        if item.get("ar_threshold") is not None:
+            epoch_bucket["trace_ar_threshold"] = item.get("ar_threshold")
+        if item.get("base_rover_dt_s") is not None:
+            epoch_bucket["trace_base_rover_dt"] = item.get("base_rover_dt_s")
+    total = aligned_events + unaligned_events
+    enriched["alignment"] = {
+        "available": bool(aggregates),
+        "tolerance_s": tolerance_s,
+        "trace_events_aligned": aligned_events,
+        "trace_events_unaligned": unaligned_events,
+        "trace_alignment_pct": (100.0 * aligned_events / total) if total else None,
+        "event_counts_by_quality": counts_by_quality,
+        "per_epoch": list(per_epoch.values()),
+        "unique_trace_times_mapped": len(cache),
     }
+    return enriched
+
+
+def _baseline_summary(
+    epochs: list[SolutionEpoch],
+    thresholds: QualityThresholds,
+    *,
+    base_ecef_xyz_m: tuple[float, float, float] | None,
+    base_llh: tuple[float, float, float] | None,
+) -> dict[str, object]:
+    base_position = base_llh or (_ecef_to_llh(*base_ecef_xyz_m) if base_ecef_xyz_m else None)
+    if base_position is None:
+        return {
+            "available": False,
+            "reason": "base coordinates not supplied to quality analyzer",
+            "bins_km": thresholds.baseline_bins,
+            "interpretation": "Baseline distance is reported for context when available and is not used by itself to mark fixed epochs suspect.",
+        }
+    base_lat, base_lon, base_height = base_position
+    distances: list[float] = []
+    for epoch in epochs:
+        if epoch.lat is None or epoch.lon is None:
+            continue
+        distances.append(_haversine_m(base_lat, base_lon, epoch.lat, epoch.lon) / 1000.0)
+    bins = _baseline_quality_bins(epochs, base_lat, base_lon, thresholds.baseline_bins)
+    return {
+        "available": bool(distances),
+        "base_llh": {"lat": base_lat, "lon": base_lon, "height_m": base_height},
+        "start_distance_km": distances[0] if distances else None,
+        "median_distance_km": _percentile(distances, 50),
+        "end_distance_km": distances[-1] if distances else None,
+        "min_distance_km": min(distances) if distances else None,
+        "max_distance_km": max(distances) if distances else None,
+        "bins_km": thresholds.baseline_bins,
+        "quality_by_baseline_bin": bins,
+        "interpretation": "Baseline distance is context for expected ambiguity-resolution difficulty and is not used by itself to mark fixed epochs suspect.",
+    }
+
+
+def _baseline_quality_bins(
+    epochs: list[SolutionEpoch],
+    base_lat: float,
+    base_lon: float,
+    bins_km: list[float],
+) -> list[dict[str, object]]:
+    if len(bins_km) < 2:
+        return []
+    result: list[dict[str, object]] = []
+    for start, end in zip(bins_km, bins_km[1:], strict=False):
+        result.append(
+            {
+                "start_km": start,
+                "end_km": end,
+                "quality_time_s": {quality: 0.0 for quality in QUALITY_ORDER},
+                "epoch_count": 0,
+            }
+        )
+    for left, right in zip(epochs, epochs[1:], strict=False):
+        if left.lat is None or left.lon is None:
+            continue
+        distance_km = _haversine_m(base_lat, base_lon, left.lat, left.lon) / 1000.0
+        dt = max(0.0, (right.time - left.time).total_seconds())
+        for item in result:
+            if float(item["start_km"]) <= distance_km < float(item["end_km"]):
+                quality_time = item["quality_time_s"]
+                if isinstance(quality_time, dict):
+                    quality_time[left.quality] = float(quality_time.get(left.quality, 0.0)) + dt
+                item["epoch_count"] = int(item.get("epoch_count", 0)) + 1
+                break
+    return result
 
 
 def _route_bins(epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> list[dict[str, object]]:
@@ -860,6 +1043,7 @@ def _false_fix_suspicion(
     transitions: dict[str, object],
     residuals: dict[str, object],
     slips: dict[str, object],
+    trace_summary: dict[str, object] | None,
     thresholds: QualityThresholds,
 ) -> dict[str, object]:
     trusted_time = provisional_time = suspect_time = 0.0
@@ -872,7 +1056,33 @@ def _false_fix_suspicion(
         "high_residual": 0.0,
         "transition_jump": 0.0,
         "incomplete_diagnostics": 0.0,
+        "trace_low_ar_ratio": 0.0,
+        "trace_recent_slip": 0.0,
+        "trace_residual_outlier": 0.0,
+        "trace_rejection_burst": 0.0,
+        "trace_base_rover_dt": 0.0,
+        "trace_warning_or_error": 0.0,
     }
+    evidence_sources = {
+        "short_time_segment": ["solution"],
+        "short_distance_while_moving": ["solution"],
+        "recent_slip": ["stat"],
+        "high_residual": ["stat"],
+        "transition_jump": ["solution"],
+        "incomplete_diagnostics": ["stat"],
+        "trace_low_ar_ratio": ["trace"],
+        "trace_recent_slip": ["trace"],
+        "trace_residual_outlier": ["trace"],
+        "trace_rejection_burst": ["trace"],
+        "trace_base_rover_dt": ["trace"],
+        "trace_warning_or_error": ["trace"],
+    }
+    trace_by_epoch = _trace_alignment_by_epoch(trace_summary)
+    stat_slip_times_s = (
+        sorted({_timestamp_s(time) for time, _, _, _ in stat.slip_events})
+        if stat and slips.get("epochs_with_slip_pct") is not None
+        else []
+    )
     fixed_entry_warning_indexes = {
         item["segment_start_index"]
         for item in transitions.get("fixed_entry_jumps", [])  # type: ignore[union-attr]
@@ -893,19 +1103,25 @@ def _false_fix_suspicion(
             and (segment.median_speed_mps or 0.0) >= thresholds.stationary_speed_threshold_mps
         ):
             flags.append("short_distance_while_moving")
-        if stat and slips_hard and _has_recent_slip(stat, segment, thresholds.recent_slip_window_s):
+        if stat_slip_times_s and slips_hard and _has_recent_slip(stat_slip_times_s, segment, thresholds.recent_slip_window_s):
             flags.append("recent_slip")
         if residuals_hard and _segment_high_residual(stat, segment, thresholds):
             flags.append("high_residual")
         if segment.start_index in fixed_entry_warning_indexes:
             flags.append("transition_jump")
+        flags.extend(_trace_flags_for_segment(segment, trace_by_epoch))
         for flag in set(flags):
             if flag in reasons:
                 reasons[flag] += segment.duration_s
         diagnostics_incomplete = bool(stat) and (not residuals_hard or not slips_hard)
         if diagnostics_incomplete:
             reasons["incomplete_diagnostics"] += segment.duration_s
-        severe = "transition_jump" in flags or ("recent_slip" in flags and "short_time_segment" in flags)
+        severe = (
+            "transition_jump" in flags
+            or ("recent_slip" in flags and "short_time_segment" in flags)
+            or ("trace_low_ar_ratio" in flags and "short_time_segment" in flags)
+            or ("trace_residual_outlier" in flags and "short_time_segment" in flags)
+        )
         if severe:
             suspect_time += segment.duration_s
             suspect_distance += segment.distance_m
@@ -946,7 +1162,55 @@ def _false_fix_suspicion(
         "provisional_fixed_distance_pct": (100.0 * provisional_distance / total_fixed_distance) if total_fixed_distance else 0.0,
         "suspect_fixed_distance_pct": (100.0 * suspect_distance / total_fixed_distance) if total_fixed_distance else 0.0,
         "reasons": reasons,
+        "evidence_sources": evidence_sources,
     }
+
+
+def _trace_alignment_by_epoch(trace_summary: dict[str, object] | None) -> dict[int, dict[str, object]]:
+    if not trace_summary:
+        return {}
+    alignment = trace_summary.get("alignment")
+    if not isinstance(alignment, dict):
+        return {}
+    per_epoch = alignment.get("per_epoch", [])
+    if not isinstance(per_epoch, list):
+        return {}
+    result: dict[int, dict[str, object]] = {}
+    for item in per_epoch:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("epoch_index")
+        if isinstance(index, int):
+            result[index] = item
+    return result
+
+
+def _trace_flags_for_segment(segment: Segment, trace_by_epoch: dict[int, dict[str, object]]) -> list[str]:
+    flags: set[str] = set()
+    for index in range(segment.start_index, segment.end_index + 1):
+        item = trace_by_epoch.get(index)
+        if not item:
+            continue
+        counts = item.get("counts", {})
+        if not isinstance(counts, dict):
+            continue
+        ar_ratio = item.get("trace_ar_ratio")
+        ar_threshold = item.get("trace_ar_threshold")
+        if ar_ratio is not None:
+            threshold = float(ar_threshold) if ar_threshold is not None else 3.0
+            if float(ar_ratio) < threshold:
+                flags.add("trace_low_ar_ratio")
+        if int(counts.get("cycle_slip", 0) or 0) or int(counts.get("lli", 0) or 0):
+            flags.add("trace_recent_slip")
+        if int(counts.get("residual_outlier", 0) or 0):
+            flags.add("trace_residual_outlier")
+        if int(counts.get("observation_rejection", 0) or 0) >= 5:
+            flags.add("trace_rejection_burst")
+        if item.get("trace_base_rover_dt") is not None and abs(float(item["trace_base_rover_dt"])) > 1.0:
+            flags.add("trace_base_rover_dt")
+        if int(counts.get("warning_or_error", 0) or 0):
+            flags.add("trace_warning_or_error")
+    return sorted(flags)
 
 
 def _qc_limitations(residuals: dict[str, object], slips: dict[str, object]) -> list[str]:
@@ -1321,6 +1585,8 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
                 f"- Trace decoded chars read: {trace.get('trace_decoded_chars_read', 'n/a')}",
                 f"- Trace lines read: {trace.get('trace_lines_read', trace.get('lines_read'))}",
                 f"- Trace truncated: {trace.get('trace_truncated', False)}",
+                f"- Trace parse elapsed s: {_fmt_any(trace.get('trace_parse_elapsed_s'))}",
+                f"- Trace parse rate MB/s: {_fmt_any(trace.get('trace_parse_rate_mb_s'))}",
                 f"- Trace deleted: {trace.get('trace_deleted', False)}",
                 "",
                 "| Event category | Count |",
@@ -1338,6 +1604,26 @@ def format_quality_markdown(analysis: QualityAnalysis, *, include_raw_json: bool
         ):
             count = counters.get(key, 0) if isinstance(counters, dict) else 0
             lines.append(f"| {label} | {count} |")
+        alignment = trace.get("alignment", {})
+        if isinstance(alignment, dict) and alignment.get("available"):
+            lines.extend(
+                [
+                    "",
+                    "| Trace alignment metric | Value |",
+                    "| --- | ---: |",
+                    f"| aligned events | {_fmt_any(alignment.get('trace_events_aligned'))} |",
+                    f"| unaligned events | {_fmt_any(alignment.get('trace_events_unaligned'))} |",
+                    f"| alignment % | {_fmt_any(alignment.get('trace_alignment_pct'))} |",
+                    f"| unique trace times mapped | {_fmt_any(alignment.get('unique_trace_times_mapped'))} |",
+                ]
+            )
+            counts_by_quality = alignment.get("event_counts_by_quality", {})
+            if isinstance(counts_by_quality, dict):
+                lines.extend(["", "| Quality | Trace events |", "| --- | ---: |"])
+                for quality in ("fixed", "float", "dgps", "single", "invalid"):
+                    counts = counts_by_quality.get(quality, {})
+                    total = sum(int(value) for value in counts.values()) if isinstance(counts, dict) else 0
+                    lines.append(f"| {quality} | {total} |")
         lines.extend(["", "Trace evidence can indicate marginal or suspect fixes, but does not prove false fixes."])
     else:
         lines.append("- Trace diagnostics were not requested or no trace file was available.")
@@ -1515,9 +1801,11 @@ def _segment_high_residual(stat: _StatAccumulator | None, segment: Segment, thre
     )
 
 
-def _has_recent_slip(stat: _StatAccumulator, segment: Segment, window_s: float) -> bool:
-    start = segment.start_time - timedelta(seconds=window_s)
-    return any(start <= slip_time <= segment.end_time for slip_time in stat.slip_times)
+def _has_recent_slip(slip_times_s: list[float], segment: Segment, window_s: float) -> bool:
+    start = _timestamp_s(segment.start_time) - window_s
+    end = _timestamp_s(segment.end_time)
+    position = bisect_left(slip_times_s, start)
+    return position < len(slip_times_s) and slip_times_s[position] <= end
 
 
 def _segment_dict(segment: Segment) -> dict[str, object]:
@@ -1575,6 +1863,27 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     d_lambda = math.radians(lon2 - lon1)
     a = math.sin(d_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2.0) ** 2
     return 2.0 * radius_m * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _ecef_to_llh(x: float, y: float, z: float) -> tuple[float, float, float]:
+    """Convert WGS84 ECEF XYZ meters to latitude, longitude, height."""
+
+    semi_major = 6378137.0
+    flattening = 1.0 / 298.257223563
+    semi_minor = semi_major * (1.0 - flattening)
+    eccentricity2 = 1.0 - (semi_minor * semi_minor) / (semi_major * semi_major)
+    ep2 = (semi_major * semi_major - semi_minor * semi_minor) / (semi_minor * semi_minor)
+    p = math.hypot(x, y)
+    theta = math.atan2(z * semi_major, p * semi_minor)
+    lon = math.atan2(y, x)
+    lat = math.atan2(
+        z + ep2 * semi_minor * math.sin(theta) ** 3,
+        p - eccentricity2 * semi_major * math.cos(theta) ** 3,
+    )
+    sin_lat = math.sin(lat)
+    n = semi_major / math.sqrt(1.0 - eccentricity2 * sin_lat * sin_lat)
+    height = p / math.cos(lat) - n
+    return math.degrees(lat), math.degrees(lon), height
 
 
 def _abs_float(value: str) -> float | None:

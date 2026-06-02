@@ -66,6 +66,35 @@ def test_trace_parser_streams_and_counts_events(tmp_path: Path):
     assert len(summary["examples"]["cycle_slip_lines"]) == 1
 
 
+def test_trace_parser_extracts_typed_timestamped_events(tmp_path: Path):
+    trace = tmp_path / "typed.trace"
+    trace.write_text(
+        "\n".join(
+            [
+                "2026/05/30 05:02:10.000 resamb: ratio=2.8 thres=3.0 G01 L1",
+                "2026/05/30 05:02:10.000 cycle slip detected G01 L1",
+                "2026/05/30 05:02:11.000 reject large residual postfit G02 C1C",
+                "2026/05/30 05:02:12.000 time difference dt=1.5 base",
+            ]
+        ),
+        encoding="ascii",
+    )
+
+    summary = analyze_rtklib_trace(trace)
+    events = summary["events"]
+
+    assert events["counts_by_type"]["ar_ratio"] == 1
+    assert events["counts_by_type"]["cycle_slip"] == 1
+    assert events["counts_by_type"]["observation_rejection"] == 1
+    assert events["counts_by_type"]["residual_outlier"] == 1
+    assert events["counts_by_type"]["base_rover_time_issue"] == 1
+    assert events["timestamped_event_times"] == 3
+    first = events["event_time_aggregates"][0]
+    assert first["ar_ratio_min"] == 2.8
+    assert first["ar_threshold"] == 3.0
+    assert first["sats"]["G01"] >= 1
+
+
 def test_trace_parser_reads_full_file_by_default_and_marks_caps(tmp_path: Path):
     trace = tmp_path / "large.trace"
     trace.write_text("".join("resamb: ratio=3.2\n" for _ in range(1200)), encoding="ascii")

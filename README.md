@@ -612,7 +612,7 @@ pipeline command is extended to do so.
 
 ## RTK Quality Analysis
 
-Use `quality-analyze` or its shorter alias `quality` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
+Use `quality` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
 solution together with an optional `.stat` file. The analyser keeps raw RTK
 state summaries separate from QC confidence. Raw fixed/float/DGPS/single
 percentages are reported unchanged, while fixed epochs are additionally
@@ -624,12 +624,15 @@ confidence is reported as unknown/limited instead of forcing all fixed time to
 suspect.
 
 ```bash
-PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
   --solution rover_20260531095025-base-rtk.nmea \
   --stat rover_20260531095025-base-rtk.nmea.stat \
   --out-md rover_20260531095025-quality.md \
   --out-json rover_20260531095025-quality.json
 ```
+
+The older standalone subcommand name `quality-analyze` is kept as a deprecated
+compatibility alias. The pipeline flag remains `--quality-analyze`.
 
 Large `.stat` files are parsed as a single streaming pass. Slip evidence is
 deduplicated and unique STAT epochs are aligned to solution epochs through an
@@ -671,6 +674,13 @@ The JSON and Markdown reports also include route-distance bins by default
 reported when base coordinates are available; growing baseline distance is
 context for expected ambiguity-resolution degradation, not by itself suspect
 evidence.
+
+Standalone quality analysis can receive base coordinates explicitly:
+
+```bash
+--base-llh 50.1234 14.1234 300.0
+--base-ecef 3970000.0 1050000.0 4860000.0
+```
 
 Optimise processing on QC-supported fixed time/distance and missing/no-output time,
 not raw fixed percentage alone. Some RTKLIB settings can look better by simply
@@ -721,6 +731,12 @@ Use `--quality-trace-max-bytes N` only when you intentionally want to cap trace
 analysis; the JSON then records `trace_truncated=true`. Level 4 and above can
 create very large files, so use them only for manual debugging.
 
+When timestamps are recognised in trace lines, trace events are aligned to
+solution epochs using `--quality-trace-align-tolerance-s` (default `0.5`).
+Only time-aligned trace evidence can contribute local QC reasons such as
+`trace_low_ar_ratio`, `trace_recent_slip`, or `trace_residual_outlier`; global
+trace counters are diagnostic only.
+
 Use keep mode only for manual debugging:
 
 ```bash
@@ -731,9 +747,8 @@ Trace level 0 is rejected for trace generation. Existing traces can be analysed
 without rerunning RTKLIB, and explicit `--trace PATH` is retained by default:
 
 ```bash
-PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality-analyze \
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
   --solution rover-rtk.pos \
-  --quality-trace existing \
   --trace rnx2rtkp.trace \
   --out-json rover-rtk.quality.json
 ```
@@ -750,7 +765,7 @@ extracted and written:
 
 `--quality-stat-cleanup` is accepted as the same opt-in flag.
 
-Standalone `quality-analyze --stat existing.stat --quality-clean-stat` is
+Standalone `quality --stat existing.stat --quality-clean-stat` is
 refused so archived user-supplied `.stat` files are not deleted accidentally.
 Cleanup status is recorded in the quality JSON and Markdown report.
 
