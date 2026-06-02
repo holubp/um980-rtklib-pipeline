@@ -12,6 +12,7 @@ from um980_rtklib_pipeline.quality import (
     QualityThresholds,
     SolutionEpoch,
     analyze_rtk_quality,
+    compare_quality_reports,
     compute_segments,
     format_quality_markdown,
     parse_solution_epochs,
@@ -377,8 +378,50 @@ def test_baseline_bins_and_markdown_include_quality_evolution(tmp_path: Path):
     assert "fixed_pct_of_elapsed" in populated[0]
     assert "trace_low_ar_count" in populated[0]
     markdown = format_quality_markdown(analysis)
-    assert "## 8. Quality By Base-Rover Distance" in markdown
+    assert "## 9. Quality By Base-Rover Distance" in markdown
     assert "Empty baseline bins omitted" in markdown
+
+
+def test_track_plausibility_exposes_bad_fixed_island(tmp_path: Path):
+    path = tmp_path / "jumpy.pos"
+    path.write_text(
+        "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 2 18\n"
+        "2026/05/30 05:00:01.000 50.000100 14.000000 250.0 1 18\n"
+        "2026/05/30 05:00:02.000 50.001500 14.000000 250.0 1 18\n"
+        "2026/05/30 05:00:03.000 50.000300 14.000000 250.0 2 18\n",
+        encoding="ascii",
+    )
+
+    data = analyze_rtk_quality(solution_path=path).as_dict()
+
+    assert data["track_plausibility"]["fixed_internal_jump_count"] >= 1
+    assert data["track_plausibility"]["speed_mps_by_quality"]["fixed"]["max"] > 90.0
+    markdown = format_quality_markdown(analyze_rtk_quality(solution_path=path))
+    assert "## 5. Track Plausibility" in markdown
+
+
+def test_quality_comparison_warns_when_cleaner_but_less_plausible() -> None:
+    left = {
+        "false_fix_suspicion": {"raw_fixed_time_s": 100.0, "qc_supported_fixed_time_s": 80.0},
+        "long_fixed_metrics": {"fixed_time_ge_thresholds_s": {"60": 80.0}, "fixed_distance_ge_thresholds_m": {"1000": 2000.0}},
+        "track_plausibility": {"track_consistency_score": 0.9, "fixed_internal_jump_count": 0, "fixed_islands_with_large_offset_count": 0},
+        "residuals": {"carrier_abs_m": {"fixed_p95": 0.2}},
+        "rejections": {"count": 100},
+        "slips": {"raw_slip_flags_total": 1000},
+    }
+    right = {
+        "false_fix_suspicion": {"raw_fixed_time_s": 110.0, "qc_supported_fixed_time_s": 20.0},
+        "long_fixed_metrics": {"fixed_time_ge_thresholds_s": {"60": 10.0}, "fixed_distance_ge_thresholds_m": {"1000": 100.0}},
+        "track_plausibility": {"track_consistency_score": 0.3, "fixed_internal_jump_count": 5, "fixed_islands_with_large_offset_count": 3},
+        "residuals": {"carrier_abs_m": {"fixed_p95": 0.1}},
+        "rejections": {"count": 10},
+        "slips": {"raw_slip_flags_total": 10},
+    }
+
+    comparison = compare_quality_reports(left, right)
+
+    assert comparison["warnings"]
+    assert "reduced noisy observations" in comparison["warnings"][0]
 
 
 def test_large_stat_slip_summary_uses_deduplicated_epoch_alignment(tmp_path: Path):

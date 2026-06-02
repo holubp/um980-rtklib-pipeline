@@ -121,6 +121,11 @@
   values. RTK QC confidence must stay separate from raw RTK state; incomplete
   residual/slip alignment should produce unknown/limited confidence, not a hard
   false-fix conclusion.
+- RTK QC must not treat raw fixed percentage, global residual p95/p99, raw slip
+  flags, or observation rejection totals as position-quality headlines. Track
+  plausibility, long stable fixed coverage, local trajectory consistency, and
+  time-aligned STAT/trace evidence must remain visible so aggressive filters
+  cannot look better merely by making diagnostics cleaner.
 - Large RTKLIB `.stat` analysis must remain indexed and bounded: never perform
   a linear nearest-solution-epoch scan inside loops over `$SAT` rows or raw slip
   flags. Deduplicate slip evidence first, align unique STAT epochs with a

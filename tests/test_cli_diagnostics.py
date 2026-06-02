@@ -171,6 +171,43 @@ def test_quality_analyze_alias_warns_deprecated(tmp_path: Path, capsys) -> None:
     assert data["baseline_summary"]["available"] is True
 
 
+def test_quality_compare_json_does_not_require_solution(tmp_path: Path, capsys) -> None:
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    left.write_text(
+        json.dumps(
+            {
+                "false_fix_suspicion": {"raw_fixed_time_s": 100.0},
+                "long_fixed_metrics": {"fixed_time_ge_thresholds_s": {"60": 80.0}},
+                "track_plausibility": {"track_consistency_score": 0.9, "fixed_internal_jump_count": 0},
+                "residuals": {"carrier_abs_m": {"fixed_p95": 0.2}},
+                "rejections": {"count": 100},
+                "slips": {"raw_slip_flags_total": 100},
+            }
+        ),
+        encoding="utf-8",
+    )
+    right.write_text(
+        json.dumps(
+            {
+                "false_fix_suspicion": {"raw_fixed_time_s": 110.0},
+                "long_fixed_metrics": {"fixed_time_ge_thresholds_s": {"60": 10.0}},
+                "track_plausibility": {"track_consistency_score": 0.1, "fixed_internal_jump_count": 2},
+                "residuals": {"carrier_abs_m": {"fixed_p95": 0.1}},
+                "rejections": {"count": 10},
+                "slips": {"raw_slip_flags_total": 10},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["quality", "--compare-json", str(left), str(right), "--format", "json"])
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["warnings"]
+
+
 def test_quality_rerun_command_includes_trace_and_base_options(tmp_path: Path) -> None:
     solution = tmp_path / "run.pos"
     trace = Path(str(solution) + ".trace")

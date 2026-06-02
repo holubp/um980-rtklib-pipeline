@@ -623,6 +623,17 @@ time-aligned and deduplicated against solution epochs; otherwise fixed
 confidence is reported as unknown/limited instead of forcing all fixed time to
 suspect.
 
+Raw fixed percentage, median fixed segment length, global residual p95/p99,
+raw slip flags, and observation rejection totals are diagnostic context, not
+quality headlines. Aggressive filtering can make those values look cleaner
+while producing worse fixed trajectory islands. The report therefore includes
+track-plausibility metrics: horizontal step, speed, acceleration, jerk, heading
+and yaw-rate summaries by quality state; fixed internal jumps; stationary fixed
+jumps; fixed-island cross-track offsets; stop drift/chatter; long stable fixed
+coverage; geometry-cost context; and trace-aligned AR/slip/rejection/residual
+evidence. Long smooth fixed segments are reported separately from short chattery
+fixed islands.
+
 ```bash
 PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
   --solution rover_20260531095025-base-rtk.nmea \
@@ -650,6 +661,19 @@ Optional bounds are available for quick inspection:
 
 If parsing is capped or `--quality-fast` skips STAT detail, the report marks
 QC confidence as limited/unknown where residual or slip evidence is incomplete.
+
+Two quality JSON reports can be compared directly:
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli quality \
+  --compare-json baseline.quality.json snr35.quality.json \
+  --format markdown
+```
+
+The comparison reports deltas for fixed coverage, long fixed coverage,
+residuals, rejection/slip cleanliness, and track plausibility. If filtering
+reduces noisy observations but worsens trajectory consistency, the report warns
+that this should not be treated as a quality improvement.
 
 Distance and time are both reported because they answer different questions.
 Time-based segment length is always relevant. Distance-based segment length is
