@@ -113,6 +113,11 @@
   generated rerun scripts must carry the same `--start-time/--end-time` values,
   and timestamped downstream products must be windowed even if the initial
   UM980 stream parse reads the full file for context.
+- Pipeline composability is a hard contract: every planned step in
+  `pipeline-manifest.json` must have a non-empty standalone command, and
+  `pipeline -v/-d --print-step-commands` must print copy-pasteable commands for
+  extract/RINEX/base/RTKLIB/quality/cleanup with the effective options used by
+  the one-shot pipeline.
 - The public UM980 stream API is `um980_rtklib_pipeline.um980_stream`; keep it
   stable for external tooling and classify command responses separately from
   NMEA, Unicore ASCII, Unicore binary, and noise records.

@@ -495,11 +495,12 @@ with `--no-emit-run-script`:
 
 The files are appended as commands become known, so they are still useful after
 partial failures. They include the original high-level command, canonical
-extract/RINEX commands, the exact RTKLIB wrapper invocation, and the standalone
-quality-analysis command. Use `--print-step-commands` to log copy-paste
-commands during the run, or `--emit-run-script PATH` to choose a script path
-explicitly. `--dry-run-plan` generates the plan and RTKLIB wrapper commands
-without running RTKLIB.
+extract/RINEX/base/RTKLIB/quality/cleanup step commands, the exact RTKLIB
+wrapper invocation when RTKLIB has run, and the standalone quality-analysis
+command. Use `--print-step-commands` to log copy-paste commands during the run,
+or `--emit-run-script PATH` to choose a script path explicitly.
+`--dry-run-plan` generates the composable step commands without parsing the
+rover or running RTKLIB.
 
 RTK2Go and other public casters are treated as generic NTRIP casters. To inspect
 a caster without adding RTK2Go-specific assumptions:
@@ -877,6 +878,12 @@ Standalone step commands are available as `parse-rover`, `extract`, `rinex`,
 and `cleanup`. Step commands accept the same `--start-time`/`--end-time`,
 `--out-dir`, `--basename`, `--manifest`, `--skip-existing`, and `--force`
 controls where applicable.
+
+When a base archive download is part of a composed run, the generated
+`resolve-base` command writes the resolved observation paths to
+`<basename>.base-observations.txt`; the generated `run-rtklib` command consumes
+that file with `--base-obs-list`. If base observations are supplied explicitly,
+the generated `run-rtklib` command passes the same `--base-obs` values directly.
 
 ### Processing Windows
 

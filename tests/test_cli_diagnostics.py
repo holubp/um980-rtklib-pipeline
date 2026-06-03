@@ -421,3 +421,130 @@ def test_canonical_step_aliases_accept_window_and_step_controls() -> None:
     assert resolve_args.station == "TUBO"
     assert run_args.start_time == "2026-05-30T05:00:00Z"
     assert cleanup_args.func is cli.cmd_cleanup
+
+
+def test_pipeline_dry_run_plan_records_commands_for_all_steps(tmp_path: Path, capsys) -> None:
+    out_dir = tmp_path / "out"
+    rc = cli.main(
+        [
+            "pipeline",
+            "rover file.ubx",
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "run",
+            "--start-time",
+            "2026-05-30T05:00:00Z",
+            "--end-time",
+            "2026-05-30T05:01:00Z",
+            "--base-obs",
+            "base obs.rnx",
+            "--nav-file",
+            "nav file.nav",
+            "--run-rtklib",
+            "--rtkconf",
+            "config with spaces.conf",
+            "--output-format",
+            "nmea",
+            "--quality-analyze",
+            "--quality-trace",
+            "temporary",
+            "--raw-output",
+            "all",
+            "--rinex-compat",
+            "convbin",
+            "--emit-ion-utc",
+            "auto",
+            "--print-step-commands",
+            "--dry-run-plan",
+            "-v",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    manifest = json.loads((out_dir / "run.pipeline-manifest.json").read_text(encoding="utf-8"))
+    commands = {step["name"]: step["command"] for step in manifest["steps"]}
+    assert set(commands) >= {"extract_receiver_products", "write_rinex_obs", "resolve_base", "run_rtklib", "quality", "cleanup"}
+    assert all(commands[name] for name in ("extract_receiver_products", "write_rinex_obs", "resolve_base", "run_rtklib", "quality", "cleanup"))
+    assert "--raw-output all" in commands["extract_receiver_products"]
+    assert "--obs-csv" in commands["extract_receiver_products"]
+    assert "--rinex-compat convbin" in commands["write_rinex_obs"]
+    assert "run-rtklib" in commands["run_rtklib"]
+    assert "--rover-obs" in commands["run_rtklib"]
+    assert "'base obs.rnx'" in commands["run_rtklib"]
+    assert "'nav file.nav'" in commands["run_rtklib"]
+    assert "--rtkconf 'config with spaces.conf'" in commands["run_rtklib"]
+    assert "--quality-trace temporary" in commands["run_rtklib"]
+    assert "quality --solution" in commands["quality"]
+    assert "--start-time 2026-05-30T05:00:00+00:00" in commands["quality"]
+
+    log_text = captured.out + captured.err
+    assert "Extract receiver products:" in log_text
+    assert "Write RINEX OBS and rover NAV:" in log_text
+    assert "Resolve base inputs:" in log_text
+    assert "Run RTKLIB:" in log_text
+    assert "Run quality analysis:" in log_text
+    assert "Cleanup:" in log_text
+
+
+def test_resolve_base_uses_cli_window_without_rover_parse(tmp_path: Path, monkeypatch, capsys) -> None:
+    calls: list[tuple[object, object]] = []
+
+    def fake_download_for_window(_args, start, end):
+        calls.append((start, end))
+        return [tmp_path / "base.obs"]
+
+    def fail_time_from_solutions(_args, _margin):
+        raise AssertionError("resolve-base must use explicit processing window before parsing rover solutions")
+
+    monkeypatch.setattr(cli, "_download_base_files_for_window", fake_download_for_window)
+    monkeypatch.setattr(cli, "_time_window_from_solutions", fail_time_from_solutions)
+
+    rc = cli.main(
+        [
+            "resolve-base",
+            "missing.ubx",
+            "--station",
+            "TUBO",
+            "--start-time",
+            "2026-05-30T05:00:00Z",
+            "--end-time",
+            "2026-05-30T05:01:00Z",
+        ]
+    )
+
+    assert rc == 0
+    assert calls
+    assert calls[0][0].isoformat() == "2026-05-30T05:00:00+00:00"
+    assert calls[0][1].isoformat() == "2026-05-30T05:01:00+00:00"
+    assert "base.obs" in capsys.readouterr().out
+
+
+def test_download_base_pipeline_plan_hands_base_list_to_rtklib(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+
+    rc = cli.main(
+        [
+            "pipeline",
+            "rover.ubx",
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "run",
+            "--download-base",
+            "--station",
+            "TUBO",
+            "--run-rtklib",
+            "--nav-file",
+            "nav.nav",
+            "--dry-run-plan",
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out_dir / "run.pipeline-manifest.json").read_text(encoding="utf-8"))
+    commands = {step["name"]: step["command"] for step in manifest["steps"]}
+    base_list = out_dir / "run.base-observations.txt"
+    assert f"> {base_list}" in commands["resolve_base"]
+    assert f"--base-obs-list {base_list}" in commands["run_rtklib"]
