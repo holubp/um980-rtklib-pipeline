@@ -1484,13 +1484,15 @@ def test_pipeline_passes_base_resolution_to_resolver(tmp_path: Path, monkeypatch
     out_dir = tmp_path / "out"
     nav = tmp_path / "nav.rnx"
     base = tmp_path / "CPAR00CZE_S_20261430530_15M_01S_MO.rnx"
+    rover = tmp_path / "rover.unc"
+    rover.write_text("dummy", encoding="ascii")
     nav.write_text("nav\n", encoding="ascii")
     base.write_text("base\n", encoding="ascii")
     captured: dict[str, object] = {}
     args = cli.build_parser().parse_args(
         [
             "pipeline",
-            "rover.unc",
+            str(rover),
             "--out-dir",
             str(out_dir),
             "--basename",
@@ -1525,6 +1527,14 @@ def test_pipeline_passes_base_resolution_to_resolver(tmp_path: Path, monkeypatch
         return [base]
 
     monkeypatch.setattr(cli, "_download_base_files_for_window", fake_download)
+    monkeypatch.setattr(
+        cli,
+        "_time_window_from_solutions",
+        lambda _args, _margin_s: (
+            datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+            datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        ),
+    )
     monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs: (base_obs, []))
     monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
 
@@ -1546,13 +1556,15 @@ def test_no_base_fallback_is_honoured_by_pipeline(tmp_path: Path, monkeypatch):
     out_dir = tmp_path / "out"
     nav = tmp_path / "nav.rnx"
     base = tmp_path / "CPAR00CZE_S_20261430530_15M_01S_MO.rnx"
+    rover = tmp_path / "rover.unc"
+    rover.write_text("dummy", encoding="ascii")
     nav.write_text("nav\n", encoding="ascii")
     base.write_text("base\n", encoding="ascii")
     captured: dict[str, object] = {}
     args = cli.build_parser().parse_args(
         [
             "pipeline",
-            "rover.unc",
+            str(rover),
             "--out-dir",
             str(out_dir),
             "--basename",
@@ -1588,6 +1600,14 @@ def test_no_base_fallback_is_honoured_by_pipeline(tmp_path: Path, monkeypatch):
         return [base]
 
     monkeypatch.setattr(cli, "_download_base_files_for_window", fake_download)
+    monkeypatch.setattr(
+        cli,
+        "_time_window_from_solutions",
+        lambda _args, _margin_s: (
+            datetime(2026, 5, 23, 5, 29, tzinfo=UTC),
+            datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
+        ),
+    )
     monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs: (base_obs, []))
     monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
 

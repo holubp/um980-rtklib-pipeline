@@ -360,9 +360,11 @@ def test_pipeline_dry_run_plan_writes_manifest_without_rover_parse(tmp_path: Pat
     manifest = out_dir / "run.pipeline-manifest.json"
     assert manifest.exists()
     data = json.loads(manifest.read_text(encoding="utf-8"))
-    assert [step["name"] for step in data["steps"]][:3] == [
+    assert [step["name"] for step in data["steps"]][:5] == [
+        "parse_rover",
         "extract_receiver_products",
         "write_rinex_obs",
+        "extract_rover_nav",
         "resolve_base",
     ]
     assert data["inputs"]["start_time"] == "2026-05-30T05:00:00+00:00"
@@ -384,8 +386,8 @@ def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     cli._init_rerun_artifacts(args, tmp_path, "rover")
     cli._append_rerun_command(args, "Standalone quality", ["python", "-m", "um980_rtklib_pipeline.cli", "quality", "--solution", "a b.pos"])
 
-    script = (tmp_path / "rover-rerun.sh").read_text(encoding="utf-8")
-    markdown = (tmp_path / "rover.commands.md").read_text(encoding="utf-8")
+    script = (tmp_path / "rerun.sh").read_text(encoding="utf-8")
+    markdown = (tmp_path / "commands.md").read_text(encoding="utf-8")
     assert "set -euo pipefail" in script
     assert "run_step()" in script
     assert "usage: $0 [all|quality|only STEP|from STEP]" in script
@@ -393,7 +395,7 @@ def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     assert "'rover file.ubx'" in script
     assert "'a b.pos'" in script
     assert "Standalone quality" in markdown
-    assert subprocess.run(["bash", "-n", str(tmp_path / "rover-rerun.sh")], check=False).returncode == 0
+    assert subprocess.run(["bash", "-n", str(tmp_path / "rerun.sh")], check=False).returncode == 0
 
 
 def test_rerun_script_modes_execute_expected_steps_with_fake_python(tmp_path: Path) -> None:
@@ -442,7 +444,7 @@ def test_rerun_script_modes_execute_expected_steps_with_fake_python(tmp_path: Pa
     )
     assert rc == 0
 
-    script = out_dir / "run-rerun.sh"
+    script = out_dir / "rerun.sh"
     assert script.exists()
     script.chmod(0o755)
 
@@ -462,8 +464,10 @@ def test_rerun_script_modes_execute_expected_steps_with_fake_python(tmp_path: Pa
 
     all_steps = _invoke("all")
     assert all_steps == [
+        "parse-rover",
         "extract",
         "rinex",
+        "nav",
         "resolve-base",
         "run-rtklib",
         "quality",
@@ -550,8 +554,27 @@ def test_pipeline_dry_run_plan_records_commands_for_all_steps(tmp_path: Path, ca
     assert rc == 0
     manifest = json.loads((out_dir / "run.pipeline-manifest.json").read_text(encoding="utf-8"))
     commands = {step["name"]: step["command"] for step in manifest["steps"]}
-    assert set(commands) >= {"extract_receiver_products", "write_rinex_obs", "resolve_base", "run_rtklib", "quality", "cleanup"}
-    assert all(commands[name] for name in ("extract_receiver_products", "write_rinex_obs", "resolve_base", "run_rtklib", "quality", "cleanup"))
+    assert set(commands) >= {
+        "extract_receiver_products",
+        "write_rinex_obs",
+        "extract_rover_nav",
+        "resolve_base",
+        "run_rtklib",
+        "quality",
+        "cleanup",
+    }
+    assert all(
+        commands[name]
+        for name in (
+            "extract_receiver_products",
+            "write_rinex_obs",
+            "extract_rover_nav",
+            "resolve_base",
+            "run_rtklib",
+            "quality",
+            "cleanup",
+        )
+    )
     assert "--raw-output all" in commands["extract_receiver_products"]
     assert "--obs-csv" in commands["extract_receiver_products"]
     assert "--rinex-compat convbin" in commands["write_rinex_obs"]
@@ -631,5 +654,128 @@ def test_download_base_pipeline_plan_hands_base_list_to_rtklib(tmp_path: Path) -
     manifest = json.loads((out_dir / "run.pipeline-manifest.json").read_text(encoding="utf-8"))
     commands = {step["name"]: step["command"] for step in manifest["steps"]}
     base_list = out_dir / "run.base-observations.txt"
-    assert f"> {base_list}" in commands["resolve_base"]
+    assert f"--base-obs-list {base_list}" in commands["resolve_base"]
     assert f"--base-obs-list {base_list}" in commands["run_rtklib"]
+
+
+def test_pipeline_only_step_resolve_base_executes_without_rtklib(tmp_path: Path, monkeypatch) -> None:
+    rover = tmp_path / "rover.ubx"
+    rover.write_bytes(b"\n")
+    out_dir = tmp_path / "out"
+    base_obs = tmp_path / "base.obs"
+    base_obs.write_text("", encoding="utf-8")
+
+    called = {"download": 0}
+
+    def fake_download_base_files(_args):
+        called["download"] += 1
+        return [base_obs]
+
+    def fail_rtklib_output(*_args, **_kwargs):
+        raise AssertionError("RTKLIB output generation must not run for --only-step resolve-base")
+
+    monkeypatch.setattr(cli, "_download_base_files", fake_download_base_files)
+    monkeypatch.setattr(cli, "_run_rtklib_output_formats", fail_rtklib_output)
+
+    rc = cli.main(
+        [
+            "pipeline",
+            str(rover),
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "run",
+            "--download-base",
+            "--station",
+            "TUBO",
+            "--only-step",
+            "resolve-base",
+            "--base-rinex-version",
+            "3",
+        ]
+    )
+
+    assert rc == 0
+    assert called["download"] == 1
+    base_list = out_dir / "run.base-observations.txt"
+    assert base_list.exists()
+    assert base_list.read_text(encoding="utf-8").strip() == str(base_obs)
+
+
+def test_pipeline_from_step_resolve_base_then_run_rtklib_uses_cached_base_list(tmp_path: Path, monkeypatch) -> None:
+    rover = tmp_path / "rover.ubx"
+    rover.write_bytes(b"\n")
+    out_dir = tmp_path / "out"
+    rover_obs = out_dir / "run.direct.obs"
+    rover_obs.parent.mkdir(parents=True, exist_ok=True)
+    rover_obs.write_text("", encoding="utf-8")
+
+    base_obs = out_dir / "base.obs"
+    base_obs.write_text("", encoding="utf-8")
+    nav_nav = out_dir / "nav.nav"
+    nav_nav.write_text("", encoding="utf-8")
+
+    calls: dict[str, list[str]] = {"base_obs": []}
+
+    def fake_run_quality(*_args, **_kwargs) -> None:
+        pass
+
+    def fake_run_rtklib(
+        *,
+        args,
+        rnx2rtkp,
+        out_dir,
+        basename,
+        rover_obs,
+        base_obs,
+        nav_files,
+        base_obs_arg,
+        base_ecef,
+        base_llh,
+    ) -> list:
+        calls["base_obs"] = [str(path) for path in base_obs]
+        return [SimpleNamespace(args=["fake", "rnx2rtkp"])]
+
+    def fake_resolve_base_position(*_args, **_kwargs):
+        return None, None
+
+    def fail_download_base(*_args, **_kwargs) -> list[Path]:
+        raise AssertionError("resolve_base should reuse --base-obs-list when --from-step run-rtklib")
+
+    def fake_resolve_nav_sources(**kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            candidates=[SimpleNamespace(path=Path(kwargs["explicit"][0]), role="explicit", priority=0, systems={"G"}, usable=True, notes=[])],
+            selected=[SimpleNamespace(path=Path(kwargs["explicit"][0]), role="explicit", priority=0, systems={"G"}, usable=True, notes=[])],
+            missing_systems=set(),
+            warnings=[],
+        )
+
+    monkeypatch.setattr(cli, "_run_rtklib_output_formats", fake_run_rtklib)
+    monkeypatch.setattr(cli, "_download_base_files", fail_download_base)
+    monkeypatch.setattr(cli, "resolve_nav_sources", fake_resolve_nav_sources)
+    monkeypatch.setattr(cli, "_resolve_base_position", fake_resolve_base_position)
+    monkeypatch.setattr(cli, "_run_quality_analysis_if_requested", fake_run_quality)
+    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda rover_file, base_files: (base_files, []))
+
+    rc = cli.main(
+        [
+            "pipeline",
+            str(rover),
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "run",
+            "--from-step",
+            "run-rtklib",
+            "--run-rtklib",
+            "--base-obs",
+            str(base_obs),
+            "--nav-file",
+            str(nav_nav),
+            "--rtkconf",
+            "cfg.conf",
+        ]
+    )
+
+    assert rc == 0
+    assert calls["base_obs"] == [str(base_obs)]

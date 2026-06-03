@@ -141,6 +141,36 @@ PIPELINE_STEPS = (
     "quality",
     "cleanup",
 )
+PIPELINE_STEP_ALIASES: dict[str, str] = {
+    "parse-rover": "parse_rover",
+    "extract-rover-products": "extract_receiver_products",
+    "extract-receiver-products": "extract_receiver_products",
+    "write-rinex-obs": "write_rinex_obs",
+    "extract-rover-nav": "extract_rover_nav",
+    "resolve-base": "resolve_base",
+    "run-rtklib": "run_rtklib",
+}
+
+
+def _normalize_pipeline_step_name(step: str | None) -> str | None:
+    """Return canonical underscore step name used by pipeline internals."""
+
+    if step is None:
+        return None
+    normalised = step.replace("-", "_")
+    return PIPELINE_STEP_ALIASES.get(step, PIPELINE_STEP_ALIASES.get(normalised, normalised))
+
+
+def _normalise_pipeline_step_control_list(values: list[str]) -> list[str]:
+    return [_normalize_pipeline_step_name(value) for value in values if _normalize_pipeline_step_name(value)]
+
+
+def _normalise_pipeline_step_controls(args: argparse.Namespace) -> None:
+    """Normalize --from-step/--only-step/--force-step names for command execution."""
+
+    setattr(args, "from_step", _normalize_pipeline_step_name(getattr(args, "from_step", None)))
+    setattr(args, "only_step", _normalize_pipeline_step_name(getattr(args, "only_step", None)))
+    setattr(args, "force_step", _normalise_pipeline_step_control_list(getattr(args, "force_step", []) or []))
 RTK_POS_MODE_CODES = {
     "single": "0",
     "dgps": "1",
@@ -541,10 +571,19 @@ def _add_rerun_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--emit-run-script", nargs="?", const="auto", help="Write rerun shell script; optional PATH or 'auto'.")
     parser.add_argument("--no-emit-run-script", action="store_true", help="Disable automatic rerun script emission.")
     parser.add_argument("--dry-run-plan", action="store_true", help="Print planned phases/commands without running RTKLIB.")
-    parser.add_argument("--from-step", choices=PIPELINE_STEPS, help="Reuse earlier pipeline outputs and run from this step onward.")
-    parser.add_argument("--only-step", choices=PIPELINE_STEPS, help="Run only one composable pipeline step.")
+    step_choices = tuple(
+        sorted(set(PIPELINE_STEPS) | {alias.replace("_", "-") for alias in PIPELINE_STEP_ALIASES.keys()})
+    )
+    parser.add_argument("--from-step", choices=step_choices, help="Reuse earlier pipeline outputs and run from this step onward.")
+    parser.add_argument("--only-step", choices=step_choices, help="Run only one composable pipeline step.")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse existing outputs for selected pipeline steps when present.")
-    parser.add_argument("--force-step", choices=PIPELINE_STEPS, action="append", default=[], help="Regenerate this step even when --skip-existing is set.")
+    parser.add_argument(
+        "--force-step",
+        choices=step_choices,
+        action="append",
+        default=[],
+        help="Regenerate this step even when --skip-existing is set.",
+    )
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -822,8 +861,8 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
     if not _rerun_enabled(args):
         return
     requested = getattr(args, "emit_run_script", None)
-    script = out_dir / f"{basename}-rerun.sh" if requested in {None, "auto"} else Path(requested)
-    commands_md = out_dir / f"{basename}.commands.md"
+    script = out_dir / "rerun.sh" if requested in {None, "auto"} else Path(requested)
+    commands_md = out_dir / "commands.md"
     setattr(args, "_rerun_script", script)
     setattr(args, "_commands_md", commands_md)
     original = getattr(args, "_original_argv", None)
@@ -839,12 +878,15 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
         'REQUEST_MODE="${1:-all}"',
         'REQUEST_STEP=""',
         "STARTED_FROM=0",
+        "normalize_step() {",
+        "  printf '%s' \"$1\" | tr '_' '-'",
+        "}",
         "case \"$REQUEST_MODE\" in",
         "  all|quality)",
         "    shift || true",
         "    ;;",
         "  only|from)",
-        "    REQUEST_STEP=\"${2:-}\"",
+        "    REQUEST_STEP=\"$(normalize_step \"${2:-}\")\"",
         "    if [ -z \"$REQUEST_STEP\" ]; then",
         "      usage",
         "    fi",
@@ -864,12 +906,13 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
         'EXTRA_ARGS=("$@")',
         "run_step() {",
         '  step="$1"',
+        "  step_key=\"$(normalize_step \"$step\")\"",
         "  shift",
         '  case "$REQUEST_MODE" in',
         '    all) "$@" ;;',
         '    quality) [ "$step" = "quality" ] && "$@" || true ;;',
-        '    only) [ "$step" = "$REQUEST_STEP" ] && "$@" || true ;;',
-        '    from) if [ "$step" = "$REQUEST_STEP" ]; then STARTED_FROM=1; fi; [ "$STARTED_FROM" = 1 ] && "$@" || true ;;',
+        '    only) [ "$step_key" = "$REQUEST_STEP" ] && "$@" || true ;;',
+        '    from) if [ "$step_key" = "$REQUEST_STEP" ]; then STARTED_FROM=1; fi; [ "$STARTED_FROM" = 1 ] && "$@" || true ;;',
         '    *) echo "usage: $0 [all|quality|only STEP|from STEP]" >&2; exit 2 ;;',
         "  esac",
         "}",
@@ -883,21 +926,23 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
     logging.info("commands markdown: %s", commands_md)
 
 
-def _append_rerun_command(args: argparse.Namespace, title: str, command: list[str] | str) -> None:
+def _append_rerun_command(
+    args: argparse.Namespace,
+    title: str,
+    command: list[str] | str,
+    *,
+    step_id: str | None = None,
+) -> None:
     """Append a copy-pasteable command to rerun artifacts."""
 
     script = getattr(args, "_rerun_script", None)
     commands_md = getattr(args, "_commands_md", None)
-    rendered = command if isinstance(command, str) else _quote_command([str(item) for item in command])
-    if " > " in str(rendered):
-        left, right = rendered.rsplit(" > ", 1)
-        rendered = f"{left} \"$@\" > {right}"
-    else:
-        rendered = f"{rendered} \"$@\""
+    rendered = _quote_command([str(item) for item in command]) if isinstance(command, list) else str(command)
+    rendered = f"{rendered} \"$@\""
     if getattr(args, "print_step_commands", False) or getattr(args, "verbose", False):
         logging.info("%s: %s", title, rendered)
     if script:
-        step = _rerun_step_name(title)
+        step = step_id or _rerun_step_name(title)
         Path(script).write_text(
             Path(script).read_text(encoding="utf-8")
             + f'# {title}\nrun_step {shlex.quote(step)} sh -c {shlex.quote(rendered)} _ "${{EXTRA_ARGS[@]}}"' + "\n\n",
@@ -918,15 +963,40 @@ def _rerun_step_name(title: str) -> str:
         return "quality"
     if "rtklib" in lowered:
         return "run_rtklib"
-    if "rinex" in lowered:
-        return "write_rinex_obs"
-    if "nav" in lowered:
-        return "extract_rover_nav"
-    if "base" in lowered:
+    if "resolve base" in lowered or "base" in lowered:
         return "resolve_base"
+    if "extract rover nav" in lowered or "rover nav" in lowered:
+        return "extract_rover_nav"
+    if "rinex" in lowered or "nav" in lowered:
+        return "write_rinex_obs"
     if "extract" in lowered:
         return "extract_receiver_products"
     return "parse_rover"
+
+
+def _rover_nav_output_paths(base_nav_path: Path) -> list[Path]:
+    """Return expected rover NAV output paths for a base rover NAV stem."""
+
+    stem = base_nav_path.name
+    suffix = ".rover-gps.nav"
+    if stem.endswith(suffix):
+        base = stem[: -len(suffix)]
+        return [
+            base_nav_path,
+            base_nav_path.with_name(f"{base}.rover-glo.gnav"),
+            base_nav_path.with_name(f"{base}.rover-gal.lnav"),
+            base_nav_path.with_name(f"{base}.rover-bds.cnav"),
+            base_nav_path.with_name(f"{base}.rover-sbas.sbs"),
+            base_nav_path.with_name(f"{base}.rover-irn.inav"),
+        ]
+    return [
+        base_nav_path,
+        base_nav_path.with_suffix(".gnav"),
+        base_nav_path.with_suffix(".lnav"),
+        base_nav_path.with_suffix(".cnav"),
+        base_nav_path.with_suffix(".sbs"),
+        base_nav_path.with_suffix(".inav"),
+    ]
 
 
 def _init_pipeline_manifest(args: argparse.Namespace, out_dir: Path, basename: str) -> None:
@@ -1331,7 +1401,13 @@ def _resolve_base_position(
     return None, None
 
 
-def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station: bool, include_rtklib_dir: bool = True) -> None:
+def _add_base_download_args(
+    parser: argparse.ArgumentParser,
+    *,
+    require_station: bool,
+    include_rtklib_dir: bool = True,
+    include_base_obs_list: bool = False,
+) -> None:
     parser.add_argument("--station", required=require_station)
     parser.add_argument("--station-long")
     if include_rtklib_dir:
@@ -1363,6 +1439,8 @@ def _add_base_download_args(parser: argparse.ArgumentParser, *, require_station:
     )
     parser.add_argument("--crx2rnx")
     parser.add_argument("--cleanup", action="store_true")
+    if include_base_obs_list:
+        parser.add_argument("--base-obs-list", help="Write resolved base observations to this path.")
 
 
 def _add_rtklib_processing_args(parser: argparse.ArgumentParser, *, require_base_obs: bool) -> None:
@@ -2286,7 +2364,12 @@ def _run_rtklib_output_formats(
         _log_rtklib_solution_summary(args, output_file)
         wrapper = getattr(command, "wrapper_file", None)
         if wrapper is not None:
-            _append_rerun_command(args, f"Rerun RTKLIB {output_format}", ["bash", str(wrapper)])
+            _append_rerun_command(
+                args,
+                f"Rerun RTKLIB {output_format}",
+                ["bash", str(wrapper)],
+                step_id="run_rtklib",
+            )
         commands.append(command)
     return commands
 
@@ -2315,7 +2398,12 @@ def _run_quality_analysis_if_requested(
         logging.warning("quality analysis running without .stat evidence: %s", solution)
     md_path = Path(args.quality_out_md) if getattr(args, "quality_out_md", None) else out_dir / f"{basename}-rtk.quality.md"
     json_path = Path(args.quality_out_json) if getattr(args, "quality_out_json", None) else out_dir / f"{basename}-rtk.quality.json"
-    _append_rerun_command(args, "Rerun quality analysis", _quality_rerun_command(args, solution, stat, json_path, md_path))
+    _append_rerun_command(
+        args,
+        "Rerun quality analysis",
+        _quality_rerun_command(args, solution, stat, json_path, md_path),
+        step_id="quality",
+    )
     trace_summary = _trace_summary_for_quality(args, commands or [])
     cleanup = {
         "trace_cleanup_requested": getattr(args, "quality_trace", "off") == "temporary",
@@ -2529,6 +2617,26 @@ def _build_extract_step_command(args: argparse.Namespace, out_dir: Path, basenam
     return command
 
 
+def _build_extract_rover_nav_step_command(args: argparse.Namespace, out_dir: Path, basename: str) -> list[str]:
+    """Build the standalone rover-NAV extraction command."""
+
+    command = [*_command_prefix(), "nav", str(args.rover_log)]
+    _append_common_output_args(command, args, out_dir, basename)
+    command.extend(["--solution", "none"])
+    command.extend(["--position-nmea", "none"])
+    command.extend(["--track-source", str(getattr(args, "track_source", "auto"))])
+    command.extend(["--nav-only"])
+    return command
+
+
+def _build_parse_step_command(args: argparse.Namespace, out_dir: Path, basename: str) -> list[str]:
+    """Build the standalone parse-only command matching pipeline-level parse options."""
+
+    command = [*_command_prefix(), "parse-rover", str(args.rover_log)]
+    _append_common_output_args(command, args, out_dir, basename)
+    return command
+
+
 def _build_rinex_step_command(args: argparse.Namespace, out_dir: Path, basename: str) -> list[str]:
     """Build the standalone RINEX/NAV command matching pipeline RINEX options."""
 
@@ -2550,7 +2658,7 @@ def _base_obs_list_path(out_dir: Path, basename: str) -> Path:
     return out_dir / f"{basename}.base-observations.txt"
 
 
-def _build_resolve_base_step_command(args: argparse.Namespace, out_dir: Path, basename: str) -> str:
+def _build_resolve_base_step_command(args: argparse.Namespace, out_dir: Path, basename: str) -> list[str]:
     """Build a standalone base-resolution command, writing a path list for RTKLIB."""
 
     command = [*_command_prefix(), "resolve-base", str(args.rover_log)]
@@ -2578,7 +2686,8 @@ def _build_resolve_base_step_command(args: argparse.Namespace, out_dir: Path, ba
         command.append("--force-download")
     if getattr(args, "cleanup", False):
         command.append("--cleanup")
-    return f"{_quote_command(command)} > {shlex.quote(str(_base_obs_list_path(out_dir, basename)))}"
+    command.extend(["--base-obs-list", str(_base_obs_list_path(out_dir, basename))])
+    return command
 
 
 def _build_run_rtklib_step_command(args: argparse.Namespace, out_dir: Path, basename: str) -> list[str]:
@@ -3176,6 +3285,19 @@ def cmd_rinex(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
+    if getattr(args, "nav_only", False):
+        if getattr(args, "analysis_json", False):
+            logging.info("analysis JSON is not produced for --nav-only; use extract/nav commands for full analysis.")
+        if args.solution != "none" or getattr(args, "position_nmea", "all") != "none":
+            logging.warning("nav-only mode enabled; solution and position outputs are suppressed.")
+        nav_path = Path(args.out_dir) / f"{basename_for(Path(args.rover_log), args.basename)}.rover-gps.nav"
+        records, _, _, _, observations, rover_nav, _, _, _ = _extract_bundle(args)
+        logging.info("extracting rover navigation files (nav-only): base=%s", nav_path)
+        nav_report = extract_rover_nav(records, nav_path)
+        for kind, path in sorted(nav_report.written.items()):
+            logging.info("wrote rover %s file: %s", kind, path)
+        return 0
+
     rover, records, _, solutions, observations, rover_nav, _, _, analysis = _extract_bundle(args)
     out_dir = ensure_out_dir(args.out_dir)
     base = basename_for(rover, args.basename)
@@ -3470,8 +3592,22 @@ def cmd_download_base(args: argparse.Namespace) -> int:
     _configure_cli_logging(args)
     logging.info("starting EUREF base download")
     normalised = _download_base_files(args)
+    base_obs_list = getattr(args, "base_obs_list", None)
     if normalised:
-        print("\n".join(str(path) for path in normalised))
+        if base_obs_list:
+            output = Path(base_obs_list)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("\n".join(str(path) for path in normalised) + "\n", encoding="utf-8")
+            logging.info("wrote %d base observations to %s", len(normalised), output)
+            print(output)
+        else:
+            print("\n".join(str(path) for path in normalised))
+    elif base_obs_list:
+        output = Path(base_obs_list)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("", encoding="utf-8")
+        logging.info("wrote empty base observation list to %s", output)
+        print(output)
     return 0
 
 
@@ -3817,6 +3953,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     """
 
     _configure_cli_logging(args)
+    _normalise_pipeline_step_controls(args)
     _log_effective_run_summary(args)
     if getattr(args, "base_rtcm", None) and args.download_base:
         raise ValueError("--base-rtcm and --download-base are mutually exclusive; choose one base source")
@@ -3828,19 +3965,31 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     _init_rerun_artifacts(args, out_dir, base)
     rover_obs = out_dir / f"{base}.direct.obs"
     _init_pipeline_manifest(args, out_dir, base)
+    parse_step_command = _build_parse_step_command(args, out_dir, base)
     extract_step_command = _build_extract_step_command(args, out_dir, base)
     rinex_step_command = _build_rinex_step_command(args, out_dir, base)
+    extract_rover_nav_step_command = _build_extract_rover_nav_step_command(args, out_dir, base)
     resolve_base_command = _build_resolve_base_step_command(args, out_dir, base)
     run_rtklib_command = _build_run_rtklib_step_command(args, out_dir, base)
     quality_command = _build_quality_step_command(args, out_dir, base)
     cleanup_command = _build_cleanup_step_command(args, out_dir, base)
-    _append_rerun_command(args, "Extract receiver products", extract_step_command)
-    _append_rerun_command(args, "Write RINEX OBS and rover NAV", rinex_step_command)
-    _append_rerun_command(args, "Resolve base inputs", resolve_base_command)
-    _append_rerun_command(args, "Run RTKLIB", run_rtklib_command)
+    _append_rerun_command(args, "Parse rover products", parse_step_command, step_id="parse_rover")
+    _append_rerun_command(args, "Extract receiver products", extract_step_command, step_id="extract_receiver_products")
+    _append_rerun_command(args, "Write RINEX OBS and rover NAV", rinex_step_command, step_id="write_rinex_obs")
+    _append_rerun_command(args, "Extract rover NAV", extract_rover_nav_step_command, step_id="extract_rover_nav")
+    _append_rerun_command(args, "Resolve base inputs", resolve_base_command, step_id="resolve_base")
+    _append_rerun_command(args, "Run RTKLIB", run_rtklib_command, step_id="run_rtklib")
     if getattr(args, "quality_analyze", False):
-        _append_rerun_command(args, "Run quality analysis", quality_command)
-    _append_rerun_command(args, "Cleanup", cleanup_command)
+        _append_rerun_command(args, "Run quality analysis", quality_command, step_id="quality")
+    _append_rerun_command(args, "Cleanup", cleanup_command, step_id="cleanup")
+    _record_pipeline_step(
+        args,
+        "parse_rover",
+        inputs=[args.rover_log],
+        outputs=[],
+        command=parse_step_command,
+        status="planned",
+    )
     _record_pipeline_step(
         args,
         "extract_receiver_products",
@@ -3855,7 +4004,16 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         inputs=[args.rover_log],
         outputs=[rover_obs, out_dir / f"{base}.rover-gps.nav"],
         command=rinex_step_command,
-        dependencies=["extract_receiver_products"],
+        dependencies=["extract_receiver_products", "parse_rover"],
+        status="planned",
+    )
+    _record_pipeline_step(
+        args,
+        "extract_rover_nav",
+        inputs=[args.rover_log],
+        outputs=_rover_nav_output_paths(out_dir / f"{base}.rover-gps.nav"),
+        command=extract_rover_nav_step_command,
+        dependencies=["extract_receiver_products", "parse_rover"],
         status="planned",
     )
     _record_pipeline_step(args, "resolve_base", inputs=[rover_obs], outputs=[_base_obs_list_path(out_dir, base)], command=resolve_base_command, dependencies=["write_rinex_obs"], status="planned")
@@ -3865,6 +4023,23 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     if getattr(args, "dry_run_plan", False):
         logging.info("dry-run plan written: %s", getattr(args, "_pipeline_manifest_path", None))
         return 0
+    if (
+        getattr(args, "only_step", None) == "parse_rover"
+        or getattr(args, "from_step", None) == "parse_rover"
+    ):
+        started = time.perf_counter()
+        logging.info("pipeline step parse_rover: parse rover log diagnostics")
+        cmd_analyze(args)
+        _record_pipeline_step(
+            args,
+            "parse_rover",
+            inputs=[args.rover_log],
+            outputs=[],
+            status="generated",
+            elapsed_s=time.perf_counter() - started,
+        )
+        if getattr(args, "only_step", None) == "parse_rover":
+            return 0
     if _should_run_pipeline_step(args, "extract_receiver_products"):
         extract_outputs = [out_dir / f"{base}.solution.csv", out_dir / f"{base}.solution.nmea"]
         if getattr(args, "skip_existing", False) and not _forced_step(args, "extract_receiver_products") and _existing_outputs(extract_outputs):
@@ -3889,12 +4064,93 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
             _record_pipeline_step(args, "write_rinex_obs", inputs=[args.rover_log], outputs=rinex_outputs, status="generated", elapsed_s=time.perf_counter() - started)
     if getattr(args, "only_step", None) == "write_rinex_obs":
         return 0
+    if _should_run_pipeline_step(args, "extract_rover_nav"):
+        rover_nav_outputs = _rover_nav_output_paths(out_dir / f"{base}.rover-gps.nav")
+        if getattr(args, "skip_existing", False) and not _forced_step(args, "extract_rover_nav") and _existing_outputs(rover_nav_outputs):
+            logging.info("pipeline step extract_rover_nav: reusing existing outputs")
+            _record_pipeline_step(
+                args,
+                "extract_rover_nav",
+                inputs=[args.rover_log],
+                outputs=rover_nav_outputs,
+                status="skipped",
+                reused=True,
+            )
+        else:
+            nav_only_args = argparse.Namespace(**vars(args))
+            nav_only_args.solution = "none"
+            nav_only_args.position_nmea = "none"
+            nav_only_args.nav_only = True
+            nav_only_args.raw_output = "none"
+            started = time.perf_counter()
+            logging.info("pipeline step extract_rover_nav: extract rover NAV sidecars")
+            cmd_rinex(nav_only_args)
+            _record_pipeline_step(
+                args,
+                "extract_rover_nav",
+                inputs=[args.rover_log],
+                outputs=rover_nav_outputs,
+                status="generated",
+                elapsed_s=time.perf_counter() - started,
+            )
+    if getattr(args, "only_step", None) == "extract_rover_nav":
+        return 0
+    if _should_run_pipeline_step(args, "resolve_base"):
+        base_obs = []
+        resolve_status: str = "generated"
+        base_obs_list_path = _base_obs_list_path(out_dir, base)
+        if (
+            getattr(args, "skip_existing", False)
+            and not _forced_step(args, "resolve_base")
+            and base_obs_list_path.exists()
+        ):
+            logging.info("pipeline step resolve_base: reusing existing base observation list")
+            try:
+                base_obs = _read_path_list(base_obs_list_path)
+                resolve_status = "skipped"
+            except Exception:
+                logging.warning("failed to read existing base observation list, re-resolving: %s", base_obs_list_path)
+                base_obs = _download_base_files(args)
+        else:
+            base_obs = _download_base_files(args)
+            base_obs_list_path.write_text("\n".join(str(item) for item in base_obs) + ("\n" if base_obs else ""), encoding="utf-8")
+            logging.info("pipeline step resolve_base: wrote %d base observation paths", len(base_obs))
+
+        if getattr(args, "only_step", None) == "resolve_base":
+            _record_pipeline_step(
+                args,
+                "resolve_base",
+                inputs=[rover_obs],
+                outputs=[base_obs_list_path],
+                status="generated" if resolve_status != "skipped" else "skipped",
+                reused=resolve_status == "skipped",
+            )
+            return 0
+
+        if not base_obs and getattr(args, "download_base", False):
+            logging.warning("resolve_base did not select any base observations")
+        elif not base_obs:
+            logging.info("resolve_base produced no base observations; continuing with explicit base inputs if any")
+        _record_pipeline_step(
+            args,
+            "resolve_base",
+            inputs=[rover_obs],
+            outputs=[base_obs_list_path],
+            status=resolve_status,
+            reused=resolve_status == "skipped",
+            elapsed_s=0.0,
+        )
+        base_obs = [Path(item) for item in base_obs]
     if getattr(args, "only_step", None) == "quality":
         setattr(args, "quality_analyze", True)
         _run_quality_analysis_if_requested(args, out_dir, base, [], base_ecef=None, base_llh=None)
         _record_pipeline_step(args, "quality", inputs=[_rtklib_output_file(out_dir, base, _rtklib_output_formats(args)[0])], outputs=[out_dir / f"{base}-rtk.quality.json"], status="generated")
         return 0
-    base_obs = [Path(item) for item in args.base_obs or []]
+    if not _should_run_pipeline_step(args, "resolve_base"):
+        base_obs = [Path(item) for item in args.base_obs or []]
+        if getattr(args, "base_obs_list", None):
+            base_obs.extend(_read_path_list(Path(args.base_obs_list)))
+    converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
     converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
     base_obs.extend(converted_base_obs)
     if args.station and args.download_base:
@@ -4190,10 +4446,11 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--raw-output", choices=["none", "ascii", "binary", "all"], default="none")
             p.add_argument("--rinex-version", default="3.04")
             p.add_argument("--rinex-compat", choices=["native", "convbin"], default="native")
+            p.add_argument("--nav-only", action="store_true", help="Generate only rover NAV sidecars and skip solution output.")
             if name == "extract":
                 _add_bestnav_nmea_args(p)
         if name == "nav":
-            p.set_defaults(func=func, solution="none", position_nmea="none")
+            p.set_defaults(func=func, solution="none", position_nmea="none", nav_only=True)
         else:
             p.set_defaults(func=func)
 
@@ -4286,7 +4543,11 @@ def build_parser() -> argparse.ArgumentParser:
     for base_step in ("download-base", "resolve-base"):
         dl = sub.add_parser(base_step)
         dl.add_argument("rover_log")
-        _add_base_download_args(dl, require_station=base_step == "download-base")
+        _add_base_download_args(
+            dl,
+            require_station=base_step == "download-base",
+            include_base_obs_list=base_step == "resolve-base",
+        )
         if base_step == "resolve-base":
             dl.add_argument("--base-obs", action="append", help="Explicit base observation file to return for composed runs.")
             dl.add_argument("--base-rtcm", help="Explicit base RTCM file to return for composed runs.")
