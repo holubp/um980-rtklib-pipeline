@@ -490,7 +490,7 @@ reported as emission.
 Verbose runs also create reproducibility artifacts by default unless disabled
 with `--no-emit-run-script`:
 
-- `<out_dir>/<basename>.rerun.sh`
+- `<out_dir>/<basename>-rerun.sh`
 - `<out_dir>/<basename>.commands.md`
 
 The files are appended as commands become known, so they are still useful after
@@ -867,10 +867,10 @@ RTKLIB. Use `--from-step STEP`, `--only-step STEP`, `--skip-existing`, and
 Generated rerun scripts support:
 
 ```bash
-./run.rerun.sh all
-./run.rerun.sh only write_rinex_obs
-./run.rerun.sh from run_rtklib
-./run.rerun.sh quality
+./<basename>-rerun.sh all
+./<basename>-rerun.sh only write_rinex_obs
+./<basename>-rerun.sh from run_rtklib
+./<basename>-rerun.sh quality
 ```
 
 Standalone step commands are available as `parse-rover`, `extract`, `rinex`,

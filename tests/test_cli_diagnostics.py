@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -382,14 +383,16 @@ def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     cli._init_rerun_artifacts(args, tmp_path, "rover")
     cli._append_rerun_command(args, "Standalone quality", ["python", "-m", "um980_rtklib_pipeline.cli", "quality", "--solution", "a b.pos"])
 
-    script = (tmp_path / "rover.rerun.sh").read_text(encoding="utf-8")
+    script = (tmp_path / "rover-rerun.sh").read_text(encoding="utf-8")
     markdown = (tmp_path / "rover.commands.md").read_text(encoding="utf-8")
     assert "set -euo pipefail" in script
     assert "run_step()" in script
     assert "usage: $0 [all|quality|only STEP|from STEP]" in script
+    assert "_ \"${EXTRA_ARGS[@]}\"" in script
     assert "'rover file.ubx'" in script
     assert "'a b.pos'" in script
     assert "Standalone quality" in markdown
+    assert subprocess.run(["bash", "-n", str(tmp_path / "rover-rerun.sh")], check=False).returncode == 0
 
 
 def test_canonical_step_aliases_accept_window_and_step_controls() -> None:

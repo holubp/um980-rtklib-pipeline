@@ -822,7 +822,7 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
     if not _rerun_enabled(args):
         return
     requested = getattr(args, "emit_run_script", None)
-    script = out_dir / f"{basename}.rerun.sh" if requested in {None, "auto"} else Path(requested)
+    script = out_dir / f"{basename}-rerun.sh" if requested in {None, "auto"} else Path(requested)
     commands_md = out_dir / f"{basename}.commands.md"
     setattr(args, "_rerun_script", script)
     setattr(args, "_commands_md", commands_md)
@@ -832,9 +832,36 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         f"# Working directory: {Path.cwd()}",
+        'usage() {',
+        '  echo "usage: $0 [all|quality|only STEP|from STEP] [--start-time T --end-time T] [additional step args...]" >&2',
+        "  exit 2",
+        "}",
         'REQUEST_MODE="${1:-all}"',
-        'REQUEST_STEP="${2:-}"',
+        'REQUEST_STEP=""',
         "STARTED_FROM=0",
+        "case \"$REQUEST_MODE\" in",
+        "  all|quality)",
+        "    shift || true",
+        "    ;;",
+        "  only|from)",
+        "    REQUEST_STEP=\"${2:-}\"",
+        "    if [ -z \"$REQUEST_STEP\" ]; then",
+        "      usage",
+        "    fi",
+        "    shift 2 || true",
+        "    ;;",
+        "  \"\")",
+        "    REQUEST_MODE=all",
+        "    ;;",
+        "  --*)",
+        "    REQUEST_MODE=all",
+        "    ;;",
+        "  *)",
+        "    usage",
+        "    ;;",
+        "esac",
+        "",
+        'EXTRA_ARGS=("$@")',
         "run_step() {",
         '  step="$1"',
         "  shift",
@@ -862,12 +889,18 @@ def _append_rerun_command(args: argparse.Namespace, title: str, command: list[st
     script = getattr(args, "_rerun_script", None)
     commands_md = getattr(args, "_commands_md", None)
     rendered = command if isinstance(command, str) else _quote_command([str(item) for item in command])
+    if " > " in str(rendered):
+        left, right = rendered.rsplit(" > ", 1)
+        rendered = f"{left} \"$@\" > {right}"
+    else:
+        rendered = f"{rendered} \"$@\""
     if getattr(args, "print_step_commands", False) or getattr(args, "verbose", False):
         logging.info("%s: %s", title, rendered)
     if script:
         step = _rerun_step_name(title)
         Path(script).write_text(
-            Path(script).read_text(encoding="utf-8") + f"# {title}\nrun_step {shlex.quote(step)} sh -c {shlex.quote(rendered)}\n\n",
+            Path(script).read_text(encoding="utf-8")
+            + f'# {title}\nrun_step {shlex.quote(step)} sh -c {shlex.quote(rendered)} _ "${{EXTRA_ARGS[@]}}"' + "\n\n",
             encoding="utf-8",
         )
     if commands_md:
@@ -2411,7 +2444,7 @@ def _quality_rerun_command(args: argparse.Namespace, solution: Path, stat: Path 
         command.extend(["--stat", str(stat)])
 
     # Prefer an explicitly supplied trace, otherwise include RTKLIB's default
-    # `<solution>.trace` when it exists.  This makes rerun.sh capable of
+    # `<solution>.trace` when it exists.  This makes rerun commands capable of
     # reproducing trace-aware QC without rerunning RTKLIB.
     trace_path: Path | None = None
     if getattr(args, "trace", None):
