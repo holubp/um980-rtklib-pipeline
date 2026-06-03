@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -393,6 +394,87 @@ def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     assert "'a b.pos'" in script
     assert "Standalone quality" in markdown
     assert subprocess.run(["bash", "-n", str(tmp_path / "rover-rerun.sh")], check=False).returncode == 0
+
+
+def test_rerun_script_modes_execute_expected_steps_with_fake_python(tmp_path: Path) -> None:
+    rover = tmp_path / "rover.ubx"
+    rover.write_bytes(b"\n")
+    out_dir = tmp_path / "out"
+    log = tmp_path / "fake-python.log"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$UM980_FAKE_PYTHON_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["UM980_FAKE_PYTHON_LOG"] = str(log)
+
+    rc = cli.main(
+        [
+            "pipeline",
+            str(rover),
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "run",
+        "--run-rtklib",
+        "--rtkconf",
+        "cfg.conf",
+        "--quality-analyze",
+        "--quality-trace",
+        "temporary",
+        "--emit-run-script",
+        "auto",
+        "--start-time",
+        "2026-05-30T05:00:00Z",
+        "--end-time",
+        "2026-05-30T05:01:00Z",
+            "--dry-run-plan",
+        ]
+    )
+    assert rc == 0
+
+    script = out_dir / "run-rerun.sh"
+    assert script.exists()
+    script.chmod(0o755)
+
+    def _invoke(mode: str, *extra: str) -> list[str]:
+        log.unlink(missing_ok=True)
+        command = [str(script), mode, *extra]
+        subprocess.run(command, cwd=out_dir, env=env, check=False, text=True)
+        lines = [line.strip() for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        subcommands: list[str] = []
+        for line in lines:
+            parts = line.split()
+            if "um980_rtklib_pipeline.cli" in parts:
+                idx = parts.index("um980_rtklib_pipeline.cli")
+                if idx + 1 < len(parts):
+                    subcommands.append(parts[idx + 1])
+        return subcommands
+
+    all_steps = _invoke("all")
+    assert all_steps == [
+        "extract",
+        "rinex",
+        "resolve-base",
+        "run-rtklib",
+        "quality",
+        "cleanup",
+    ]
+
+    quality_only = _invoke("only", "quality")
+    assert quality_only == ["quality"]
+
+    from_rtklib = _invoke("from", "run_rtklib")
+    assert from_rtklib == ["run-rtklib", "quality", "cleanup"]
 
 
 def test_canonical_step_aliases_accept_window_and_step_controls() -> None:

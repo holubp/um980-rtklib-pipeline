@@ -875,8 +875,8 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
         "}",
     ]
     if original:
-        header.append("# Original command:")
-        header.append(_quote_command(["PYTHONPATH=src", "python", "-m", "um980_rtklib_pipeline.cli", *original]))
+        original_cmd = ["PYTHONPATH=src", "python", "-m", "um980_rtklib_pipeline.cli", *original]
+        header.append(f"# Original command: {_quote_command(original_cmd)}")
     script.write_text("\n".join(header) + "\n\n", encoding="utf-8")
     commands_md.write_text("# Reproducible Run Commands\n\n", encoding="utf-8")
     logging.info("rerun script: %s", script)
@@ -912,6 +912,8 @@ def _append_rerun_command(args: argparse.Namespace, title: str, command: list[st
 
 def _rerun_step_name(title: str) -> str:
     lowered = title.lower()
+    if "cleanup" in lowered:
+        return "cleanup"
     if "quality" in lowered:
         return "quality"
     if "rtklib" in lowered:
