@@ -15,6 +15,7 @@ from .obs_decode import ObservationExtraction
 from .rinex_nav import NavExtractionReport
 from .solution import SolutionExtraction
 from .stream import StreamDiagnostics
+from .time_window import ProcessingWindow
 from .timeutil import gps_week_tow_to_utc_datetime
 
 QUALITY_ORDER = ("fixed", "float", "dgps", "single", "invalid", "unknown")
@@ -167,6 +168,7 @@ class QualityAnalysis:
             route_bins = self.route_bins
         return {
             "inputs": self.inputs,
+            "effective_processing_window": self.inputs.get("effective_processing_window"),
             "parser_coverage": self.parser_coverage,
             "time_summary": self.time_summary,
             "distance_summary": self.distance_summary,
@@ -345,6 +347,7 @@ def analyze_rtk_quality(
     fast: bool = False,
     base_ecef_xyz_m: tuple[float, float, float] | None = None,
     base_llh: tuple[float, float, float] | None = None,
+    processing_window: ProcessingWindow | None = None,
 ) -> QualityAnalysis:
     """Analyse RTKLIB solution quality from `.nmea`/`.pos` and optional `.stat`.
 
@@ -362,7 +365,17 @@ def analyze_rtk_quality(
     epochs, solution_warnings, solution_type = parse_solution_epochs(solution_path)
     solution_parse_elapsed_s = time.perf_counter() - solution_parse_started
     stat = parse_stat_file(stat_path, max_lines=stat_max_lines, max_seconds=stat_max_seconds, fast=fast) if stat_path and not fast else None
+    window = processing_window or ProcessingWindow()
+    original_solution_epoch_count = len(epochs)
+    if window.enabled:
+        epochs = [epoch for epoch in epochs if window.contains(epoch.time)]
+        if stat is not None:
+            stat = _filter_stat_accumulator(stat, window)
     warnings = [*solution_warnings]
+    if window.enabled:
+        warnings.append(
+            f"quality solution epochs filtered by processing window: kept {len(epochs)} of {original_solution_epoch_count}"
+        )
     if stat_path and stat is None:
         if fast:
             warnings.append("quality-fast enabled; STAT parsing and detailed residual/slip QC were skipped")
@@ -387,6 +400,10 @@ def analyze_rtk_quality(
     dropout = _dropout_reacquisition_summary(epochs, segments, limits)
     trace_align_started = time.perf_counter()
     aligned_trace = _align_trace_summary(trace_summary, epoch_index, limits.trace_align_tolerance_s)
+    if window.enabled and isinstance(aligned_trace, dict) and aligned_trace.get("available"):
+        aligned_trace["window_applied"] = True
+        aligned_trace["full_trace_parsed"] = True
+        aligned_trace["window"] = window.to_json()
     trace_align_elapsed_s = time.perf_counter() - trace_align_started
     suspicion = _false_fix_suspicion(segments, epochs, stat, transitions, residuals, slips, aligned_trace, limits)
     base_position = _base_position_llh(base_ecef_xyz_m=base_ecef_xyz_m, base_llh=base_llh)
@@ -463,6 +480,10 @@ def analyze_rtk_quality(
             "stat_max_lines": stat_max_lines,
             "stat_max_seconds": stat_max_seconds,
             "quality_fast": fast,
+            "quality_window_applied": window.enabled,
+            "start_time": window.start_time_utc.isoformat() if window.start_time_utc else None,
+            "end_time": window.end_time_utc.isoformat() if window.end_time_utc else None,
+            "effective_processing_window": window.to_json(),
             "base_ecef_xyz_m": base_ecef_xyz_m,
             "base_llh": base_llh,
         },
@@ -2287,6 +2308,45 @@ def _transition_jump_item(left: SolutionEpoch, right: SolutionEpoch, segment_sta
         "vertical_m": vertical,
         "motion_anomaly": anomaly,
     }
+
+
+def _filter_stat_accumulator(stat: _StatAccumulator, window: ProcessingWindow) -> _StatAccumulator:
+    """Return STAT evidence restricted to `window` while preserving parser coverage."""
+
+    if not window.enabled:
+        return stat
+    filtered_residuals = {time: value for time, value in stat.residuals_by_time.items() if window.contains(time)}
+    carrier: list[float] = []
+    code: list[float] = []
+    for values in filtered_residuals.values():
+        carrier.extend(values.get("carrier", []))
+        code.extend(values.get("code", []))
+    filtered_slip_events = {event for event in stat.slip_events if window.contains(event[0])}
+    filtered_rejections_by_time = {time: count for time, count in stat.rejections_by_time.items() if window.contains(time)}
+    return _StatAccumulator(
+        stat_lines=stat.stat_lines,
+        sat_lines=stat.sat_lines,
+        parsed_sat_lines=stat.parsed_sat_lines,
+        unparsed_sat_lines=stat.unparsed_sat_lines,
+        carrier_residual_abs_m=carrier,
+        code_residual_abs_m=code,
+        slip_times=[time for time in stat.slip_times if window.contains(time)],
+        slip_events=filtered_slip_events,
+        slip_count=len(filtered_slip_events),
+        rejected_count=sum(filtered_rejections_by_time.values()),
+        used_counts_by_time={time: count for time, count in stat.used_counts_by_time.items() if window.contains(time)},
+        snr_values_by_time={time: values for time, values in stat.snr_values_by_time.items() if window.contains(time)},
+        residuals_by_time=filtered_residuals,
+        top_residuals_by_sat=dict(stat.top_residuals_by_sat),
+        slips_by_sat=dict(stat.slips_by_sat),
+        rejections_by_sat=dict(stat.rejections_by_sat),
+        rejections_by_time=filtered_rejections_by_time,
+        parse_elapsed_s=stat.parse_elapsed_s,
+        truncated=stat.truncated,
+        truncate_reason=stat.truncate_reason,
+        max_lines=stat.max_lines,
+        max_seconds=stat.max_seconds,
+    )
 
 
 def _residual_summary(stat: _StatAccumulator | None, epoch_index: EpochIndex) -> dict[str, object]:

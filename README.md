@@ -494,11 +494,12 @@ with `--no-emit-run-script`:
 - `<out_dir>/<basename>.commands.md`
 
 The files are appended as commands become known, so they are still useful after
-partial failures. They include the original high-level command, the exact
-RTKLIB wrapper invocation, and the standalone quality-analysis command. Use
-`--print-step-commands` to log copy-paste commands during the run, or
-`--emit-run-script PATH` to choose a script path explicitly. `--dry-run-plan`
-generates the plan and RTKLIB wrapper commands without running RTKLIB.
+partial failures. They include the original high-level command, canonical
+extract/RINEX commands, the exact RTKLIB wrapper invocation, and the standalone
+quality-analysis command. Use `--print-step-commands` to log copy-paste
+commands during the run, or `--emit-run-script PATH` to choose a script path
+explicitly. `--dry-run-plan` generates the plan and RTKLIB wrapper commands
+without running RTKLIB.
 
 RTK2Go and other public casters are treated as generic NTRIP casters. To inspect
 a caster without adding RTK2Go-specific assumptions:
@@ -850,16 +851,56 @@ expose the same core metrics through `route_bins`.
 
 Verbose pipeline runs write `<basename>.pipeline-manifest.json` alongside the
 rerun shell script and command Markdown. The manifest records planned and
-completed steps, inputs, outputs, dependencies, elapsed time, and whether an
-output was reused. The current safe step boundaries are:
+completed steps, inputs, outputs, dependencies, elapsed time, cache metadata,
+the effective processing window, and whether an output was reused. The
+canonical step vocabulary is:
 
 ```text
-extract_receiver_products, write_rinex_obs, resolve_base, run_rtklib, quality
+parse_rover, extract_receiver_products, write_rinex_obs, extract_rover_nav,
+resolve_base, run_rtklib, quality, cleanup
 ```
 
 Use `--dry-run-plan` to write the manifest without parsing the rover or running
 RTKLIB. Use `--from-step STEP`, `--only-step STEP`, `--skip-existing`, and
 `--force-step STEP` to reuse existing products at those command boundaries.
+Generated rerun scripts support:
+
+```bash
+./run.rerun.sh all
+./run.rerun.sh only write_rinex_obs
+./run.rerun.sh from run_rtklib
+./run.rerun.sh quality
+```
+
+Standalone step commands are available as `parse-rover`, `extract`, `rinex`,
+`nav`, `resolve-base`/`download-base`, `run-rtklib`/`postprocess`, `quality`,
+and `cleanup`. Step commands accept the same `--start-time`/`--end-time`,
+`--out-dir`, `--basename`, `--manifest`, `--skip-existing`, and `--force`
+controls where applicable.
+
+### Processing Windows
+
+`--start-time` and `--end-time` select one inclusive UTC processing window.
+Timezone-aware ISO-8601 values are normalised to UTC; naive values are treated
+as UTC. The same window is applied to all timestamped products. Initial UM980
+stream parsing may read the full input so binary/ASCII framing and navigation
+context remain intact, but downstream solution exports, raw observations,
+RINEX OBS, RTKLIB processing inputs, `.stat` evidence, trace alignment, and
+quality reports are windowed.
+
+One-shot and composed workflows should therefore use the same window:
+
+```bash
+um980-ppk pipeline rover.ubx --start-time 2026-05-30T05:00:00Z --end-time 2026-05-30T05:01:00Z ...
+
+um980-ppk extract rover.ubx --start-time 2026-05-30T05:00:00Z --end-time 2026-05-30T05:01:00Z ...
+um980-ppk rinex rover.ubx --start-time 2026-05-30T05:00:00Z --end-time 2026-05-30T05:01:00Z ...
+um980-ppk quality --solution run-rtk.nmea --stat run-rtk.nmea.stat --start-time 2026-05-30T05:00:00Z --end-time 2026-05-30T05:01:00Z ...
+```
+
+Manifests and quality/extraction JSON include `inputs.start_time`,
+`inputs.end_time`, and `effective_processing_window` so equivalence checks can
+confirm the selected window.
 
 ### UM980 Stream Parser API
 

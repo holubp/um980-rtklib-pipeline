@@ -18,6 +18,7 @@ from um980_rtklib_pipeline.quality import (
     parse_solution_epochs,
     parse_stat_file,
 )
+from um980_rtklib_pipeline.time_window import processing_window_from_values
 from um980_rtklib_pipeline.timeutil import gps_week_tow_to_utc_datetime
 
 
@@ -491,6 +492,25 @@ def test_track_consistency_not_computed_uses_null_status(tmp_path: Path):
     assert status["status"] in {"ok", "warning", "suspect", "not_computed"}
     if status["status"] == "not_computed":
         assert status["score"] is None
+
+
+def test_quality_analysis_filters_solution_to_processing_window(tmp_path: Path):
+    solution = tmp_path / "window.pos"
+    solution.write_text(
+        "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 18\n"
+        "2026/05/30 05:00:01.000 50.000100 14.000000 250.0 1 18\n"
+        "2026/05/30 05:00:02.000 50.000200 14.000000 250.0 2 18\n",
+        encoding="ascii",
+    )
+    window = processing_window_from_values("2026-05-30T05:00:01Z", "2026-05-30T05:00:02Z")
+
+    data = analyze_rtk_quality(solution_path=solution, processing_window=window).as_dict()
+
+    assert data["inputs"]["quality_window_applied"] is True
+    assert data["parser_coverage"]["solution_epochs"] == 2
+    assert data["time_summary"]["quality_time_s"]["fixed"] == 1.0
+    assert data["time_summary"]["quality_time_s"]["float"] == 0.0
+    assert data["effective_processing_window"]["start_time"] == "2026-05-30T05:00:01+00:00"
 
 
 def test_large_stat_slip_summary_uses_deduplicated_epoch_alignment(tmp_path: Path):

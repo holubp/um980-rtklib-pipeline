@@ -241,6 +241,36 @@ def test_quality_detail_outputs_are_explicit(tmp_path: Path) -> None:
     assert segments_jsonl.exists()
 
 
+def test_quality_cli_accepts_time_window(tmp_path: Path) -> None:
+    solution = tmp_path / "run.pos"
+    out_json = tmp_path / "quality.json"
+    solution.write_text(
+        "2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n"
+        "2026/05/30 05:00:01.000 50.000100 14.000000 250.0 1 16\n"
+        "2026/05/30 05:00:02.000 50.000200 14.000000 250.0 2 16\n",
+        encoding="ascii",
+    )
+
+    rc = cli.main(
+        [
+            "quality",
+            "--solution",
+            str(solution),
+            "--start-time",
+            "2026-05-30T05:00:01Z",
+            "--end-time",
+            "2026-05-30T05:00:02Z",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+
+    assert rc == 0
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert data["inputs"]["quality_window_applied"] is True
+    assert data["parser_coverage"]["solution_epochs"] == 2
+
+
 def test_quality_compare_subcommand_outputs_multiple_comparisons(tmp_path: Path, capsys) -> None:
     reports = []
     for index, fixed_km in enumerate((1.0, 0.5, 2.0)):
@@ -289,6 +319,8 @@ def test_quality_rerun_command_includes_trace_and_base_options(tmp_path: Path) -
         quality_motion_profile="auto",
         quality_route_bin_km=10.0,
         quality_fast=False,
+        start_time="2026-05-30T05:00:00Z",
+        end_time="2026-05-30T05:01:00Z",
     )
 
     command = cli._quality_rerun_command(args, solution, None, json_path, md_path)
@@ -299,12 +331,28 @@ def test_quality_rerun_command_includes_trace_and_base_options(tmp_path: Path) -
     assert "--quality-trace-max-bytes" in command
     assert "--quality-trace-align-tolerance-s" in command
     assert "--base-llh" in command
+    assert "--start-time" in command
+    assert "--end-time" in command
 
 
 def test_pipeline_dry_run_plan_writes_manifest_without_rover_parse(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
 
-    rc = cli.main(["pipeline", str(tmp_path / "missing.ubx"), "--out-dir", str(out_dir), "--basename", "run", "--dry-run-plan"])
+    rc = cli.main(
+        [
+            "pipeline",
+            str(tmp_path / "missing.ubx"),
+            "--out-dir",
+            str(out_dir),
+            "--basename",
+            "run",
+            "--start-time",
+            "2026-05-30T05:00:00Z",
+            "--end-time",
+            "2026-05-30T05:01:00Z",
+            "--dry-run-plan",
+        ]
+    )
 
     assert rc == 0
     manifest = out_dir / "run.pipeline-manifest.json"
@@ -315,6 +363,10 @@ def test_pipeline_dry_run_plan_writes_manifest_without_rover_parse(tmp_path: Pat
         "write_rinex_obs",
         "resolve_base",
     ]
+    assert data["inputs"]["start_time"] == "2026-05-30T05:00:00+00:00"
+    assert data["effective_processing_window"]["source"] == "cli"
+    assert all(step["processing_window"]["start_time"] == "2026-05-30T05:00:00+00:00" for step in data["steps"])
+    assert "--start-time 2026-05-30T05:00:00+00:00" in data["steps"][0]["command"]
 
 
 def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
@@ -333,6 +385,39 @@ def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     script = (tmp_path / "rover.rerun.sh").read_text(encoding="utf-8")
     markdown = (tmp_path / "rover.commands.md").read_text(encoding="utf-8")
     assert "set -euo pipefail" in script
+    assert "run_step()" in script
+    assert "usage: $0 [all|quality|only STEP|from STEP]" in script
     assert "'rover file.ubx'" in script
     assert "'a b.pos'" in script
     assert "Standalone quality" in markdown
+
+
+def test_canonical_step_aliases_accept_window_and_step_controls() -> None:
+    parser = cli.build_parser()
+
+    parse_args = parser.parse_args(
+        [
+            "parse-rover",
+            "rover.ubx",
+            "--start-time",
+            "2026-05-30T05:00:00Z",
+            "--end-time",
+            "2026-05-30T05:01:00Z",
+            "--manifest",
+            "run.pipeline-manifest.json",
+            "--skip-existing",
+            "--force",
+        ]
+    )
+    nav_args = parser.parse_args(["nav", "rover.ubx", "--out-dir", "out", "--basename", "run"])
+    resolve_args = parser.parse_args(["resolve-base", "rover.ubx", "--station", "TUBO"])
+    run_args = parser.parse_args(["run-rtklib", "rover.ubx", "--rover-obs", "rover.obs", "--start-time", "2026-05-30T05:00:00Z"])
+    cleanup_args = parser.parse_args(["cleanup", "--manifest", "run.pipeline-manifest.json"])
+
+    assert parse_args.manifest == "run.pipeline-manifest.json"
+    assert parse_args.skip_existing is True
+    assert parse_args.force is True
+    assert nav_args.solution == "none"
+    assert resolve_args.station == "TUBO"
+    assert run_args.start_time == "2026-05-30T05:00:00Z"
+    assert cleanup_args.func is cli.cmd_cleanup

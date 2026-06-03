@@ -108,6 +108,11 @@
 - Pipeline reproducibility artifacts must remain append-only and useful after
   partial runs: rerun scripts, commands Markdown, and pipeline manifests should
   record the exact step commands and whether outputs were reused.
+- Pipeline time-window handling must use one canonical `ProcessingWindow`.
+  One-shot pipeline commands, composed step commands, standalone `quality`, and
+  generated rerun scripts must carry the same `--start-time/--end-time` values,
+  and timestamped downstream products must be windowed even if the initial
+  UM980 stream parse reads the full file for context.
 - The public UM980 stream API is `um980_rtklib_pipeline.um980_stream`; keep it
   stable for external tooling and classify command responses separately from
   NMEA, Unicore ASCII, Unicore binary, and noise records.
