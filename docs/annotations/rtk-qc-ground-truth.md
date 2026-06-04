@@ -12,17 +12,17 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### Codex/GPT Generated Annotation
 
 - Recording ID: `rover_20260530050210`
-- Expected context: Moto route with substantial forest/canopy. Expected weak and fragmented fixed coverage, high diagnostic stress, and non-highway motion profile.
-- Annotation status: needs-user-review
+- Expected context: Moto route with substantial forest/canopy in the middle. Beginning and end is a typical town/city driving situation. In the middle part, expected weak and fragmented fixed coverage, high diagnostic stress, and non-highway motion profile.
+- Annotation status: user-reviewed
 <!-- codex-generated:end recording=rover_20260530050210 -->
 
 <!-- user-annotation:start recording=rover_20260530050210 -->
 ### User Subjective Annotation
 
 - Annotation kind: recording
-- Actual capture conditions:
-- In-device solution quality:
-- RTKLIB solution quality:
+- Actual capture conditions: Moto riding with GPS antenna hosted in the top pocket of a backpack. Town/city conditions are standard, no extremely high building, no extreme terrain but also not flat. Forest riding in hilly terrain and medium to dense forest vegetation.
+- In-device solution quality: Decent on during open sky, acceptable in the forest - sometimes the shape of the track is good but it's actual position is sometimes off.
+- RTKLIB solution quality: not-available
 - Map/trajectory observations:
 - Reviewer/date:
 - Notes:
@@ -86,7 +86,7 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: recording
-- Actual capture conditions:
+- Actual capture conditions: GPS antenna hosted in the top pocket of a backpack.
 - In-device solution quality:
 - RTKLIB solution quality:
 - Map/trajectory observations:
@@ -104,10 +104,10 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Segment ID: `30050210-051014-051130`
 - Recording ID: `rover_20260530050210`
 - Time window UTC: `2026-05-30T05:10:14Z` to `2026-05-30T05:11:30Z`
-- Label: reasonably open view
+- Label: reasonably open view, town/city driving with smaller buildings, mildly hilly
 - Expected context: Reasonably open view with no major obstruction or canopy; useful as an in-device open-view reference.
 - GPX in-device track: `30050210-051014-051130 in-device`
-- Annotation status: needs-user-review
+- Annotation status: user-reviewed
 <!-- codex-generated:end segment=30050210-051014-051130 -->
 
 <!-- user-annotation:start segment=30050210-051014-051130 -->
@@ -130,18 +130,18 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Segment ID: `30050210-052000-052600`
 - Recording ID: `rover_20260530050210`
 - Time window UTC: `2026-05-30T05:20:00Z` to `2026-05-30T05:26:00Z`
-- Label: weak/provisional forest moto
-- Expected context: Weak/provisional forest moto segment; expected fragmented fixed and stressed diagnostics.
+- Label: weak/provisional forest moto with some scrub segments
+- Expected context: Weak/provisional forest moto segment with some straight scrub/grass segment wiht potential to provide significantly better solution than the rest; expected fragmented fixed and stressed diagnostics.
 - GPX in-device track: `30050210-052000-052600 in-device`
-- Annotation status: needs-user-review
+- Annotation status: user reviewed
 <!-- codex-generated:end segment=30050210-052000-052600 -->
 
 <!-- user-annotation:start segment=30050210-052000-052600 -->
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Actual capture conditions:
-- In-device solution quality:
+- Actual capture conditions: GPS antenna in the top pocket of a backpack. Steep hilly terrain with lot of leaf trees coverage.
+- In-device solution quality: Surprisignly good.
 - RTKLIB solution quality:
 - Map/trajectory observations:
 - Reviewer/date:
@@ -156,18 +156,18 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Segment ID: `30050210-062052-062203`
 - Recording ID: `rover_20260530050210`
 - Time window UTC: `2026-05-30T06:20:52Z` to `2026-05-30T06:22:03Z`
-- Label: reasonably open view
-- Expected context: Reasonably open view with no major obstruction or canopy; useful as a second open-view reference.
+- Label: reasonably open view, town/city driving with smaller buildings, mildly hilly
+- Expected context: Reasonably open view with no major obstruction or canopy; useful as as a second open-view reference.
 - GPX in-device track: `30050210-062052-062203 in-device`
-- Annotation status: needs-user-review
+- Annotation status: user-reviewed
 <!-- codex-generated:end segment=30050210-062052-062203 -->
 
 <!-- user-annotation:start segment=30050210-062052-062203 -->
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Actual capture conditions: User note: reasonably open view, no major obstructions and no canopy.
-- In-device solution quality:
+- Actual capture conditions: reasonably open view, no major obstructions and no canopy.
+- In-device solution quality: Reasonable, but some shifts perhaps due to multipath caused by buildings
 - RTKLIB solution quality:
 - Map/trajectory observations:
 - Reviewer/date:
