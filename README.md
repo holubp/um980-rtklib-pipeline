@@ -612,6 +612,51 @@ continues recording failed variants instead of claiming success. It does not
 mutate arbitrary RTKLIB options or run high RTKLIB trace unless the underlying
 pipeline command is extended to do so.
 
+## Manual Annotation GPX
+
+Use `annotation-gpx` to prepare manual review material for selected validation
+regions. The command writes two outputs:
+
+- a simple GPX 1.1 file for JOSM or other map tools;
+- one human-editable Markdown annotation file.
+
+The GPX intentionally contains no custom namespaces or GPX extensions. It keeps
+sub-second UTC timestamps so multi-Hz receiver tracks remain inspectable, but it
+can reveal private route geometry and should stay local. Generated annotation
+GPX filenames such as `*.annotation.gpx` are ignored by Git.
+
+The Markdown file is the canonical annotation store and may be committed. It
+separates ownership explicitly:
+
+- **Codex/GPT Generated Annotation** sections contain expected context,
+  generated metadata and GPX track names. The tool may replace these sections
+  on rerun.
+- **User Subjective Annotation** sections are for manual ground truth notes.
+  The tool creates missing placeholders but does not rewrite non-empty user
+  annotation blocks.
+
+Initial in-device-only review:
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli annotation-gpx \
+  examples-private/rover_20260531063148.ubx \
+  --annotations docs/annotations/rtk-qc-ground-truth.md \
+  --out-gpx /data/data/com.termux/files/home/sdcard/GitHub/um980-rtklib-pipeline/annotations/rover_20260531063148.annotation.gpx \
+  --use-default-segments \
+  --track-source auto
+```
+
+Later, the same Markdown can be updated with RTKLIB base/config runs without
+touching existing user notes:
+
+```bash
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli annotation-gpx \
+  examples-private/rover_20260531063148.ubx \
+  --annotations docs/annotations/rtk-qc-ground-truth.md \
+  --out-gpx /data/data/com.termux/files/home/sdcard/GitHub/um980-rtklib-pipeline/annotations/rover_20260531063148.annotation.gpx \
+  --rtk-solution tubo-el28=outputs/rover_20260531063148-tubo-el28-rtk.nmea
+```
+
 ## RTK Quality Analysis
 
 Use `quality` to inspect a generated RTKLIB `.nmea`, `.pos`, or `.llh`
@@ -635,6 +680,14 @@ jumps; fixed-island cross-track offsets; stop drift/chatter; long stable fixed
 coverage; geometry-cost context; and trace-aligned AR/slip/rejection/residual
 evidence. Long smooth fixed segments are reported separately from short chattery
 fixed islands.
+
+The JSON report also includes a pass-aware moving-route layer when `.stat`
+evidence is available. `$POS` rows are deduplicated by processing pass so the
+report can distinguish both-pass fixed, forward-only fixed, backward-only
+fixed, pass disagreement, and forward/backward position deltas. `$SAT` rows
+separate raw slip flags from used-row slip and cumulative slip/rejection counter
+increments. Terminal stationary regions and middle stationary episodes are
+reported separately from the core moving-route headline.
 
 The Markdown report now starts its practical interpretation with **Usable Fixed
 Continuity**. This block answers how much fixed solution is available in long,

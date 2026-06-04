@@ -16,6 +16,16 @@ from datetime import timedelta
 from glob import glob
 from pathlib import Path
 
+from .annotation import (
+    DEFAULT_RECORDING_ANNOTATIONS,
+    DEFAULT_SEGMENT_ANNOTATIONS,
+    AnnotationTrack,
+    RecordingAnnotation,
+    RtkAnnotationRun,
+    parse_segment_arg,
+    update_annotation_markdown,
+    write_annotation_gpx,
+)
 from .badsat import BadSatConfig, choose_bad_sats, compute_sat_metrics, parse_rtklib_stat
 from .badsat_report import write_badsat_json_report, write_badsat_markdown_report
 from .base_rt import convert_rtcm_to_rinex, fetch_ntrip_sourcetable, record_ntrip_base
@@ -82,6 +92,7 @@ from .quality import (
     format_quality_comparison_markdown,
     format_quality_markdown,
     format_quality_text,
+    parse_solution_epochs,
     write_analysis_json,
     write_quality_json,
     write_quality_segments_jsonl,
@@ -871,6 +882,7 @@ def _init_rerun_artifacts(args: argparse.Namespace, out_dir: Path, basename: str
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         f"# Working directory: {Path.cwd()}",
+        f"cd {shlex.quote(str(Path.cwd()))}",
         'usage() {',
         '  echo "usage: $0 [all|quality|only STEP|from STEP] [--start-time T --end-time T] [additional step args...]" >&2',
         "  exit 2",
@@ -3570,6 +3582,188 @@ def cmd_quality_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_annotation_gpx(args: argparse.Namespace) -> int:
+    """Create or update manual annotation Markdown and a local GPX."""
+
+    _configure_cli_logging(args)
+    rover = Path(args.rover_log)
+    recording_id = getattr(args, "recording_id", None) or rover.stem
+    logging.info("building annotation tracks for recording_id=%s", recording_id)
+    records, _ = _load_records(rover)
+    solutions = extract_solutions(records, progress=logging.getLogger().isEnabledFor(logging.INFO))
+    bestnav = extract_bestnav_records(records)
+    track_source = getattr(args, "track_source", "auto")
+    if track_source in {"bestnav", "bestnavb"} or (
+        track_source == "auto" and not solutions.solution_points and bestnav.records
+    ):
+        bestnav_source = "binary" if track_source == "bestnavb" else "auto"
+        bestnav_solutions = bestnav_records_to_solution_extraction(
+            bestnav.records,
+            source=bestnav_source,
+            talk_id=getattr(args, "bestnav_nmea_talk_id", "GN"),
+        )
+        if bestnav_solutions.solution_points:
+            solutions = bestnav_solutions
+        elif track_source in {"bestnav", "bestnavb"}:
+            raise ValueError(f"--track-source {track_source} was requested but no valid BESTNAV solution epochs exist")
+    solutions = _filter_solution_extraction(solutions, _processing_window_from_args(args))
+    if not solutions.solution_points:
+        raise ValueError("no in-device solution points were decoded for annotation GPX generation")
+
+    recordings, segments = _annotation_inputs_from_args(args, recording_id)
+    rtk_runs = _parse_annotation_rtk_runs(getattr(args, "rtk_solution", None) or [])
+    annotation_path = Path(args.annotations)
+    existing = annotation_path.read_text(encoding="utf-8") if annotation_path.exists() else None
+    markdown = update_annotation_markdown(
+        existing,
+        recordings=recordings,
+        segments=segments,
+        rtk_runs=rtk_runs,
+        rtk_recording_id=recording_id if rtk_runs else None,
+    )
+    annotation_path.parent.mkdir(parents=True, exist_ok=True)
+    annotation_path.write_text(markdown, encoding="utf-8")
+
+    tracks = _build_annotation_tracks(recording_id, solutions.solution_points, segments, rtk_runs)
+    out_gpx = Path(args.out_gpx)
+    write_annotation_gpx(out_gpx, tracks)
+    logging.info("wrote annotation Markdown: %s", annotation_path)
+    logging.info("wrote local annotation GPX: %s", out_gpx)
+    if rtk_runs:
+        logging.info("included RTKLIB annotation run placeholders: %s", ", ".join(run.run_id for run in rtk_runs))
+    return 0
+
+
+def _annotation_inputs_from_args(
+    args: argparse.Namespace,
+    recording_id: str,
+) -> tuple[list[RecordingAnnotation], list]:
+    explicit_segments = [parse_segment_arg(value, recording_id=recording_id) for value in (getattr(args, "segment", None) or [])]
+    if getattr(args, "use_default_segments", False):
+        recordings = list(DEFAULT_RECORDING_ANNOTATIONS)
+        segments = list(DEFAULT_SEGMENT_ANNOTATIONS)
+    else:
+        default_recording = next((item for item in DEFAULT_RECORDING_ANNOTATIONS if item.recording_id == recording_id), None)
+        recordings = [
+            default_recording
+            or RecordingAnnotation(
+                recording_id=recording_id,
+                title=recording_id,
+                codex_context="User-selected recording for in-device solution annotation.",
+            )
+        ]
+        if explicit_segments:
+            segments = explicit_segments
+        else:
+            segments = [item for item in DEFAULT_SEGMENT_ANNOTATIONS if item.recording_id == recording_id]
+    segments.extend(item for item in explicit_segments if item not in segments)
+    if getattr(args, "segments_json", None):
+        segments.extend(_load_annotation_segments_json(Path(args.segments_json), recording_id=recording_id))
+    return recordings, segments
+
+
+def _load_annotation_segments_json(path: Path, *, recording_id: str) -> list:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("--segments-json must contain a list of segment objects")
+    segments = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("--segments-json entries must be objects")
+        segment_recording = str(item.get("recording_id") or recording_id)
+        value = ",".join(
+            [
+                str(item["id"]),
+                str(item["start_time"]),
+                str(item["end_time"]),
+                str(item.get("label") or item["id"]),
+            ]
+        )
+        segment = parse_segment_arg(value, recording_id=segment_recording)
+        if item.get("codex_context"):
+            segment = replace(segment, codex_context=str(item["codex_context"]))
+        segments.append(segment)
+    return segments
+
+
+def _parse_annotation_rtk_runs(values: list[str]) -> list[RtkAnnotationRun]:
+    runs: list[RtkAnnotationRun] = []
+    seen: set[str] = set()
+    for value in values:
+        if "=" not in value:
+            raise ValueError("--rtk-solution must have the form RUN_ID=PATH")
+        run_id, path_text = value.split("=", 1)
+        run_id = run_id.strip()
+        if not run_id:
+            raise ValueError("--rtk-solution RUN_ID must be non-empty")
+        if run_id in seen:
+            raise ValueError(f"duplicate --rtk-solution RUN_ID: {run_id}")
+        seen.add(run_id)
+        runs.append(RtkAnnotationRun(run_id=run_id, solution_path=Path(path_text)))
+    return runs
+
+
+def _build_annotation_tracks(
+    recording_id: str,
+    in_device_points: list[SolutionPoint],
+    segments,
+    rtk_runs: list[RtkAnnotationRun],
+) -> list[AnnotationTrack]:
+    tracks: list[AnnotationTrack] = [AnnotationTrack(f"00 whole in-device {recording_id}", in_device_points)]
+    rtk_points_by_run = {run.run_id: _load_rtk_solution_points(run.solution_path) for run in rtk_runs}
+    for segment in sorted(segments, key=lambda item: (item.recording_id, item.start_time, item.segment_id)):
+        if segment.recording_id != recording_id:
+            continue
+        tracks.append(
+            AnnotationTrack(
+                name=f"{segment.segment_id} in-device",
+                points=[
+                    point
+                    for point in in_device_points
+                    if segment.start_time <= point.time_utc.astimezone(segment.start_time.tzinfo) <= segment.end_time
+                ],
+                description=segment.label,
+            )
+        )
+        for run in rtk_runs:
+            tracks.append(
+                AnnotationTrack(
+                    name=f"{segment.segment_id} rtklib {run.run_id}",
+                    points=[
+                        point
+                        for point in rtk_points_by_run[run.run_id]
+                        if segment.start_time <= point.time_utc.astimezone(segment.start_time.tzinfo) <= segment.end_time
+                    ],
+                    description=segment.label,
+                )
+            )
+    return tracks
+
+
+def _load_rtk_solution_points(path: Path) -> list[SolutionPoint]:
+    epochs, warnings, _ = parse_solution_epochs(path)
+    for warning in warnings:
+        logging.warning("RTKLIB solution parse warning for %s: %s", path, warning)
+    points: list[SolutionPoint] = []
+    for epoch in epochs:
+        if epoch.lat is None or epoch.lon is None:
+            continue
+        points.append(
+            SolutionPoint(
+                time_utc=epoch.time,
+                source="GGA",
+                lat=epoch.lat,
+                lon=epoch.lon,
+                h_msl=epoch.height_m,
+                fix_quality=epoch.raw_quality if isinstance(epoch.raw_quality, int) else None,
+                fix_quality_text=epoch.quality,
+                num_sats=epoch.num_sats,
+                hdop=epoch.hdop,
+            )
+        )
+    return points
+
+
 def _time_window_from_solutions(args: argparse.Namespace, margin_s: int):
     rover, _, _, solutions, _, _, _, _, _ = _extract_bundle(args)
     if not solutions.solution_points:
@@ -4511,6 +4705,33 @@ def build_parser() -> argparse.ArgumentParser:
     quality_compare.add_argument("--out", help="Optional comparison output path.")
     _add_common(quality_compare)
     quality_compare.set_defaults(func=cmd_quality_compare)
+
+    annotation = sub.add_parser("annotation-gpx")
+    annotation.add_argument("rover_log")
+    annotation.add_argument("--annotations", required=True, help="Human-editable Markdown annotation file to create or update.")
+    annotation.add_argument("--out-gpx", required=True, help="Local GPX path for JOSM/manual inspection. Do not commit private GPX outputs.")
+    annotation.add_argument("--recording-id", help="Stable recording ID; defaults to the rover filename stem.")
+    annotation.add_argument(
+        "--segment",
+        action="append",
+        help="Add a selected segment as ID,START,END,LABEL. START/END are UTC ISO datetimes; Z is accepted.",
+    )
+    annotation.add_argument("--segments-json", help="Optional JSON list of selected segment objects.")
+    annotation.add_argument(
+        "--use-default-segments",
+        action="store_true",
+        help="Seed Markdown from the built-in validation recordings and selected test segments.",
+    )
+    annotation.add_argument(
+        "--rtk-solution",
+        action="append",
+        help="Optional RTKLIB solution to include as RUN_ID=PATH. Repeat for multiple base/config runs.",
+    )
+    _add_track_source_arg(annotation)
+    _add_bestnav_nmea_args(annotation)
+    _add_time_window_args(annotation)
+    _add_common(annotation)
+    annotation.set_defaults(func=cmd_annotation_gpx)
 
     opt = sub.add_parser("optimize-settings")
     opt.add_argument("rover_log", nargs="+")

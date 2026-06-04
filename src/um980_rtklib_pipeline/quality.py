@@ -132,6 +132,12 @@ class QualityAnalysis:
     stop_diagnostics: dict[str, object] = field(default_factory=dict)
     long_fixed_metrics: dict[str, object] = field(default_factory=dict)
     geometry_cost: dict[str, object] = field(default_factory=dict)
+    moving_route: dict[str, object] = field(default_factory=dict)
+    terminal_quarantine: dict[str, object] = field(default_factory=dict)
+    stationary_episodes: list[dict[str, object]] = field(default_factory=list)
+    pass_aware_stat: dict[str, object] = field(default_factory=dict)
+    stat_sat_diagnostics: dict[str, object] = field(default_factory=dict)
+    supported_moving_fixed: dict[str, object] = field(default_factory=dict)
     motion: dict[str, object] = field(default_factory=dict)
     dropout_reacquisition: dict[str, object] = field(default_factory=dict)
     baseline_summary: dict[str, object] = field(default_factory=dict)
@@ -193,6 +199,12 @@ class QualityAnalysis:
             "stop_diagnostics": self.stop_diagnostics,
             "long_fixed_metrics": long_fixed,
             "geometry_cost": geometry_cost,
+            "moving_route": self.moving_route,
+            "terminal_quarantine": self.terminal_quarantine,
+            "stationary_episodes": self.stationary_episodes,
+            "pass_aware_stat": self.pass_aware_stat,
+            "stat_sat_diagnostics": self.stat_sat_diagnostics,
+            "supported_moving_fixed": self.supported_moving_fixed,
             "motion": self.motion,
             "dropout_reacquisition": self.dropout_reacquisition,
             "baseline_summary": baseline_summary,
@@ -230,11 +242,49 @@ class _StatAccumulator:
     slips_by_sat: dict[str, int] = field(default_factory=dict)
     rejections_by_sat: dict[str, int] = field(default_factory=dict)
     rejections_by_time: dict[datetime, int] = field(default_factory=dict)
+    pos_rows: dict[datetime, dict[str, "_StatPosRow"]] = field(default_factory=dict)
+    pos_lines: int = 0
+    parsed_pos_lines: int = 0
+    unparsed_pos_lines: int = 0
+    used_slip_times: set[datetime] = field(default_factory=set)
+    any_slip_times: set[datetime] = field(default_factory=set)
+    used_set_by_time: dict[datetime, set[tuple[str, str, str]]] = field(default_factory=dict)
+    new_slipc_events: int = 0
+    new_used_slipc_events: int = 0
+    new_slipc_events_by_time: dict[datetime, int] = field(default_factory=dict)
+    new_used_slipc_events_by_time: dict[datetime, int] = field(default_factory=dict)
+    new_rejc_events: int = 0
+    new_used_rejc_events: int = 0
+    new_rejc_events_by_time: dict[datetime, int] = field(default_factory=dict)
+    new_used_rejc_events_by_time: dict[datetime, int] = field(default_factory=dict)
+    _last_slipc_by_key: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    _last_rejc_by_key: dict[tuple[str, str, str], int] = field(default_factory=dict)
     parse_elapsed_s: float = 0.0
     truncated: bool = False
     truncate_reason: str | None = None
     max_lines: int = 0
     max_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class _StatPosRow:
+    """One tolerant RTKLIB STAT $POS row."""
+
+    time: datetime
+    pass_name: str
+    stat: int | None
+    pos_ecef: tuple[float, float, float] | None
+    fixed_ecef: tuple[float, float, float] | None
+
+    @property
+    def quality(self) -> str:
+        return RTKLIB_Q_TO_QUALITY.get(self.stat or 0, "unknown")
+
+    @property
+    def selected_ecef(self) -> tuple[float, float, float] | None:
+        if self.stat == 1 and self.fixed_ecef is not None:
+            return self.fixed_ecef
+        return self.pos_ecef
 
 
 @dataclass(frozen=True)
@@ -426,6 +476,16 @@ def analyze_rtk_quality(
         base_llh=base_llh,
     )
     route_bins = _route_bins(epochs, segments, stat, aligned_trace, suspicion, limits)
+    moving_layer = _moving_route_metric_layer(epochs, segments, limits)
+    pass_aware_stat = _pass_aware_pos_summary(stat)
+    stat_sat_diagnostics = _stat_sat_diagnostics_summary(stat, epoch_index, moving_layer)
+    supported_moving_fixed = _supported_moving_fixed_summary(
+        epochs,
+        stat,
+        moving_layer,
+        stat_sat_diagnostics,
+        limits,
+    )
     if residuals.get("available") and residuals.get("quality_aligned") is False:
         warnings.append("STAT residuals parsed globally but not aligned to solution quality states; residuals not used for hard fixed-epoch suspicion.")
     if slips.get("available") and slips.get("epochs_with_slip_pct") is None:
@@ -445,6 +505,8 @@ def analyze_rtk_quality(
         "stat_lines": stat.stat_lines if stat else 0,
         "stat_sat_lines_parsed": stat.parsed_sat_lines if stat else 0,
         "stat_sat_lines_unparsed": stat.unparsed_sat_lines if stat else 0,
+        "stat_pos_lines_parsed": stat.parsed_pos_lines if stat else 0,
+        "stat_pos_lines_unparsed": stat.unparsed_pos_lines if stat else 0,
         "stat_truncated": stat.truncated if stat else False,
         "stat_truncate_reason": stat.truncate_reason if stat else None,
         "warnings": warnings,
@@ -511,6 +573,12 @@ def analyze_rtk_quality(
         stop_diagnostics=stop_diagnostics,
         long_fixed_metrics=long_fixed_metrics,
         geometry_cost=geometry_cost,
+        moving_route=moving_layer["moving_route"],
+        terminal_quarantine=moving_layer["terminal_quarantine"],
+        stationary_episodes=moving_layer["stationary_episodes"],
+        pass_aware_stat=pass_aware_stat,
+        stat_sat_diagnostics=stat_sat_diagnostics,
+        supported_moving_fixed=supported_moving_fixed,
         motion=motion,
         dropout_reacquisition=dropout,
         baseline_summary=baseline_summary,
@@ -764,6 +832,11 @@ def parse_stat_file(
                 break
             line = line.rstrip("\r\n")
             stat.stat_lines += 1
+            if line.startswith("$POS"):
+                stat.pos_lines += 1
+                if not _parse_pos_stat_line(line, stat):
+                    stat.unparsed_pos_lines += 1
+                continue
             if not line.startswith("$SAT"):
                 continue
             stat.sat_lines += 1
@@ -771,6 +844,71 @@ def parse_stat_file(
                 stat.unparsed_sat_lines += 1
     stat.parse_elapsed_s = time.perf_counter() - started
     return stat
+
+
+def _normalise_stat_pass(value: str | None) -> str:
+    text = (value or "").strip().lower()
+    if text in {"f", "fwd", "forward", "forw"}:
+        return "forward"
+    if text in {"b", "bwd", "backward", "back"}:
+        return "backward"
+    if text in {"c", "comb", "combined"}:
+        return "combined"
+    return text or "unknown"
+
+
+def _parse_pos_stat_line(line: str, stat: _StatAccumulator) -> bool:
+    fields = line.split(",")
+    if len(fields) < 8:
+        return False
+    week = int_or_none(fields[1])
+    tow = float_or_none(fields[2])
+    if week is None or tow is None:
+        return False
+    try:
+        time = gps_week_tow_to_utc_datetime(week, tow)
+    except Exception:
+        return False
+
+    pass_index: int | None = None
+    pass_name = "unknown"
+    for index, field in enumerate(fields[3:8], start=3):
+        normalised = _normalise_stat_pass(field)
+        if normalised in {"forward", "backward", "combined"}:
+            pass_index = index
+            pass_name = normalised
+            break
+
+    stat_index = (pass_index + 1) if pass_index is not None else 3
+    q = int_or_none(fields[stat_index]) if stat_index < len(fields) else None
+    if q is None:
+        return False
+    xyz_start = stat_index + 1
+    pos = _parse_xyz(fields, xyz_start)
+    fixed = _parse_xyz(fields, xyz_start + 3)
+    if pos is None and fixed is None:
+        return False
+    if pass_name == "unknown":
+        existing = stat.pos_rows.get(time, {})
+        if "forward" not in existing:
+            pass_name = "forward"
+        elif "backward" not in existing:
+            pass_name = "backward"
+        else:
+            pass_name = f"extra{len(existing) + 1}"
+    row = _StatPosRow(time=time, pass_name=pass_name, stat=q, pos_ecef=pos, fixed_ecef=fixed)
+    stat.pos_rows.setdefault(time, {})[pass_name] = row
+    stat.parsed_pos_lines += 1
+    return True
+
+
+def _parse_xyz(fields: list[str], start: int) -> tuple[float, float, float] | None:
+    if start + 2 >= len(fields):
+        return None
+    values = [float_or_none(fields[start]), float_or_none(fields[start + 1]), float_or_none(fields[start + 2])]
+    if any(value is None for value in values):
+        return None
+    return (float(values[0]), float(values[1]), float(values[2]))  # type: ignore[arg-type]
 
 
 def _parse_sat_stat_line(line: str, stat: _StatAccumulator) -> bool:
@@ -786,11 +924,16 @@ def _parse_sat_stat_line(line: str, stat: _StatAccumulator) -> bool:
     except Exception:
         return False
     sat = fields[3] if len(fields) > 3 else "?"
+    signal = fields[4] if len(fields) > 4 else ""
+    pass_name = _normalise_stat_pass(fields[17] if len(fields) > 17 else None)
     carrier = _abs_float(fields[7]) if len(fields) > 7 else None
     code = _abs_float(fields[8]) if len(fields) > 8 else None
     used = int_or_none(fields[9]) if len(fields) > 9 else None
     snr = float_or_none(fields[10]) if len(fields) > 10 else None
-    slip = _any_int(fields[12:13] + fields[15:16])
+    slip_flag = int_or_none(fields[12]) if len(fields) > 12 else None
+    slipc = int_or_none(fields[15]) if len(fields) > 15 else None
+    rejc = int_or_none(fields[16]) if len(fields) > 16 else None
+    slip = bool(slip_flag and slip_flag > 0)
     rejected = _any_int(fields[16:17])
     stat.parsed_sat_lines += 1
     if carrier is not None:
@@ -805,13 +948,42 @@ def _parse_sat_stat_line(line: str, stat: _StatAccumulator) -> bool:
             stat.top_residuals_by_sat[sat] = stat.top_residuals_by_sat.get(sat, 0) + 1
     if used and used > 0:
         stat.used_counts_by_time[time] = stat.used_counts_by_time.get(time, 0) + 1
+        stat.used_set_by_time.setdefault(time, set()).add((sat, signal, pass_name))
     if snr is not None:
         stat.snr_values_by_time.setdefault(time, []).append(snr)
     if slip:
         stat.slip_count += 1
         stat.slip_times.append(time)
-        stat.slip_events.add((time, sat, fields[4] if len(fields) > 4 else "", "slip"))
+        stat.any_slip_times.add(time)
+        if used and used > 0:
+            stat.used_slip_times.add(time)
+        stat.slip_events.add((time, sat, signal, "slip"))
         stat.slips_by_sat[sat] = stat.slips_by_sat.get(sat, 0) + 1
+    if slip_flag and slip_flag > 0:
+        stat.any_slip_times.add(time)
+        if used and used > 0:
+            stat.used_slip_times.add(time)
+    key = (sat, signal, pass_name)
+    if slipc is not None:
+        previous = stat._last_slipc_by_key.get(key)
+        increment = max(0, slipc - previous) if previous is not None else 0
+        stat._last_slipc_by_key[key] = slipc
+        if increment:
+            stat.new_slipc_events += increment
+            stat.new_slipc_events_by_time[time] = stat.new_slipc_events_by_time.get(time, 0) + increment
+            if used and used > 0:
+                stat.new_used_slipc_events += increment
+                stat.new_used_slipc_events_by_time[time] = stat.new_used_slipc_events_by_time.get(time, 0) + increment
+    if rejc is not None:
+        previous = stat._last_rejc_by_key.get(key)
+        increment = max(0, rejc - previous) if previous is not None else 0
+        stat._last_rejc_by_key[key] = rejc
+        if increment:
+            stat.new_rejc_events += increment
+            stat.new_rejc_events_by_time[time] = stat.new_rejc_events_by_time.get(time, 0) + increment
+            if used and used > 0:
+                stat.new_used_rejc_events += increment
+                stat.new_used_rejc_events_by_time[time] = stat.new_used_rejc_events_by_time.get(time, 0) + increment
     if rejected:
         stat.rejected_count += 1
         stat.rejections_by_time[time] = stat.rejections_by_time.get(time, 0) + 1
@@ -896,25 +1068,30 @@ def _segment_summary(segments: list[Segment]) -> dict[str, object]:
 
 def _motion_summary(epochs: list[SolutionEpoch], thresholds: QualityThresholds) -> dict[str, object]:
     speeds: list[float] = []
+    route_m = 0.0
     for left, right in zip(epochs, epochs[1:], strict=False):
         if left.lat is None or left.lon is None or right.lat is None or right.lon is None:
             continue
         dt = (right.time - left.time).total_seconds()
         if dt <= 0:
             continue
-        speeds.append(_haversine_m(left.lat, left.lon, right.lat, right.lon) / dt)
+        distance = _haversine_m(left.lat, left.lon, right.lat, right.lon)
+        route_m += distance
+        speeds.append(distance / dt)
     p90 = _percentile(speeds, 90) or 0.0
     p95 = _percentile(speeds, 95) or 0.0
     p99 = _percentile(speeds, 99) or 0.0
     max_observed = max(speeds) if speeds else None
     high_speed_count = sum(1 for speed in speeds if speed > 30.0)
+    sustained_highway = sum(1 for speed in speeds if speed > 25.0)
+    route_km = route_m / 1000.0
     requested = thresholds.motion_profile
     if requested == "auto":
-        if max_observed is not None and max_observed > 45.0 and (p90 > 10.0 or high_speed_count >= 3):
+        # Deliberately ignore isolated maximum-speed spikes. Forest/moto runs
+        # can contain GNSS jumps above highway speed without being highway runs.
+        if (p95 > 28.0 or p90 > 22.0) and sustained_highway >= 20 and route_km > 3.0:
             profile = "highway"
-        elif p99 > 45.0:
-            profile = "highway"
-        elif p95 > 15.0 or (max_observed is not None and max_observed > 45.0):
+        elif p95 > 12.0 or p90 > 8.0:
             profile = "vehicle"
         elif p95 <= 1.0:
             profile = "static"
@@ -939,6 +1116,7 @@ def _motion_summary(epochs: list[SolutionEpoch], thresholds: QualityThresholds) 
         "p99_speed_mps": p99,
         "max_speed_mps": max_observed,
         "high_speed_samples_gt_30_mps": high_speed_count,
+        "sustained_highway_speed_samples": sustained_highway,
         "max_speed_threshold_mps": max_speed,
         "max_accel_threshold_mps2": thresholds.max_accel_mps2,
         "warning": (
@@ -1452,6 +1630,314 @@ def _usable_fixed_totals(segments: list[Segment]) -> dict[str, float]:
     return totals
 
 
+def _moving_route_metric_layer(
+    epochs: list[SolutionEpoch],
+    segments: list[Segment],
+    thresholds: QualityThresholds,
+) -> dict[str, object]:
+    """Return movement-aware final-output summaries.
+
+    The private index sets are consumed by local QC classification but are not
+    exposed through ``QualityAnalysis.as_dict``.
+    """
+
+    speeds, plausible_steps_m = _epoch_speeds_and_plausible_steps(epochs, thresholds)
+    terminal_head = _terminal_run_indices(epochs, speeds, from_start=True, thresholds=thresholds)
+    terminal_tail = _terminal_run_indices(epochs, speeds, from_start=False, thresholds=thresholds)
+    terminal_indices = set(terminal_head) | set(terminal_tail)
+    stationary_runs = _stationary_runs(epochs, speeds, thresholds, excluded=terminal_indices)
+    stationary_indices = {index for run in stationary_runs for index in run}
+    moving_indices = {
+        index
+        for index, speed in enumerate(speeds)
+        if index not in terminal_indices and index not in stationary_indices and speed is not None and speed > thresholds.stationary_speed_threshold_mps
+    }
+    core_indices = set(range(len(epochs))) - terminal_indices
+
+    full = _quality_time_distance_for_indices(epochs, set(range(len(epochs))), plausible_steps_m)
+    core = _quality_time_distance_for_indices(epochs, core_indices, plausible_steps_m)
+    moving = _quality_time_distance_for_indices(epochs, moving_indices, plausible_steps_m)
+    moving_fixed_segments = _segments_inside_indices(segments, moving_indices, quality="fixed")
+    terminal_summary = _terminal_quarantine_summary(epochs, speeds, terminal_head, terminal_tail, plausible_steps_m)
+    stationary_episodes = [
+        _stationary_episode_summary(epochs, run, plausible_steps_m, speeds)
+        for run in stationary_runs
+    ]
+
+    return {
+        "moving_route": {
+            "full_recording": full,
+            "core_nonterminal": core,
+            "core_moving_route": moving,
+            "longest_moving_fixed_segment": _longest_segment_record(moving_fixed_segments),
+            "fixed_gaps": _fixed_gap_summary(epochs, segments, moving_indices, plausible_steps_m),
+            "distance_note": "distance metrics use plausibility-filtered step lengths, not raw jump-inflated distance",
+        },
+        "terminal_quarantine": terminal_summary,
+        "stationary_episodes": stationary_episodes,
+        "_speeds": speeds,
+        "_plausible_steps_m": plausible_steps_m,
+        "_core_indices": core_indices,
+        "_moving_indices": moving_indices,
+        "_terminal_indices": terminal_indices,
+        "_stationary_indices": stationary_indices,
+    }
+
+
+def _epoch_speeds_and_plausible_steps(
+    epochs: list[SolutionEpoch],
+    thresholds: QualityThresholds,
+) -> tuple[list[float | None], list[float]]:
+    speeds: list[float | None] = [None for _ in epochs]
+    plausible_steps_m: list[float] = [0.0 for _ in epochs]
+    profile_limit = thresholds.max_speed_mps or {"static": 1.0, "walking": 3.0, "cycling": 15.0, "vehicle": 45.0, "highway": 60.0}.get(
+        thresholds.motion_profile,
+        45.0,
+    )
+    for index, (left, right) in enumerate(zip(epochs, epochs[1:], strict=False), start=1):
+        if left.lat is None or left.lon is None or right.lat is None or right.lon is None:
+            continue
+        dt = (right.time - left.time).total_seconds()
+        if dt <= 0:
+            continue
+        step = _haversine_m(left.lat, left.lon, right.lat, right.lon)
+        speed = step / dt
+        speeds[index] = speed
+        max_plausible_step = max(30.0, profile_limit * dt * 2.5)
+        plausible_steps_m[index] = step if step <= max_plausible_step else 0.0
+    return speeds, plausible_steps_m
+
+
+def _terminal_run_indices(
+    epochs: list[SolutionEpoch],
+    speeds: list[float | None],
+    *,
+    from_start: bool,
+    thresholds: QualityThresholds,
+) -> list[int]:
+    if not epochs:
+        return []
+    indices = range(len(epochs)) if from_start else range(len(epochs) - 1, -1, -1)
+    selected: list[int] = []
+    max_terminal_speed = max(0.8, thresholds.stationary_speed_threshold_mps * 2.0)
+    for index in indices:
+        speed = speeds[index]
+        if speed is None or speed <= max_terminal_speed:
+            selected.append(index)
+            continue
+        break
+    if len(selected) < 3:
+        return []
+    selected_sorted = sorted(selected)
+    duration = (epochs[selected_sorted[-1]].time - epochs[selected_sorted[0]].time).total_seconds()
+    return selected_sorted if duration >= 10.0 else []
+
+
+def _stationary_runs(
+    epochs: list[SolutionEpoch],
+    speeds: list[float | None],
+    thresholds: QualityThresholds,
+    *,
+    excluded: set[int],
+) -> list[list[int]]:
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for index, speed in enumerate(speeds):
+        if index in excluded:
+            if current:
+                _append_stationary_run_if_long(epochs, runs, current)
+                current = []
+            continue
+        if speed is not None and speed <= thresholds.stationary_speed_threshold_mps:
+            current.append(index)
+        elif current:
+            _append_stationary_run_if_long(epochs, runs, current)
+            current = []
+    if current:
+        _append_stationary_run_if_long(epochs, runs, current)
+    return runs
+
+
+def _append_stationary_run_if_long(epochs: list[SolutionEpoch], runs: list[list[int]], run: list[int]) -> None:
+    if len(run) < 3:
+        return
+    duration = (epochs[run[-1]].time - epochs[run[0]].time).total_seconds()
+    if duration >= 10.0:
+        runs.append(list(run))
+
+
+def _quality_time_distance_for_indices(
+    epochs: list[SolutionEpoch],
+    indices: set[int],
+    plausible_steps_m: list[float],
+) -> dict[str, object]:
+    quality_time = {quality: 0.0 for quality in QUALITY_ORDER}
+    quality_distance = {quality: 0.0 for quality in QUALITY_ORDER}
+    if not epochs or not indices:
+        return {
+            "epoch_count": 0,
+            "elapsed_time_s": 0.0,
+            "quality_time_s": quality_time,
+            "quality_pct_of_elapsed": _percentages(quality_time, 0.0),
+            "quality_distance_km": {quality: 0.0 for quality in QUALITY_ORDER},
+            "quality_pct_of_distance": _percentages(quality_distance, 0.0),
+        }
+    ordered = sorted(indices)
+    elapsed = max(0.0, (epochs[ordered[-1]].time - epochs[ordered[0]].time).total_seconds())
+    for left_index, right_index in zip(ordered, ordered[1:], strict=False):
+        if right_index != left_index + 1:
+            continue
+        dt = (epochs[right_index].time - epochs[left_index].time).total_seconds()
+        if dt > 0:
+            quality_time[epochs[left_index].quality] += dt
+        quality_distance[epochs[right_index].quality] += plausible_steps_m[right_index]
+    total_distance = sum(quality_distance.values())
+    return {
+        "epoch_count": len(indices),
+        "elapsed_time_s": elapsed,
+        "quality_time_s": quality_time,
+        "quality_pct_of_elapsed": _percentages(quality_time, elapsed),
+        "quality_distance_km": {quality: value / 1000.0 for quality, value in quality_distance.items()},
+        "quality_pct_of_distance": _percentages(quality_distance, total_distance),
+    }
+
+
+def _segments_inside_indices(segments: list[Segment], indices: set[int], *, quality: str | None = None) -> list[Segment]:
+    result: list[Segment] = []
+    for segment in segments:
+        if quality is not None and segment.quality != quality:
+            continue
+        segment_indices = set(range(segment.start_index, segment.end_index + 1))
+        if segment_indices and segment_indices.issubset(indices):
+            result.append(segment)
+    return result
+
+
+def _longest_segment_record(segments: list[Segment]) -> dict[str, object] | None:
+    if not segments:
+        return None
+    segment = max(segments, key=lambda item: (item.duration_s, item.distance_m))
+    return _segment_dict(segment)
+
+
+def _fixed_gap_summary(
+    epochs: list[SolutionEpoch],
+    segments: list[Segment],
+    moving_indices: set[int],
+    plausible_steps_m: list[float],
+) -> dict[str, object]:
+    gaps = [segment for segment in _segments_inside_indices(segments, moving_indices) if segment.quality != "fixed"]
+    return {
+        "count": len(gaps),
+        "total_time_s": sum(segment.duration_s for segment in gaps),
+        "longest_time_s": max((segment.duration_s for segment in gaps), default=0.0),
+        "total_distance_km": sum(_segment_plausible_distance_m(segment, plausible_steps_m) for segment in gaps) / 1000.0,
+        "longest_distance_km": max((_segment_plausible_distance_m(segment, plausible_steps_m) for segment in gaps), default=0.0) / 1000.0,
+    }
+
+
+def _segment_plausible_distance_m(segment: Segment, plausible_steps_m: list[float]) -> float:
+    return sum(plausible_steps_m[index] for index in range(segment.start_index + 1, min(segment.end_index + 1, len(plausible_steps_m))))
+
+
+def _terminal_quarantine_summary(
+    epochs: list[SolutionEpoch],
+    speeds: list[float | None],
+    head: list[int],
+    tail: list[int],
+    plausible_steps_m: list[float],
+) -> dict[str, object]:
+    regions = []
+    for name, indices in (("head", head), ("tail", tail)):
+        if indices:
+            regions.append(_terminal_region_summary(name, epochs, speeds, indices, plausible_steps_m))
+    return {
+        "available": bool(regions),
+        "regions": regions,
+        "quarantined_epoch_count": sum(int(region.get("epoch_count", 0) or 0) for region in regions),
+        "note": "terminal regions are excluded from core moving-route headline metrics",
+    }
+
+
+def _terminal_region_summary(
+    name: str,
+    epochs: list[SolutionEpoch],
+    speeds: list[float | None],
+    indices: list[int],
+    plausible_steps_m: list[float],
+) -> dict[str, object]:
+    quality_time_distance = _quality_time_distance_for_indices(epochs, set(indices), plausible_steps_m)
+    duration = float(quality_time_distance.get("elapsed_time_s", 0.0) or 0.0)
+    max_speed = max((speeds[index] or 0.0 for index in indices), default=0.0)
+    fixed_time = float(quality_time_distance.get("quality_time_s", {}).get("fixed", 0.0) if isinstance(quality_time_distance.get("quality_time_s"), dict) else 0.0)
+    total_distance_km = sum(float(value) for value in quality_time_distance.get("quality_distance_km", {}).values()) if isinstance(quality_time_distance.get("quality_distance_km"), dict) else 0.0
+    if duration >= 10.0 and total_distance_km < 0.02 and fixed_time / duration > 0.8:
+        klass = "stationary_clean_fixed"
+    elif duration >= 10.0 and total_distance_km < 0.02:
+        klass = "stationary_noisy"
+    elif max_speed <= 2.0:
+        klass = "slow_real_motion"
+    else:
+        klass = "unknown"
+    return {
+        "name": name,
+        "start_time": epochs[indices[0]].time.isoformat(),
+        "end_time": epochs[indices[-1]].time.isoformat(),
+        "epoch_count": len(indices),
+        "duration_s": duration,
+        "path_length_km": total_distance_km,
+        "max_speed_mps": max_speed,
+        "quality_time_s": quality_time_distance.get("quality_time_s", {}),
+        "diagnostic_class": klass,
+    }
+
+
+def _stationary_episode_summary(
+    epochs: list[SolutionEpoch],
+    indices: list[int],
+    plausible_steps_m: list[float],
+    speeds: list[float | None],
+) -> dict[str, object]:
+    points = [epochs[index] for index in indices if epochs[index].lat is not None and epochs[index].lon is not None]
+    center_lat = sum(point.lat or 0.0 for point in points) / len(points) if points else None
+    center_lon = sum(point.lon or 0.0 for point in points) / len(points) if points else None
+    radii = [
+        _haversine_m(center_lat, center_lon, point.lat or center_lat, point.lon or center_lon)
+        for point in points
+        if center_lat is not None and center_lon is not None
+    ]
+    quality_summary = _quality_time_distance_for_indices(epochs, set(indices), plausible_steps_m)
+    duration = float(quality_summary.get("elapsed_time_s", 0.0) or 0.0)
+    path_m = sum(plausible_steps_m[index] for index in indices)
+    net_m = 0.0
+    if len(points) >= 2:
+        net_m = _haversine_m(points[0].lat or 0.0, points[0].lon or 0.0, points[-1].lat or 0.0, points[-1].lon or 0.0)
+    max_step = max((plausible_steps_m[index] for index in indices), default=0.0)
+    fixed_time = float(quality_summary.get("quality_time_s", {}).get("fixed", 0.0) if isinstance(quality_summary.get("quality_time_s"), dict) else 0.0)
+    float_time = float(quality_summary.get("quality_time_s", {}).get("float", 0.0) if isinstance(quality_summary.get("quality_time_s"), dict) else 0.0)
+    if duration and fixed_time / duration > 0.8 and (_percentile(radii, 95) or 0.0) < 1.0:
+        klass = "stationary_clean_fixed"
+    elif duration and float_time / duration > 0.5:
+        klass = "stationary_noisy"
+    elif max((speeds[index] or 0.0 for index in indices), default=0.0) > 1.0:
+        klass = "slow_real_motion"
+    else:
+        klass = "unknown"
+    return {
+        "start_time": epochs[indices[0]].time.isoformat(),
+        "end_time": epochs[indices[-1]].time.isoformat(),
+        "duration_s": duration,
+        "net_displacement_m": net_m,
+        "path_length_m": path_m,
+        "radius_p50_m": _percentile(radii, 50),
+        "radius_p95_m": _percentile(radii, 95),
+        "radius_p99_m": _percentile(radii, 99),
+        "max_step_m": max_step,
+        "quality_time_s": quality_summary.get("quality_time_s", {}),
+        "diagnostic_class": klass,
+    }
+
+
 def _n_coverage_threshold(values_desc: list[float], fraction: float) -> float | None:
     if not values_desc:
         return None
@@ -1462,6 +1948,297 @@ def _n_coverage_threshold(values_desc: list[float], fraction: float) -> float | 
         if total >= target:
             return value
     return values_desc[-1]
+
+
+def _pass_aware_pos_summary(stat: _StatAccumulator | None) -> dict[str, object]:
+    if stat is None or not stat.pos_rows:
+        return {
+            "available": False,
+            "timestamp_count": 0,
+            "state_counts": {},
+            "state_pct": {},
+            "pass_disagreement_pct": None,
+            "forward_backward_deltas_m": {},
+            "note": "STAT $POS rows unavailable; pass-aware support is diagnostic-only.",
+        }
+    state_counts = {
+        "both_fixed": 0,
+        "fwd_only_fixed": 0,
+        "bwd_only_fixed": 0,
+        "any_fixed": 0,
+        "none_fixed": 0,
+    }
+    delta_groups: dict[str, list[tuple[float, float]]] = {
+        "both_fixed": [],
+        "one_fixed_one_nonfixed": [],
+        "neither_fixed": [],
+    }
+    for rows in stat.pos_rows.values():
+        forward = rows.get("forward")
+        backward = rows.get("backward")
+        f_fixed = forward is not None and forward.stat == 1
+        b_fixed = backward is not None and backward.stat == 1
+        if f_fixed and b_fixed:
+            state = "both_fixed"
+        elif f_fixed:
+            state = "fwd_only_fixed"
+        elif b_fixed:
+            state = "bwd_only_fixed"
+        else:
+            state = "none_fixed"
+        state_counts[state] += 1
+        if f_fixed or b_fixed:
+            state_counts["any_fixed"] += 1
+        if forward is not None and backward is not None:
+            delta = _forward_backward_delta_m(forward, backward)
+            if delta is not None:
+                if f_fixed and b_fixed:
+                    group = "both_fixed"
+                elif f_fixed or b_fixed:
+                    group = "one_fixed_one_nonfixed"
+                else:
+                    group = "neither_fixed"
+                delta_groups[group].append(delta)
+    total = len(stat.pos_rows)
+    disagreement = state_counts["fwd_only_fixed"] + state_counts["bwd_only_fixed"]
+    return {
+        "available": True,
+        "timestamp_count": total,
+        "state_counts": state_counts,
+        "state_pct": {key: (100.0 * value / total) if total else 0.0 for key, value in state_counts.items()},
+        "any_fixed_pct": (100.0 * state_counts["any_fixed"] / total) if total else 0.0,
+        "both_fixed_pct": (100.0 * state_counts["both_fixed"] / total) if total else 0.0,
+        "fwd_only_fixed_pct": (100.0 * state_counts["fwd_only_fixed"] / total) if total else 0.0,
+        "bwd_only_fixed_pct": (100.0 * state_counts["bwd_only_fixed"] / total) if total else 0.0,
+        "none_fixed_pct": (100.0 * state_counts["none_fixed"] / total) if total else 0.0,
+        "pass_disagreement_pct": (100.0 * disagreement / total) if total else 0.0,
+        "forward_backward_deltas_m": {
+            key: {
+                "horizontal": _stats([item[0] for item in values]),
+                "vertical": _stats([item[1] for item in values]),
+            }
+            for key, values in delta_groups.items()
+        },
+        "headline_note": "Raw STAT fixed row percentage is intentionally not used as headline fixed quality.",
+    }
+
+
+def _forward_backward_delta_m(forward: _StatPosRow, backward: _StatPosRow) -> tuple[float, float] | None:
+    left = forward.selected_ecef
+    right = backward.selected_ecef
+    if left is None or right is None:
+        return None
+    try:
+        lat1, lon1, h1 = _ecef_to_llh(*left)
+        lat2, lon2, h2 = _ecef_to_llh(*right)
+    except Exception:
+        dx = right[0] - left[0]
+        dy = right[1] - left[1]
+        dz = right[2] - left[2]
+        return math.hypot(dx, dy), abs(dz)
+    return _haversine_m(lat1, lon1, lat2, lon2), abs(h2 - h1)
+
+
+def _stat_sat_diagnostics_summary(
+    stat: _StatAccumulator | None,
+    epoch_index: EpochIndex,
+    moving_layer: dict[str, object],
+) -> dict[str, object]:
+    if stat is None or stat.parsed_sat_lines == 0:
+        return {"available": False}
+    epochs = epoch_index.epochs
+    duration_min = max(0.0, (epochs[-1].time - epochs[0].time).total_seconds() / 60.0) if len(epochs) >= 2 else 0.0
+    moving_route = moving_layer.get("moving_route", {})
+    moving_distance_km = 0.0
+    if isinstance(moving_route, dict):
+        core = moving_route.get("core_moving_route", {})
+        if isinstance(core, dict):
+            distances = core.get("quality_distance_km", {})
+            if isinstance(distances, dict):
+                moving_distance_km = sum(float(value or 0.0) for value in distances.values())
+    any_slip_indexes = _aligned_epoch_indexes(stat.any_slip_times, epoch_index)
+    used_slip_indexes = _aligned_epoch_indexes(stat.used_slip_times, epoch_index)
+    used_counts = list(stat.used_counts_by_time.values())
+    used_sets = [stat.used_set_by_time[time] for time in sorted(stat.used_set_by_time)]
+    used_set_changes = 0
+    for left, right in zip(used_sets, used_sets[1:], strict=False):
+        if left != right:
+            used_set_changes += 1
+    return {
+        "available": True,
+        "any_slip_epoch_pct": (100.0 * len(any_slip_indexes) / len(epochs)) if epochs else 0.0,
+        "used_slip_epoch_pct": (100.0 * len(used_slip_indexes) / len(epochs)) if epochs else 0.0,
+        "new_slipc_events": stat.new_slipc_events,
+        "new_used_slipc_events": stat.new_used_slipc_events,
+        "new_used_slipc_events_per_min": (stat.new_used_slipc_events / duration_min) if duration_min else None,
+        "new_used_slipc_events_per_km": (stat.new_used_slipc_events / moving_distance_km) if moving_distance_km else None,
+        "new_rejc_events": stat.new_rejc_events,
+        "new_used_rejc_events": stat.new_used_rejc_events,
+        "new_used_rejc_events_per_min": (stat.new_used_rejc_events / duration_min) if duration_min else None,
+        "new_used_rejc_events_per_km": (stat.new_used_rejc_events / moving_distance_km) if moving_distance_km else None,
+        "used_rows_p05": _percentile(used_counts, 5),
+        "used_rows_p50": _percentile(used_counts, 50),
+        "used_rows_p95": _percentile(used_counts, 95),
+        "used_set_change_epoch_pct": (100.0 * used_set_changes / max(1, len(used_sets) - 1)) if len(used_sets) >= 2 else 0.0,
+        "note": "raw slip/rejection totals describe observation cleanliness; local moving-fixed classification uses aligned increments and densities",
+    }
+
+
+def _aligned_epoch_indexes(times: set[datetime], epoch_index: EpochIndex) -> set[int]:
+    mapping = {time: epoch_index.nearest_index(time) for time in times}
+    return {index for index in mapping.values() if index is not None}
+
+
+def _supported_moving_fixed_summary(
+    epochs: list[SolutionEpoch],
+    stat: _StatAccumulator | None,
+    moving_layer: dict[str, object],
+    stat_sat: dict[str, object],
+    thresholds: QualityThresholds,
+) -> dict[str, object]:
+    moving_indices = moving_layer.get("_moving_indices")
+    terminal_indices = moving_layer.get("_terminal_indices")
+    stationary_indices = moving_layer.get("_stationary_indices")
+    plausible_steps = moving_layer.get("_plausible_steps_m")
+    if not isinstance(moving_indices, set) or not isinstance(terminal_indices, set) or not isinstance(stationary_indices, set) or not isinstance(plausible_steps, list):
+        return {"available": False}
+    epoch_index = EpochIndex.build(epochs)
+    class_time = {
+        "strong_supported_moving_fixed": 0.0,
+        "mixed_supported_moving_fixed": 0.0,
+        "direction_dependent_fixed": 0.0,
+        "provisional_fixed": 0.0,
+        "suspect_fixed": 0.0,
+        "stationary_fixed": 0.0,
+        "terminal_fixed": 0.0,
+        "not_fixed": 0.0,
+    }
+    class_distance = {key: 0.0 for key in class_time}
+    reasons: dict[str, dict[str, object]] = {}
+    pos_lookup = stat.pos_rows if stat is not None else {}
+    pos_time_index = _build_pos_time_index(pos_lookup)
+    for left_index, right_index in zip(range(len(epochs) - 1), range(1, len(epochs)), strict=False):
+        epoch = epochs[left_index]
+        dt = (epochs[right_index].time - epoch.time).total_seconds()
+        if dt <= 0:
+            continue
+        klass, local_reasons = _classify_supported_epoch(
+            epoch,
+            left_index,
+            epoch_index,
+            pos_lookup,
+            pos_time_index,
+            moving_indices,
+            terminal_indices,
+            stationary_indices,
+            stat,
+            thresholds,
+        )
+        class_time[klass] += dt
+        class_distance[klass] += float(plausible_steps[right_index] or 0.0)
+        for reason in local_reasons:
+            item = reasons.setdefault(reason, {"source": "stat" if reason.startswith(("pass_", "used_", "fb_")) else "solution", "aligned": True, "affected_epoch_count": 0, "affected_fixed_time_s": 0.0, "affected_fixed_distance_m": 0.0})
+            item["affected_epoch_count"] = int(item["affected_epoch_count"]) + 1
+            if epoch.quality == "fixed":
+                item["affected_fixed_time_s"] = float(item["affected_fixed_time_s"]) + dt
+                item["affected_fixed_distance_m"] = float(item["affected_fixed_distance_m"]) + float(plausible_steps[right_index] or 0.0)
+    total_fixed_moving_time = class_time["strong_supported_moving_fixed"] + class_time["mixed_supported_moving_fixed"] + class_time["direction_dependent_fixed"] + class_time["provisional_fixed"] + class_time["suspect_fixed"]
+    if total_fixed_moving_time and class_time["strong_supported_moving_fixed"] / total_fixed_moving_time > 0.5:
+        interpretation = "moving fixed output has substantial pass-supported coverage"
+    elif total_fixed_moving_time:
+        interpretation = "moving fixed output is mostly mixed/provisional; inspect pass disagreement and diagnostic densities"
+    else:
+        interpretation = "no moving fixed output was available after terminal/stationary separation"
+    return {
+        "available": True,
+        "class_time_s": class_time,
+        "class_distance_km": {key: value / 1000.0 for key, value in class_distance.items()},
+        "class_pct_of_moving_fixed_time": _percentages(
+            {key: value for key, value in class_time.items() if key != "not_fixed"},
+            total_fixed_moving_time,
+        ),
+        "reason_evidence": reasons,
+        "interpretation": interpretation,
+        "stat_diagnostic_support": {
+            "used_slip_epoch_pct": stat_sat.get("used_slip_epoch_pct"),
+            "new_used_slipc_events_per_km": stat_sat.get("new_used_slipc_events_per_km"),
+            "new_used_rejc_events_per_km": stat_sat.get("new_used_rejc_events_per_km"),
+        },
+    }
+
+
+def _classify_supported_epoch(
+    epoch: SolutionEpoch,
+    index: int,
+    epoch_index: EpochIndex,
+    pos_rows: dict[datetime, dict[str, _StatPosRow]],
+    pos_time_index: tuple[list[datetime], list[float]],
+    moving_indices: set[int],
+    terminal_indices: set[int],
+    stationary_indices: set[int],
+    stat: _StatAccumulator | None,
+    thresholds: QualityThresholds,
+) -> tuple[str, list[str]]:
+    if epoch.quality != "fixed":
+        return "not_fixed", []
+    if index in terminal_indices:
+        return "terminal_fixed", ["terminal_quarantine"]
+    if index in stationary_indices or index not in moving_indices:
+        return "stationary_fixed", ["stationary_or_low_motion"]
+
+    rows = _nearest_pos_rows(epoch.time, pos_rows, pos_time_index)
+    fwd = rows.get("forward") if rows else None
+    bwd = rows.get("backward") if rows else None
+    f_fixed = fwd is not None and fwd.stat == 1
+    b_fixed = bwd is not None and bwd.stat == 1
+    reasons: list[str] = []
+    fb_delta = _forward_backward_delta_m(fwd, bwd) if fwd is not None and bwd is not None else None
+    if fb_delta is not None and (fb_delta[0] > 3.0 or fb_delta[1] > 5.0):
+        return "suspect_fixed", ["fb_large_delta"]
+    used_slip = stat is not None and epoch.time in stat.used_slip_times
+    used_rej = stat is not None and stat.new_used_rejc_events_by_time.get(epoch.time, 0) > 0
+    used_slipc = stat is not None and stat.new_used_slipc_events_by_time.get(epoch.time, 0) > 0
+    if used_slip or used_rej or used_slipc:
+        reasons.append("used_diagnostic_pressure")
+    if f_fixed and b_fixed:
+        if reasons:
+            return "mixed_supported_moving_fixed", ["pass_both_fixed", *reasons]
+        return "strong_supported_moving_fixed", ["pass_both_fixed"]
+    if f_fixed or b_fixed:
+        if fb_delta is not None:
+            return "direction_dependent_fixed", ["pass_one_direction_fixed"]
+        return "mixed_supported_moving_fixed", ["pass_one_direction_fixed"]
+    if rows:
+        return "provisional_fixed", ["final_fixed_without_pass_fixed"]
+    return "mixed_supported_moving_fixed", ["final_fixed_stat_pos_unavailable"]
+
+
+def _nearest_pos_rows(
+    time: datetime,
+    pos_rows: dict[datetime, dict[str, _StatPosRow]],
+    pos_time_index: tuple[list[datetime], list[float]],
+) -> dict[str, _StatPosRow]:
+    if time in pos_rows:
+        return pos_rows[time]
+    if not pos_rows:
+        return {}
+    ordered_times, times_s = pos_time_index
+    target = _timestamp_s(time)
+    position = bisect_left(times_s, target)
+    candidates = []
+    if position < len(ordered_times):
+        candidates.append(position)
+    if position:
+        candidates.append(position - 1)
+    if not candidates:
+        return {}
+    best = min(candidates, key=lambda item: abs(times_s[item] - target))
+    return pos_rows[ordered_times[best]] if abs(times_s[best] - target) <= 0.51 else {}
+
+
+def _build_pos_time_index(pos_rows: dict[datetime, dict[str, _StatPosRow]]) -> tuple[list[datetime], list[float]]:
+    ordered = sorted(pos_rows)
+    return ordered, [_timestamp_s(item) for item in ordered]
 
 
 def _geometry_cost_summary(
@@ -2323,6 +3100,11 @@ def _filter_stat_accumulator(stat: _StatAccumulator, window: ProcessingWindow) -
         code.extend(values.get("code", []))
     filtered_slip_events = {event for event in stat.slip_events if window.contains(event[0])}
     filtered_rejections_by_time = {time: count for time, count in stat.rejections_by_time.items() if window.contains(time)}
+    filtered_pos_rows = {time: value for time, value in stat.pos_rows.items() if window.contains(time)}
+    filtered_new_slipc = {time: count for time, count in stat.new_slipc_events_by_time.items() if window.contains(time)}
+    filtered_new_used_slipc = {time: count for time, count in stat.new_used_slipc_events_by_time.items() if window.contains(time)}
+    filtered_new_rejc = {time: count for time, count in stat.new_rejc_events_by_time.items() if window.contains(time)}
+    filtered_new_used_rejc = {time: count for time, count in stat.new_used_rejc_events_by_time.items() if window.contains(time)}
     return _StatAccumulator(
         stat_lines=stat.stat_lines,
         sat_lines=stat.sat_lines,
@@ -2341,6 +3123,23 @@ def _filter_stat_accumulator(stat: _StatAccumulator, window: ProcessingWindow) -
         slips_by_sat=dict(stat.slips_by_sat),
         rejections_by_sat=dict(stat.rejections_by_sat),
         rejections_by_time=filtered_rejections_by_time,
+        pos_rows=filtered_pos_rows,
+        pos_lines=stat.pos_lines,
+        parsed_pos_lines=stat.parsed_pos_lines,
+        unparsed_pos_lines=stat.unparsed_pos_lines,
+        used_slip_times={time for time in stat.used_slip_times if window.contains(time)},
+        any_slip_times={time for time in stat.any_slip_times if window.contains(time)},
+        used_set_by_time={time: value for time, value in stat.used_set_by_time.items() if window.contains(time)},
+        new_slipc_events=sum(filtered_new_slipc.values()),
+        new_used_slipc_events=sum(filtered_new_used_slipc.values()),
+        new_slipc_events_by_time=filtered_new_slipc,
+        new_used_slipc_events_by_time=filtered_new_used_slipc,
+        new_rejc_events=sum(filtered_new_rejc.values()),
+        new_used_rejc_events=sum(filtered_new_used_rejc.values()),
+        new_rejc_events_by_time=filtered_new_rejc,
+        new_used_rejc_events_by_time=filtered_new_used_rejc,
+        _last_slipc_by_key=dict(stat._last_slipc_by_key),
+        _last_rejc_by_key=dict(stat._last_rejc_by_key),
         parse_elapsed_s=stat.parse_elapsed_s,
         truncated=stat.truncated,
         truncate_reason=stat.truncate_reason,
@@ -2642,6 +3441,37 @@ def format_quality_text(analysis: QualityAnalysis) -> str:
     return "\n".join(lines)
 
 
+def _quality_interpretation_lines(data: dict[str, object]) -> list[str]:
+    moving = data.get("moving_route", {})
+    terminal = data.get("terminal_quarantine", {})
+    stationary = data.get("stationary_episodes", [])
+    supported = data.get("supported_moving_fixed", {})
+    pass_aware = data.get("pass_aware_stat", {})
+    core_fixed_km = None
+    core_fixed_pct = None
+    if isinstance(moving, dict):
+        core = moving.get("core_moving_route", {})
+        if isinstance(core, dict):
+            distances = core.get("quality_distance_km", {})
+            pcts = core.get("quality_pct_of_distance", {})
+            if isinstance(distances, dict):
+                core_fixed_km = distances.get("fixed")
+            if isinstance(pcts, dict):
+                core_fixed_pct = pcts.get("fixed")
+    supported_time = supported.get("class_time_s", {}) if isinstance(supported, dict) and isinstance(supported.get("class_time_s"), dict) else {}
+    terminal_regions = terminal.get("regions", []) if isinstance(terminal, dict) else []
+    station_count = len(stationary) if isinstance(stationary, list) else 0
+    return [
+        "| Topic | Summary |",
+        "| --- | --- |",
+        f"| Moving route quality | Fixed moving-route distance: {_fmt_any(core_fixed_km)} km ({_fmt_any(core_fixed_pct)}% of plausibility-filtered moving distance). |",
+        f"| Terminal quarantine | {_fmt_any(len(terminal_regions) if isinstance(terminal_regions, list) else 0)} terminal region(s) excluded from core moving headline. |",
+        f"| Stationary/noisy intervals | {_fmt_any(station_count)} middle stationary episode(s) retained and labelled separately. |",
+        f"| Supported fixed classification | Strong={_fmt_any(supported_time.get('strong_supported_moving_fixed'))} s; mixed={_fmt_any(supported_time.get('mixed_supported_moving_fixed'))} s; direction-dependent={_fmt_any(supported_time.get('direction_dependent_fixed'))} s; suspect={_fmt_any(supported_time.get('suspect_fixed'))} s. |",
+        f"| Pass-aware STAT | both-fixed={_fmt_any(pass_aware.get('both_fixed_pct') if isinstance(pass_aware, dict) else None)}%; pass disagreement={_fmt_any(pass_aware.get('pass_disagreement_pct') if isinstance(pass_aware, dict) else None)}%. Raw STAT fixed row percentage is not a headline metric. |",
+    ]
+
+
 def format_quality_markdown(
     analysis: QualityAnalysis,
     *,
@@ -2656,6 +3486,10 @@ def format_quality_markdown(
     raw_fixed_distance = float(suspicion.get("raw_fixed_distance_m", 0.0)) if isinstance(suspicion, dict) else 0.0
     lines = [
         "# RTK Solution Quality Report",
+        "",
+        "## Interpretation",
+        "",
+        *_quality_interpretation_lines(data),
         "",
         "## 1. Input Files And Parser Coverage",
         "",

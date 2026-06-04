@@ -105,6 +105,19 @@ The optional two-pass satellite QC path is split into reusable modules:
 Do not make automatic satellite QC implicit. It must require `--auto-sat-qc`,
 write pass-1 stat evidence, and keep the derived config inspectable.
 
+Quality analysis keeps final RTKLIB/NMEA output state separate from diagnostic
+support. `.stat` `$POS` rows are treated as pass-aware evidence, `$SAT` rows
+are aggregated through cumulative slip/rejection counter increments, and
+terminal or stationary regions are reported separately from the core moving
+route. Do not promote raw `.stat` fixed-row percentage, raw slip flags, or
+global rejection counts to headline position-quality metrics.
+
+Manual annotation support is split between a committed Markdown workbook and
+local-only GPX files. The Markdown parser must preserve user-owned subjective
+annotation blocks verbatim while regenerating only Codex/GPT context blocks.
+The GPX writer used by `annotation-gpx` should remain plain GPX 1.1 without
+custom namespaces or extensions so it loads in common mapping tools.
+
 ## EUREF Fixtures
 
 Keep `test-euref.zip`, downloaded station observations, and RTKLIB-ex source/bin

@@ -140,6 +140,11 @@
   distance in long segments, N50/N80 continuity, top fixed segments, and
   trajectory plausibility. Keep default quality JSON compact; write full
   segment and geometry arrays only through explicit detail-output options.
+- Annotation GPX outputs can leak private route geometry and must stay local
+  and ignored. Commit the Markdown annotation workbook, but preserve the split
+  between tool-owned Codex/GPT generated context blocks and user-owned
+  subjective annotation blocks; tools may refresh only generated blocks and
+  create missing empty user placeholders, never overwrite filled user notes.
 - Large RTKLIB `.stat` analysis must remain indexed and bounded: never perform
   a linear nearest-solution-epoch scan inside loops over `$SAT` rows or raw slip
   flags. Deduplicate slip evidence first, align unique STAT epochs with a

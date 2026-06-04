@@ -389,6 +389,7 @@ def test_rerun_script_emits_quoted_commands(tmp_path: Path) -> None:
     script = (tmp_path / "rerun.sh").read_text(encoding="utf-8")
     markdown = (tmp_path / "commands.md").read_text(encoding="utf-8")
     assert "set -euo pipefail" in script
+    assert f"cd {Path.cwd()}" in script
     assert "run_step()" in script
     assert "usage: $0 [all|quality|only STEP|from STEP]" in script
     assert "_ \"${EXTRA_ARGS[@]}\"" in script

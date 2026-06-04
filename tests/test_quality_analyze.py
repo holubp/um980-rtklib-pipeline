@@ -571,6 +571,124 @@ def test_quality_fast_skips_stat_detail(tmp_path: Path):
     assert any("quality-fast enabled" in warning for warning in data["warnings"])
 
 
+def test_pass_aware_pos_and_supported_moving_fixed_are_separate_from_raw_stat_pct(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    solution = _write_solution_track(tmp_path, base, count=8, step_lat=0.00009, quality=1)
+    stat = tmp_path / "pass.stat"
+    lines = []
+    for index in range(8):
+        tow = 450000.0 + index
+        # First four epochs are fixed in both passes with tiny disagreement.
+        bwd_q = 1 if index < 4 else 2
+        lines.append(f"$POS,2419,{tow:.1f},forward,1,3978640.0,1025000.0,4862800.0,3978640.1,1025000.0,4862800.0\n")
+        lines.append(f"$POS,2419,{tow:.1f},backward,{bwd_q},3978640.2,1025000.0,4862800.0,3978640.2,1025000.0,4862800.0\n")
+    stat.write_text("".join(lines), encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat).as_dict()
+
+    assert data["pass_aware_stat"]["available"] is True
+    assert data["pass_aware_stat"]["both_fixed_pct"] == 50.0
+    assert data["pass_aware_stat"]["pass_disagreement_pct"] == 50.0
+    assert "headline" not in data["pass_aware_stat"]
+    assert data["supported_moving_fixed"]["class_time_s"]["strong_supported_moving_fixed"] > 0.0
+    assert data["supported_moving_fixed"]["class_time_s"]["direction_dependent_fixed"] > 0.0
+
+
+def test_standard_rtklib_pos_rows_are_inferred_as_forward_backward_passes(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    solution = _write_solution_track(tmp_path, base, count=3, step_lat=0.00009, quality=1)
+    stat = tmp_path / "standard-pos.stat"
+    stat.write_text(
+        "$POS,2419,450000.0,1,3978640.0,1025000.0,4862800.0,3978640.1,1025000.0,4862800.0\n"
+        "$POS,2419,450000.0,1,3978640.0,1025000.0,4862800.0,3978640.2,1025000.0,4862800.0\n",
+        encoding="ascii",
+    )
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat).as_dict()
+
+    assert data["parser_coverage"]["stat_pos_lines_parsed"] == 2
+    assert data["pass_aware_stat"]["state_counts"]["both_fixed"] == 1
+
+
+def test_stat_sat_cumulative_counters_report_used_slips_and_rejections(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    solution = _write_solution_track(tmp_path, base, count=4, step_lat=0.00009, quality=1)
+    stat = tmp_path / "sat.stat"
+    stat.write_text(
+        "$SAT,2419,450000.0,G01,L1,45,120,0.12,2.5,1,42,0,0,0,0,0,0,forward\n"
+        "$SAT,2419,450001.0,G01,L1,45,120,0.12,2.5,1,42,0,1,0,0,2,3,forward\n"
+        "$SAT,2419,450002.0,G01,L1,45,120,0.12,2.5,0,42,0,1,0,0,3,5,forward\n",
+        encoding="ascii",
+    )
+
+    data = analyze_rtk_quality(solution_path=solution, stat_path=stat).as_dict()
+    sat = data["stat_sat_diagnostics"]
+
+    assert sat["available"] is True
+    assert sat["new_slipc_events"] == 3
+    assert sat["new_used_slipc_events"] == 2
+    assert sat["new_rejc_events"] == 5
+    assert sat["new_used_rejc_events"] == 3
+    assert sat["used_slip_epoch_pct"] < sat["any_slip_epoch_pct"]
+
+
+def test_terminal_quarantine_excludes_tail_static_fixed_from_moving_headline(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    lines = []
+    for index in range(6):
+        dt = base + timedelta(seconds=index)
+        lines.append(_pos_line(dt, 50.0 + index * 0.00009, 14.0, 250.0, 1))
+    for index in range(6, 18):
+        dt = base + timedelta(seconds=index)
+        lines.append(_pos_line(dt, 50.0 + 5 * 0.00009, 14.0, 250.0, 1))
+    solution = tmp_path / "terminal.pos"
+    solution.write_text("".join(lines), encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=solution).as_dict()
+
+    assert data["terminal_quarantine"]["available"] is True
+    assert data["terminal_quarantine"]["regions"][0]["diagnostic_class"] == "stationary_clean_fixed"
+    full_fixed = data["moving_route"]["full_recording"]["quality_time_s"]["fixed"]
+    core_moving_fixed = data["moving_route"]["core_moving_route"]["quality_time_s"]["fixed"]
+    assert core_moving_fixed < full_fixed
+
+
+def test_middle_stationary_episode_is_labelled_not_trimmed_as_terminal(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    lines = []
+    for index in range(5):
+        lines.append(_pos_line(base + timedelta(seconds=index), 50.0 + index * 0.00009, 14.0, 250.0, 1))
+    for index in range(5, 18):
+        lines.append(_pos_line(base + timedelta(seconds=index), 50.0 + 4 * 0.00009, 14.0, 250.0, 2))
+    for index in range(18, 24):
+        lines.append(_pos_line(base + timedelta(seconds=index), 50.0 + (index - 13) * 0.00009, 14.0, 250.0, 1))
+    solution = tmp_path / "stationary-middle.pos"
+    solution.write_text("".join(lines), encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=solution).as_dict()
+
+    assert data["stationary_episodes"]
+    assert data["stationary_episodes"][0]["diagnostic_class"] == "stationary_noisy"
+    assert data["moving_route"]["core_nonterminal"]["epoch_count"] > data["moving_route"]["core_moving_route"]["epoch_count"]
+
+
+def test_motion_profile_ignores_single_speed_outlier_for_forest_like_run(tmp_path: Path):
+    base = gps_week_tow_to_utc_datetime(2419, 450000.0)
+    lines = []
+    for index in range(20):
+        lat = 50.0 + index * 0.000015
+        if index == 10:
+            lat += 0.002
+        lines.append(_pos_line(base + timedelta(seconds=index), lat, 14.0, 250.0, 1))
+    solution = tmp_path / "spike.pos"
+    solution.write_text("".join(lines), encoding="ascii")
+
+    data = analyze_rtk_quality(solution_path=solution).as_dict()
+
+    assert data["motion"]["max_speed_mps"] > 45.0
+    assert data["motion"]["inferred_profile"] != "highway"
+
+
 def test_no_linear_nearest_epoch_scan_in_quality_module() -> None:
     source = Path("src/um980_rtklib_pipeline/quality.py").read_text(encoding="utf-8")
 
@@ -617,6 +735,19 @@ def test_pipeline_quality_analyze_invokes_analyzer(tmp_path: Path, monkeypatch):
 def _write_minimal_pos(tmp_path: Path) -> Path:
     path = tmp_path / "run.pos"
     path.write_text("2026/05/30 05:00:00.000 50.000000 14.000000 250.0 1 16\n", encoding="ascii")
+    return path
+
+
+def _pos_line(dt: datetime, lat: float, lon: float, height: float, quality: int) -> str:
+    return f"{dt:%Y/%m/%d %H:%M:%S}.000 {lat:.7f} {lon:.7f} {height:.1f} {quality} 18\n"
+
+
+def _write_solution_track(tmp_path: Path, base: datetime, *, count: int, step_lat: float, quality: int) -> Path:
+    path = tmp_path / "track.pos"
+    path.write_text(
+        "".join(_pos_line(base + timedelta(seconds=index), 50.0 + index * step_lat, 14.0, 250.0, quality) for index in range(count)),
+        encoding="ascii",
+    )
     return path
 
 

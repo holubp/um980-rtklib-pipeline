@@ -25,6 +25,8 @@ examples-private/
 *.solution.nmea
 *.solution.csv
 *.solution.gpx
+*.annotation.gpx
+annotations.gpx
 *.solution_all_records.csv
 *.observations.csv
 *.direct.obs
