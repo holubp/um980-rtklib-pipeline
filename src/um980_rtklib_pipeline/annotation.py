@@ -88,12 +88,28 @@ DEFAULT_RECORDING_ANNOTATIONS: tuple[RecordingAnnotation, ...] = (
 
 DEFAULT_SEGMENT_ANNOTATIONS: tuple[AnnotationSegment, ...] = (
     AnnotationSegment(
+        "30050210-051014-051130",
+        "rover_20260530050210",
+        datetime(2026, 5, 30, 5, 10, 14, tzinfo=timezone.utc),
+        datetime(2026, 5, 30, 5, 11, 30, tzinfo=timezone.utc),
+        "reasonably open view",
+        "Reasonably open view with no major obstruction or canopy; useful as an in-device open-view reference.",
+    ),
+    AnnotationSegment(
         "30050210-052000-052600",
         "rover_20260530050210",
         datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
         datetime(2026, 5, 30, 5, 26, tzinfo=timezone.utc),
         "weak/provisional forest moto",
         "Weak/provisional forest moto segment; expected fragmented fixed and stressed diagnostics.",
+    ),
+    AnnotationSegment(
+        "30050210-062052-062203",
+        "rover_20260530050210",
+        datetime(2026, 5, 30, 6, 20, 52, tzinfo=timezone.utc),
+        datetime(2026, 5, 30, 6, 22, 3, tzinfo=timezone.utc),
+        "reasonably open view",
+        "Reasonably open view with no major obstruction or canopy; useful as a second open-view reference.",
     ),
     AnnotationSegment(
         "31063148-070330-070930",
@@ -104,12 +120,20 @@ DEFAULT_SEGMENT_ANNOTATIONS: tuple[AnnotationSegment, ...] = (
         "Clean supported highway fixed segment; expected useful long moving fixed continuity.",
     ),
     AnnotationSegment(
-        "31063148-063900-064600",
+        "31063148-063900-064113",
         "rover_20260531063148",
         datetime(2026, 5, 31, 6, 39, tzinfo=timezone.utc),
+        datetime(2026, 5, 31, 6, 41, 13, tzinfo=timezone.utc),
+        "long tunnel",
+        "First part of the earlier recovery/transition segment; contains a long tunnel.",
+    ),
+    AnnotationSegment(
+        "31063148-064113-064600",
+        "rover_20260531063148",
+        datetime(2026, 5, 31, 6, 41, 13, tzinfo=timezone.utc),
         datetime(2026, 5, 31, 6, 46, tzinfo=timezone.utc),
-        "highway recovery/transition",
-        "Highway recovery/transition segment; expected reacquisition or transition behavior.",
+        "relatively open sky after tunnel",
+        "Second part of the earlier recovery/transition segment; relatively open sky after the tunnel.",
     ),
     AnnotationSegment(
         "31095025-101230-101930",
@@ -120,12 +144,20 @@ DEFAULT_SEGMENT_ANNOTATIONS: tuple[AnnotationSegment, ...] = (
         "Clean supported highway fixed segment; expected strong moving-route continuity.",
     ),
     AnnotationSegment(
-        "31095025-103530-104330",
+        "31095025-103530-104221",
         "rover_20260531095025",
         datetime(2026, 5, 31, 10, 35, 30, tzinfo=timezone.utc),
+        datetime(2026, 5, 31, 10, 42, 21, tzinfo=timezone.utc),
+        "high fixed distance but stressed/mixed before tunnel",
+        "High fixed-distance but stressed/mixed segment before the tunnel; raw fixed distance alone should not be over-rewarded.",
+    ),
+    AnnotationSegment(
+        "31095025-104221-104330",
+        "rover_20260531095025",
+        datetime(2026, 5, 31, 10, 42, 21, tzinfo=timezone.utc),
         datetime(2026, 5, 31, 10, 43, 30, tzinfo=timezone.utc),
-        "high fixed distance but stressed/mixed",
-        "High fixed-distance but stressed/mixed segment; raw fixed distance alone should not be over-rewarded.",
+        "same tunnel, different tube",
+        "Tunnel part of the earlier stressed/mixed segment; same tunnel as the 31063148 split but a different tube.",
     ),
     AnnotationSegment(
         "31184035-185230-185730",
@@ -134,6 +166,30 @@ DEFAULT_SEGMENT_ANNOTATIONS: tuple[AnnotationSegment, ...] = (
         datetime(2026, 5, 31, 18, 57, 30, tzinfo=timezone.utc),
         "usable mixed forest-road fixed",
         "Usable mixed forest-road fixed segment; expected moderate support under harder conditions.",
+    ),
+    AnnotationSegment(
+        "31184035-185804-185942",
+        "rover_20260531184035",
+        datetime(2026, 5, 31, 18, 58, 4, tzinfo=timezone.utc),
+        datetime(2026, 5, 31, 18, 59, 42, tzinfo=timezone.utc),
+        "typical forest road/street",
+        "Typical road or street through a forest; useful for forest-road in-device annotation.",
+    ),
+    AnnotationSegment(
+        "31184035-191511-191555",
+        "rover_20260531184035",
+        datetime(2026, 5, 31, 19, 15, 11, tzinfo=timezone.utc),
+        datetime(2026, 5, 31, 19, 15, 55, tzinfo=timezone.utc),
+        "typical forest road/street",
+        "Typical road or street through a forest; short forest-road comparison segment.",
+    ),
+    AnnotationSegment(
+        "31184035-191603-191653",
+        "rover_20260531184035",
+        datetime(2026, 5, 31, 19, 16, 3, tzinfo=timezone.utc),
+        datetime(2026, 5, 31, 19, 16, 53, tzinfo=timezone.utc),
+        "tree alley road",
+        "Typical road in a tree alley; useful for distinguishing alley effects from denser canopy.",
     ),
     AnnotationSegment(
         "31063148-073630-074100",
@@ -263,7 +319,11 @@ def update_annotation_markdown(
             lines.extend(_rtk_generated_block(segment.segment_id, run))
             lines.extend([rtk_block, ""])
 
-    unused = [block for key, block in preserved_user_blocks.items() if key not in used_user_keys]
+    unused = [
+        block
+        for key, block in preserved_user_blocks.items()
+        if key not in used_user_keys and _user_block_has_notes(block)
+    ]
     if unused:
         lines.extend(["## Preserved Unmatched User Annotation Blocks", ""])
         lines.extend(unused)
@@ -405,6 +465,21 @@ def _collect_user_blocks(text: str) -> dict[str, str]:
     if starts != len(blocks) or ends != len(blocks):
         raise ValueError("malformed user annotation sentinel structure")
     return blocks
+
+
+def _user_block_has_notes(block: str) -> bool:
+    """Return true when a user-owned block contains non-placeholder notes."""
+
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("- ") or ":" not in line:
+            continue
+        key, value = line[2:].split(":", 1)
+        if key.strip() == "Annotation kind":
+            continue
+        if value.strip():
+            return True
+    return False
 
 
 def _parse_cli_datetime(value: str) -> datetime:

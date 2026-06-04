@@ -96,6 +96,32 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 
 ## Segment Annotations
 
+### Segment: 30050210-051014-051130
+
+<!-- codex-generated:start segment=30050210-051014-051130 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `30050210-051014-051130`
+- Recording ID: `rover_20260530050210`
+- Time window UTC: `2026-05-30T05:10:14Z` to `2026-05-30T05:11:30Z`
+- Label: reasonably open view
+- Expected context: Reasonably open view with no major obstruction or canopy; useful as an in-device open-view reference.
+- GPX in-device track: `30050210-051014-051130 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=30050210-051014-051130 -->
+
+<!-- user-annotation:start segment=30050210-051014-051130 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: reasonably open view, no major obstructions and no canopy.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=30050210-051014-051130 -->
+
 ### Segment: 30050210-052000-052600
 
 <!-- codex-generated:start segment=30050210-052000-052600 -->
@@ -121,6 +147,32 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=30050210-052000-052600 -->
+
+### Segment: 30050210-062052-062203
+
+<!-- codex-generated:start segment=30050210-062052-062203 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `30050210-062052-062203`
+- Recording ID: `rover_20260530050210`
+- Time window UTC: `2026-05-30T06:20:52Z` to `2026-05-30T06:22:03Z`
+- Label: reasonably open view
+- Expected context: Reasonably open view with no major obstruction or canopy; useful as a second open-view reference.
+- GPX in-device track: `30050210-062052-062203 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=30050210-062052-062203 -->
+
+<!-- user-annotation:start segment=30050210-062052-062203 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: reasonably open view, no major obstructions and no canopy.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=30050210-062052-062203 -->
 
 ### Segment: 30050210-062300-062600
 
@@ -148,31 +200,57 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Notes:
 <!-- user-annotation:end segment=30050210-062300-062600 -->
 
-### Segment: 31063148-063900-064600
+### Segment: 31063148-063900-064113
 
-<!-- codex-generated:start segment=31063148-063900-064600 -->
+<!-- codex-generated:start segment=31063148-063900-064113 -->
 ### Codex/GPT Generated Annotation
 
-- Segment ID: `31063148-063900-064600`
+- Segment ID: `31063148-063900-064113`
 - Recording ID: `rover_20260531063148`
-- Time window UTC: `2026-05-31T06:39:00Z` to `2026-05-31T06:46:00Z`
-- Label: highway recovery/transition
-- Expected context: Highway recovery/transition segment; expected reacquisition or transition behavior.
-- GPX in-device track: `31063148-063900-064600 in-device`
+- Time window UTC: `2026-05-31T06:39:00Z` to `2026-05-31T06:41:13Z`
+- Label: long tunnel
+- Expected context: First part of the earlier recovery/transition segment; contains a long tunnel.
+- GPX in-device track: `31063148-063900-064113 in-device`
 - Annotation status: needs-user-review
-<!-- codex-generated:end segment=31063148-063900-064600 -->
+<!-- codex-generated:end segment=31063148-063900-064113 -->
 
-<!-- user-annotation:start segment=31063148-063900-064600 -->
+<!-- user-annotation:start segment=31063148-063900-064113 -->
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Actual capture conditions:
+- Actual capture conditions: User note: long tunnel; split point approximately 08:41:13 local / 06:41:13 UTC.
 - In-device solution quality:
 - RTKLIB solution quality:
 - Map/trajectory observations:
 - Reviewer/date:
 - Notes:
-<!-- user-annotation:end segment=31063148-063900-064600 -->
+<!-- user-annotation:end segment=31063148-063900-064113 -->
+
+### Segment: 31063148-064113-064600
+
+<!-- codex-generated:start segment=31063148-064113-064600 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `31063148-064113-064600`
+- Recording ID: `rover_20260531063148`
+- Time window UTC: `2026-05-31T06:41:13Z` to `2026-05-31T06:46:00Z`
+- Label: relatively open sky after tunnel
+- Expected context: Second part of the earlier recovery/transition segment; relatively open sky after the tunnel.
+- GPX in-device track: `31063148-064113-064600 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=31063148-064113-064600 -->
+
+<!-- user-annotation:start segment=31063148-064113-064600 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: relatively open sky after the tunnel; starts approximately 08:41:13 local / 06:41:13 UTC.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=31063148-064113-064600 -->
 
 ### Segment: 31063148-070330-070930
 
@@ -252,31 +330,57 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Notes:
 <!-- user-annotation:end segment=31095025-101230-101930 -->
 
-### Segment: 31095025-103530-104330
+### Segment: 31095025-103530-104221
 
-<!-- codex-generated:start segment=31095025-103530-104330 -->
+<!-- codex-generated:start segment=31095025-103530-104221 -->
 ### Codex/GPT Generated Annotation
 
-- Segment ID: `31095025-103530-104330`
+- Segment ID: `31095025-103530-104221`
 - Recording ID: `rover_20260531095025`
-- Time window UTC: `2026-05-31T10:35:30Z` to `2026-05-31T10:43:30Z`
-- Label: high fixed distance but stressed/mixed
-- Expected context: High fixed-distance but stressed/mixed segment; raw fixed distance alone should not be over-rewarded.
-- GPX in-device track: `31095025-103530-104330 in-device`
+- Time window UTC: `2026-05-31T10:35:30Z` to `2026-05-31T10:42:21Z`
+- Label: high fixed distance but stressed/mixed before tunnel
+- Expected context: High fixed-distance but stressed/mixed segment before the tunnel; raw fixed distance alone should not be over-rewarded.
+- GPX in-device track: `31095025-103530-104221 in-device`
 - Annotation status: needs-user-review
-<!-- codex-generated:end segment=31095025-103530-104330 -->
+<!-- codex-generated:end segment=31095025-103530-104221 -->
 
-<!-- user-annotation:start segment=31095025-103530-104330 -->
+<!-- user-annotation:start segment=31095025-103530-104221 -->
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Actual capture conditions:
+- Actual capture conditions: User note: pre-tunnel part of the originally selected stressed/mixed segment; the same tunnel starts after approximately 12:42:21 local / 10:42:21 UTC.
 - In-device solution quality:
 - RTKLIB solution quality:
 - Map/trajectory observations:
 - Reviewer/date:
 - Notes:
-<!-- user-annotation:end segment=31095025-103530-104330 -->
+<!-- user-annotation:end segment=31095025-103530-104221 -->
+
+### Segment: 31095025-104221-104330
+
+<!-- codex-generated:start segment=31095025-104221-104330 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `31095025-104221-104330`
+- Recording ID: `rover_20260531095025`
+- Time window UTC: `2026-05-31T10:42:21Z` to `2026-05-31T10:43:30Z`
+- Label: same tunnel, different tube
+- Expected context: Tunnel part of the earlier stressed/mixed segment; same tunnel as the 31063148 split but a different tube.
+- GPX in-device track: `31095025-104221-104330 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=31095025-104221-104330 -->
+
+<!-- user-annotation:start segment=31095025-104221-104330 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: same tunnel as in the 31063148 split, different tube; starts after approximately 12:42:21 local / 10:42:21 UTC.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=31095025-104221-104330 -->
 
 ### Segment: 31095025-105000-105940
 
@@ -330,6 +434,32 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Notes:
 <!-- user-annotation:end segment=31184035-185230-185730 -->
 
+### Segment: 31184035-185804-185942
+
+<!-- codex-generated:start segment=31184035-185804-185942 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `31184035-185804-185942`
+- Recording ID: `rover_20260531184035`
+- Time window UTC: `2026-05-31T18:58:04Z` to `2026-05-31T18:59:42Z`
+- Label: typical forest road/street
+- Expected context: Typical road or street through a forest; useful for forest-road in-device annotation.
+- GPX in-device track: `31184035-185804-185942 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=31184035-185804-185942 -->
+
+<!-- user-annotation:start segment=31184035-185804-185942 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: typical road/street through a forest.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=31184035-185804-185942 -->
+
 ### Segment: 31184035-190315-190945
 
 <!-- codex-generated:start segment=31184035-190315-190945 -->
@@ -355,3 +485,55 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31184035-190315-190945 -->
+
+### Segment: 31184035-191511-191555
+
+<!-- codex-generated:start segment=31184035-191511-191555 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `31184035-191511-191555`
+- Recording ID: `rover_20260531184035`
+- Time window UTC: `2026-05-31T19:15:11Z` to `2026-05-31T19:15:55Z`
+- Label: typical forest road/street
+- Expected context: Typical road or street through a forest; short forest-road comparison segment.
+- GPX in-device track: `31184035-191511-191555 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=31184035-191511-191555 -->
+
+<!-- user-annotation:start segment=31184035-191511-191555 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: typical road/street through a forest.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=31184035-191511-191555 -->
+
+### Segment: 31184035-191603-191653
+
+<!-- codex-generated:start segment=31184035-191603-191653 -->
+### Codex/GPT Generated Annotation
+
+- Segment ID: `31184035-191603-191653`
+- Recording ID: `rover_20260531184035`
+- Time window UTC: `2026-05-31T19:16:03Z` to `2026-05-31T19:16:53Z`
+- Label: tree alley road
+- Expected context: Typical road in a tree alley; useful for distinguishing alley effects from denser canopy.
+- GPX in-device track: `31184035-191603-191653 in-device`
+- Annotation status: needs-user-review
+<!-- codex-generated:end segment=31184035-191603-191653 -->
+
+<!-- user-annotation:start segment=31184035-191603-191653 -->
+### User Subjective Annotation
+
+- Annotation kind: segment
+- Actual capture conditions: User note: typical road in a tree alley.
+- In-device solution quality:
+- RTKLIB solution quality:
+- Map/trajectory observations:
+- Reviewer/date:
+- Notes:
+<!-- user-annotation:end segment=31184035-191603-191653 -->

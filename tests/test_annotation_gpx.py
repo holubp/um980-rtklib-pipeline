@@ -7,6 +7,7 @@ from pathlib import Path
 from um980_rtklib_pipeline.annotation import (
     AnnotationSegment,
     AnnotationTrack,
+    DEFAULT_SEGMENT_ANNOTATIONS,
     RecordingAnnotation,
     RtkAnnotationRun,
     update_annotation_markdown,
@@ -116,6 +117,87 @@ def test_markdown_rerun_updates_codex_block_without_touching_user_annotation() -
     assert "Updated Codex context." in second
     assert "Initial Codex context." not in second
     assert "- Actual capture conditions: highway, open sky" in second
+
+
+def test_markdown_rerun_drops_obsolete_empty_user_placeholders() -> None:
+    first = update_annotation_markdown(
+        None,
+        recordings=[RecordingAnnotation("rec", "rec", "context")],
+        segments=[
+            AnnotationSegment(
+                "old",
+                "rec",
+                datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
+                datetime(2026, 5, 30, 5, 21, tzinfo=timezone.utc),
+                "old",
+                "context",
+            )
+        ],
+        rtk_runs=[],
+    )
+
+    second = update_annotation_markdown(
+        first,
+        recordings=[RecordingAnnotation("rec", "rec", "context")],
+        segments=[
+            AnnotationSegment(
+                "new",
+                "rec",
+                datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
+                datetime(2026, 5, 30, 5, 21, tzinfo=timezone.utc),
+                "new",
+                "context",
+            )
+        ],
+        rtk_runs=[],
+    )
+
+    assert "segment=old" not in second
+    assert "segment=new" in second
+
+
+def test_markdown_rerun_preserves_obsolete_non_empty_user_blocks() -> None:
+    first = update_annotation_markdown(
+        None,
+        recordings=[RecordingAnnotation("rec", "rec", "context")],
+        segments=[
+            AnnotationSegment(
+                "old",
+                "rec",
+                datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
+                datetime(2026, 5, 30, 5, 21, tzinfo=timezone.utc),
+                "old",
+                "context",
+            )
+        ],
+        rtk_runs=[],
+    ).replace("- Actual capture conditions:\n", "- Actual capture conditions: keep me\n")
+
+    second = update_annotation_markdown(
+        first,
+        recordings=[RecordingAnnotation("rec", "rec", "context")],
+        segments=[],
+        rtk_runs=[],
+    )
+
+    assert "## Preserved Unmatched User Annotation Blocks" in second
+    assert "- Actual capture conditions: keep me" in second
+
+
+def test_default_segments_include_open_view_and_split_tunnel_updates() -> None:
+    ids = {segment.segment_id for segment in DEFAULT_SEGMENT_ANNOTATIONS}
+
+    assert "30050210-051014-051130" in ids
+    assert "30050210-062052-062203" in ids
+    assert "31184035-185804-185942" in ids
+    assert "31184035-191511-191555" in ids
+    assert "31184035-191603-191653" in ids
+    assert "31063148-063900-064113" in ids
+    assert "31063148-064113-064600" in ids
+    assert "31063148-063900-064600" not in ids
+    assert "31095025-103530-104221" in ids
+    assert "31095025-104221-104330" in ids
+    assert "31095025-103530-104330" not in ids
 
 
 def test_running_without_rtk_runs_does_not_create_rtk_annotation_blocks() -> None:
