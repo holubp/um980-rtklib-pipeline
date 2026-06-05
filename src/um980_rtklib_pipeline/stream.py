@@ -232,8 +232,7 @@ def is_plausible_command_response_line(line: bytes) -> bool:
         line.decode("ascii")
     except UnicodeDecodeError:
         return False
-    ok = nmea_checksum_ok(line)
-    return ok is not False
+    return True
 
 
 def unicore_ascii_checksum_ok(line: bytes) -> bool | None:

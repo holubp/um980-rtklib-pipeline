@@ -1,0 +1,23 @@
+mode: binary
+expect_mode: binary
+expected_messages: BESTNAVB,OBSVMCMPB
+family: binary_rawobs_solution
+rate_hz: 20
+stress: true
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+disabled_reason: 20 Hz raw observation stress profile requires UM980_BANDWIDTH_STRESS=1 and explicit enabling.
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+BESTNAVB COM1 0.05
+OBSVMCMPB COM1 0.05
+GPSEPHB COM1 300
+GLOEPHB COM1 300
+GALEPHB COM1 300
+BDSEPHB COM1 300
+BD3EPHB COM1 300
+QZSSEPHB COM1 300

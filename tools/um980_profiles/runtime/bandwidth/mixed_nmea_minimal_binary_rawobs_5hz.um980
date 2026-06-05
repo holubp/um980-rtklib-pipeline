@@ -1,0 +1,25 @@
+# enabled: true
+mode: mixed
+expect_mode: mixed
+expected_messages: GGA,RMC,BESTNAVB,OBSVMCMPB
+family: mixed_nmea_binary_rawobs
+rate_hz: 5
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.2
+GNRMC 0.2
+GNVTG 0.2
+BESTNAVB COM1 0.2
+OBSVMCMPB COM1 0.2
+GPSEPHB COM1 300
+GLOEPHB COM1 300
+GALEPHB COM1 300
+BDSEPHB COM1 300
+BD3EPHB COM1 300
+QZSSEPHB COM1 300

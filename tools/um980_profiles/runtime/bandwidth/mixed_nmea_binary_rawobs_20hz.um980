@@ -1,0 +1,19 @@
+mode: mixed
+expect_mode: mixed
+expected_messages: GGA,RMC,BESTNAVB,OBSVMCMPB
+family: mixed_nmea_binary_rawobs
+rate_hz: 20
+stress: true
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+disabled_reason: 20 Hz mixed raw observation stress profile requires UM980_BANDWIDTH_STRESS=1 and explicit enabling.
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.05
+GNRMC 0.05
+BESTNAVB COM1 0.05
+OBSVMCMPB COM1 0.05

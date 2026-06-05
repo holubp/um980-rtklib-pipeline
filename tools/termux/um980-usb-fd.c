@@ -44,6 +44,7 @@ struct options {
     int ep_in_override;
     int ep_out_override;
     long long expect_min_bytes;
+    int serial_baud;
     int fd;
 };
 
@@ -53,6 +54,7 @@ struct selected_endpoint {
     unsigned char ep_in;
     unsigned char ep_out;
     unsigned char ep_in_type;
+    int ep_in_max_packet_size;
     bool has_out;
 };
 
@@ -60,6 +62,7 @@ struct command_profile {
     char commands[MAX_COMMANDS][MAX_COMMAND_LEN];
     int count;
     bool enabled;
+    bool allow_reviewed_port_commands;
 };
 
 struct run_summary {
@@ -76,6 +79,8 @@ struct run_summary {
     int altsetting;
     int id_vendor;
     int id_product;
+    int serial_baud;
+    bool ftdi_serial_mode;
     const char *output_path;
     int exit_status;
     const char *error_message;
@@ -113,6 +118,7 @@ static void usage(FILE *stream) {
             "  --ep-in 0xNN\n"
             "  --ep-out 0xNN\n"
             "  --expect-min-bytes N\n"
+            "  --serial-baud N\n"
             "  --verbose\n"
             "  --help\n");
 }
@@ -143,11 +149,12 @@ static bool has_shell_metachar(const char *line) {
     return strpbrk(line, ";&|`$<>") != NULL;
 }
 
-static bool contains_unsafe_token(const char *line, char *token_out, size_t token_out_len) {
+static bool contains_unsafe_token(const char *line, bool allow_reviewed_port_commands, char *token_out, size_t token_out_len) {
     static const char *tokens[] = {
         "SAVECONFIG", "SAVE", "FRESET", "FACTORY", "DEFAULT", "ERASE", "FORMAT",
-        "UPDATE", "UPGRADE", "BOOT", "BAUD", "COM", "USBMODE", "PERMANENT",
+        "UPDATE", "UPGRADE", "BOOT", "USBMODE", "PERMANENT",
         "NVM", "FLASH", "RESET", NULL};
+    static const char *reviewable_port_tokens[] = {"BAUD", "COM", NULL};
     char upper[MAX_COMMAND_LEN];
     size_t n = strlen(line);
     if (n >= sizeof(upper)) {
@@ -162,6 +169,14 @@ static bool contains_unsafe_token(const char *line, char *token_out, size_t toke
         if (strstr(upper, tokens[i]) != NULL) {
             snprintf(token_out, token_out_len, "%s", tokens[i]);
             return true;
+        }
+    }
+    if (!allow_reviewed_port_commands) {
+        for (int i = 0; reviewable_port_tokens[i] != NULL; i++) {
+            if (strstr(upper, reviewable_port_tokens[i]) != NULL) {
+                snprintf(token_out, token_out_len, "%s", reviewable_port_tokens[i]);
+                return true;
+            }
         }
     }
     return false;
@@ -210,6 +225,10 @@ static int load_profile(const char *path, struct command_profile *profile, char 
                 (strstr(active, "true") != NULL || strstr(active, "TRUE") != NULL || strstr(active, "True") != NULL)) {
                 profile->enabled = true;
             }
+            if (strncasecmp(active, "allow_reviewed_port_commands:", 29) == 0 &&
+                (strstr(active, "true") != NULL || strstr(active, "TRUE") != NULL || strstr(active, "True") != NULL)) {
+                profile->allow_reviewed_port_commands = true;
+            }
             continue;
         }
         if (has_shell_metachar(active)) {
@@ -218,7 +237,7 @@ static int load_profile(const char *path, struct command_profile *profile, char 
             return -1;
         }
         char token[64];
-        if (contains_unsafe_token(active, token, sizeof(token))) {
+        if (contains_unsafe_token(active, profile->allow_reviewed_port_commands, token, sizeof(token))) {
             snprintf(error, error_len, "%s:%d unsafe receiver token %s in active command", path, line_no, token);
             fclose(fp);
             return -1;
@@ -256,6 +275,7 @@ static int parse_args(int argc, char **argv, struct options *opts) {
     opts->altsetting_override = -1;
     opts->ep_in_override = -1;
     opts->ep_out_override = -1;
+    opts->serial_baud = 0;
     opts->fd = -1;
     static const struct option long_options[] = {
         {"probe", no_argument, 0, 1},
@@ -274,7 +294,8 @@ static int parse_args(int argc, char **argv, struct options *opts) {
         {"ep-in", required_argument, 0, 14},
         {"ep-out", required_argument, 0, 15},
         {"expect-min-bytes", required_argument, 0, 16},
-        {"verbose", no_argument, 0, 17},
+        {"serial-baud", required_argument, 0, 17},
+        {"verbose", no_argument, 0, 18},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -305,7 +326,8 @@ static int parse_args(int argc, char **argv, struct options *opts) {
             opts->ep_out_override = value;
             break;
         case 16: opts->expect_min_bytes = atoll(optarg); break;
-        case 17: opts->verbose = true; break;
+        case 17: opts->serial_baud = atoi(optarg); break;
+        case 18: opts->verbose = true; break;
         case 'h': usage(stdout); exit(0);
         default: usage(stderr); return -1;
         }
@@ -413,6 +435,13 @@ static int select_endpoint(libusb_device_handle *handle, const struct options *o
                 selected->ep_in = ep_in;
                 selected->ep_out = ep_out;
                 selected->ep_in_type = ep_in_type;
+                selected->ep_in_max_packet_size = 64;
+                for (int k = 0; k < alt->bNumEndpoints; k++) {
+                    const struct libusb_endpoint_descriptor *ep = &alt->endpoint[k];
+                    if (ep->bEndpointAddress == ep_in) {
+                        selected->ep_in_max_packet_size = ep->wMaxPacketSize > 0 ? ep->wMaxPacketSize : 64;
+                    }
+                }
                 selected->has_out = ep_out != 0;
             }
         }
@@ -432,6 +461,66 @@ static int claim_selected(libusb_device_handle *handle, const struct selected_en
     }
     libusb_set_interface_alt_setting(handle, selected->interface_number, selected->altsetting);
     return 0;
+}
+
+static int configure_ftdi_serial(libusb_device_handle *handle, int interface_number, int baud, char *error, size_t error_len) {
+    if (baud <= 0) {
+        return 0;
+    }
+    int index = interface_number + 1;
+    int rc = libusb_control_transfer(handle, 0x40, 0, 0, index, NULL, 0, 1000);
+    if (rc < 0) {
+        snprintf(error, error_len, "FTDI reset failed: %s", libusb_error_name(rc));
+        return -1;
+    }
+    rc = libusb_control_transfer(handle, 0x40, 0, 1, index, NULL, 0, 1000);
+    if (rc < 0) {
+        snprintf(error, error_len, "FTDI RX purge failed: %s", libusb_error_name(rc));
+        return -1;
+    }
+    rc = libusb_control_transfer(handle, 0x40, 0, 2, index, NULL, 0, 1000);
+    if (rc < 0) {
+        snprintf(error, error_len, "FTDI TX purge failed: %s", libusb_error_name(rc));
+        return -1;
+    }
+    rc = libusb_control_transfer(handle, 0x40, 4, 8, index, NULL, 0, 1000);
+    if (rc < 0) {
+        snprintf(error, error_len, "FTDI 8N1 setup failed: %s", libusb_error_name(rc));
+        return -1;
+    }
+    int divisor = (3000000 + baud / 2) / baud;
+    if (divisor <= 0) {
+        divisor = 1;
+    }
+    int value = divisor & 0xffff;
+    int baud_index = index | ((divisor >> 16) & 0xffff);
+    rc = libusb_control_transfer(handle, 0x40, 3, value, baud_index, NULL, 0, 1000);
+    if (rc < 0) {
+        snprintf(error, error_len, "FTDI baud setup failed: %s", libusb_error_name(rc));
+        return -1;
+    }
+    return 0;
+}
+
+static size_t write_ftdi_payload(FILE *out, const unsigned char *buffer, int transferred, int max_packet_size) {
+    if (max_packet_size <= 2) {
+        max_packet_size = 64;
+    }
+    size_t written = 0;
+    int offset = 0;
+    while (offset < transferred) {
+        int packet_len = transferred - offset;
+        if (packet_len > max_packet_size) {
+            packet_len = max_packet_size;
+        }
+        if (packet_len > 2) {
+            size_t chunk = (size_t)(packet_len - 2);
+            fwrite(buffer + offset + 2, 1, chunk, out);
+            written += chunk;
+        }
+        offset += packet_len;
+    }
+    return written;
 }
 
 static int send_profile(libusb_device_handle *handle, const struct selected_endpoint *selected, const struct options *opts, const struct command_profile *profile) {
@@ -486,6 +575,8 @@ static int write_analysis_json(const char *path, const struct run_summary *s) {
             "  \"altsetting\": %d,\n"
             "  \"id_vendor\": \"0x%04x\",\n"
             "  \"id_product\": \"0x%04x\",\n"
+            "  \"serial_baud\": %d,\n"
+            "  \"ftdi_serial_mode\": %s,\n"
             "  \"output_path\": \"%s\",\n"
             "  \"exit_status\": %d,\n"
             "  \"error_message\": \"%s\"\n"
@@ -494,12 +585,13 @@ static int write_analysis_json(const char *path, const struct run_summary *s) {
             s->read_timeouts, s->read_errors, s->endpoint_in,
             endpoint_out_json,
             s->interface_number, s->altsetting, s->id_vendor, s->id_product,
+            s->serial_baud, s->ftdi_serial_mode ? "true" : "false",
             s->output_path ? s->output_path : "", s->exit_status, s->error_message ? s->error_message : "");
     fclose(fp);
     return 0;
 }
 
-static int capture_loop(libusb_device_handle *handle, const struct selected_endpoint *selected, const struct options *opts, struct run_summary *summary) {
+static int capture_loop(libusb_device_handle *handle, const struct selected_endpoint *selected, const struct options *opts, struct run_summary *summary, bool ftdi_serial_mode) {
     FILE *out = fopen(opts->out_path, "wb");
     if (out == NULL) {
         summary->error_message = "failed to open output file";
@@ -524,8 +616,12 @@ static int capture_loop(libusb_device_handle *handle, const struct selected_endp
             rc = libusb_bulk_transfer(handle, selected->ep_in, buffer, want, &transferred, opts->read_timeout_ms);
         }
         if (transferred > 0) {
-            fwrite(buffer, 1, (size_t)transferred, out);
-            bytes += transferred;
+            if (ftdi_serial_mode) {
+                bytes += (long long)write_ftdi_payload(out, buffer, transferred, selected->ep_in_max_packet_size);
+            } else {
+                fwrite(buffer, 1, (size_t)transferred, out);
+                bytes += transferred;
+            }
         }
         if (rc == LIBUSB_ERROR_TIMEOUT) {
             timeouts++;
@@ -634,6 +730,8 @@ int main(int argc, char **argv) {
     summary.altsetting = selected.altsetting;
     summary.id_vendor = dd.idVendor;
     summary.id_product = dd.idProduct;
+    summary.serial_baud = opts.serial_baud;
+    summary.ftdi_serial_mode = (dd.idVendor == 0x0403 && opts.serial_baud > 0);
     summary.output_path = opts.out_path;
     summary.exit_status = 0;
     summary.error_message = "";
@@ -645,14 +743,27 @@ int main(int argc, char **argv) {
             summary.error_message = "failed to claim interface";
         } else {
             if (opts.verbose) {
-                fprintf(stderr, "selected interface=%d altsetting=%d ep_in=0x%02x ep_out=%s\n",
+                fprintf(stderr, "selected interface=%d altsetting=%d ep_in=0x%02x ep_out=%s serial_baud=%d\n",
                         selected.interface_number, selected.altsetting, selected.ep_in,
-                        selected.has_out ? "available" : "none");
+                        selected.has_out ? "available" : "none", opts.serial_baud);
+            }
+            bool ftdi_serial_mode = summary.ftdi_serial_mode;
+            if (ftdi_serial_mode) {
+                if (configure_ftdi_serial(handle, selected.interface_number, opts.serial_baud, error, sizeof(error)) != 0) {
+                    fprintf(stderr, "%s\n", error);
+                    summary.exit_status = 1;
+                    summary.error_message = "failed to configure FTDI serial bridge";
+                    libusb_release_interface(handle, selected.interface_number);
+                    write_analysis_json(opts.analysis_json, &summary);
+                    libusb_close(handle);
+                    libusb_exit(ctx);
+                    return summary.exit_status;
+                }
             }
             if (send_profile(handle, &selected, &opts, &profile) != 0) {
                 summary.exit_status = 1;
                 summary.error_message = "failed to send profile";
-            } else if (capture_loop(handle, &selected, &opts, &summary) != 0) {
+            } else if (capture_loop(handle, &selected, &opts, &summary, ftdi_serial_mode) != 0) {
                 summary.exit_status = 1;
             }
             libusb_release_interface(handle, selected.interface_number);

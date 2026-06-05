@@ -66,3 +66,14 @@ def test_unsafe_words_in_comments_are_ignored() -> None:
 def test_shell_metacharacters_are_rejected() -> None:
     with pytest.raises(CaptureProfileError):
         parse_capture_profile_text("# enabled: true\nLOG GGA ONTIME 1; SAVECONFIG\n")
+
+
+def test_reviewed_port_commands_require_explicit_metadata() -> None:
+    with pytest.raises(CaptureProfileError):
+        parse_capture_profile_text("# enabled: true\nBESTNAVB COM1 0.05\n")
+
+    profile = parse_capture_profile_text(
+        "# enabled: true\nallow_reviewed_port_commands: true\nBESTNAVB COM1 0.05\nUNLOG COM1\n"
+    )
+
+    assert profile.commands == ("BESTNAVB COM1 0.05", "UNLOG COM1")

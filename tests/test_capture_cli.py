@@ -1,4 +1,6 @@
 from pathlib import Path
+from argparse import Namespace
+from types import SimpleNamespace
 
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline import capture_termux
@@ -51,6 +53,10 @@ def test_capture_usb_passes_options_to_wrapper(tmp_path: Path, monkeypatch) -> N
             "GGA",
             "--native-helper",
             "helper",
+            "--serial-baud",
+            "230400",
+            "--command-timeout-s",
+            "7",
         ]
     )
 
@@ -62,6 +68,8 @@ def test_capture_usb_passes_options_to_wrapper(tmp_path: Path, monkeypatch) -> N
     assert seen["options"].extract_check is True
     assert seen["options"].expect_messages == ("GGA",)
     assert seen["options"].native_helper == Path("helper")
+    assert seen["options"].serial_baud == 230400
+    assert seen["options"].command_timeout_s == 7
 
 
 def test_hardware_capture_tests_are_opt_in(monkeypatch) -> None:
@@ -91,3 +99,37 @@ def test_native_helper_build_uses_shell_even_when_script_is_not_executable(tmp_p
     assert seen["check"] is True
     assert seen["command"][-1] == "tools/termux/build-um980-usb-fd.sh"
     assert seen["command"][0].endswith("/sh") or seen["command"][0] == "sh"
+
+
+def test_rinex_nav_only_passes_parsed_records_to_nav_extractor(tmp_path: Path, monkeypatch) -> None:
+    parsed_records = [object()]
+    out_dir = tmp_path / "nav-out"
+    seen = {}
+
+    def fake_extract_bundle(args):  # noqa: ANN001
+        return (tmp_path / "rover.unc", parsed_records, object(), object(), object(), object(), object(), object(), {})
+
+    def fake_extract_rover_nav(records, output_path):  # noqa: ANN001
+        seen["records"] = records
+        seen["output_path"] = output_path
+        return SimpleNamespace(written={})
+
+    monkeypatch.setattr(cli, "_extract_bundle", fake_extract_bundle)
+    monkeypatch.setattr(cli, "extract_rover_nav", fake_extract_rover_nav)
+    args = Namespace(
+        rover_log=str(tmp_path / "rover.unc"),
+        verbose=False,
+        debug=False,
+        out_dir=str(out_dir),
+        basename="rover",
+        analysis_json=False,
+        solution="none",
+        position_nmea="none",
+        nav_only=True,
+        log_file=None,
+    )
+
+    assert cli.cmd_rinex(args) == 0
+    assert seen["records"] is parsed_records
+    assert seen["output_path"] == out_dir / "rover.rover-gps.nav"
+    assert out_dir.is_dir()

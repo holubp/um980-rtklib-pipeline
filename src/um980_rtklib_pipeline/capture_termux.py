@@ -40,6 +40,8 @@ class CaptureUsbOptions:
     altsetting: int | None = None
     ep_in: str | None = None
     ep_out: str | None = None
+    serial_baud: int | None = None
+    command_timeout_s: float | None = None
     verbose: bool = False
 
 
@@ -91,7 +93,10 @@ def run_capture_usb(options: CaptureUsbOptions) -> CaptureUsbResult:
     ensure_native_helper(options.native_helper)
     usb_analysis_path = _usb_analysis_path(options)
     command = _termux_usb_command(options, usb_analysis_path)
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, check=False, timeout=options.command_timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"termux USB capture timed out after {options.command_timeout_s}s") from exc
     if options.verbose and completed.stdout:
         print(completed.stdout, end="")
     if options.verbose and completed.stderr:
@@ -115,7 +120,7 @@ def run_capture_usb(options: CaptureUsbOptions) -> CaptureUsbResult:
         if validation.errors:
             raise RuntimeError(f"capture validation failed: {'; '.join(validation.errors)}")
     if options.extract_check and options.out is not None:
-        extract_result = run_extract_check(options.out, verbose=options.verbose)
+        extract_result = run_extract_check(options.out, verbose=options.verbose, timeout_s=options.command_timeout_s)
         if not extract_result.get("passed"):
             raise RuntimeError(f"extract-check failed: {extract_result.get('error_message', 'unknown error')}")
     result = CaptureUsbResult(
@@ -146,7 +151,7 @@ def ensure_native_helper(helper: Path) -> None:
         raise FileNotFoundError(f"native helper build completed but {helper} still does not exist")
 
 
-def run_extract_check(capture_file: Path, *, verbose: bool = False) -> dict[str, object]:
+def run_extract_check(capture_file: Path, *, verbose: bool = False, timeout_s: float | None = None) -> dict[str, object]:
     """Run the existing extraction path as structural parser validation."""
 
     out_dir = capture_file.with_suffix("")
@@ -171,7 +176,19 @@ def run_extract_check(capture_file: Path, *, verbose: bool = False) -> dict[str,
         command.append("-v")
     env = os.environ.copy()
     env["PYTHONPATH"] = f"src{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "src"
-    completed = subprocess.run(command, text=True, capture_output=True, env=env, check=False)
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, env=env, check=False, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "passed": False,
+            "returncode": None,
+            "command": command,
+            "out_dir": str(out_dir),
+            "analysis_json": str(analysis_path),
+            "stdout_tail": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+            "stderr_tail": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
+            "error_message": f"extract-check timed out after {timeout_s}s",
+        }
     analysis_path = out_dir / f"{capture_file.stem}.analysis.json"
     return {
         "passed": completed.returncode == 0 and out_dir.exists() and analysis_path.exists(),
@@ -213,6 +230,7 @@ def _termux_usb_command(options: CaptureUsbOptions, usb_analysis_path: Path | No
     _append_option(helper_args, "--altsetting", options.altsetting)
     _append_option(helper_args, "--ep-in", options.ep_in)
     _append_option(helper_args, "--ep-out", options.ep_out)
+    _append_option(helper_args, "--serial-baud", options.serial_baud)
     _append_option(helper_args, "--expect-min-bytes", options.expect_min_bytes if options.expect_min_bytes > 0 else None)
     if options.verbose:
         helper_args.append("--verbose")

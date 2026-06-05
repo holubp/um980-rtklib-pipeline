@@ -66,6 +66,15 @@ def test_binary_frame_passes_binary_mode(tmp_path: Path) -> None:
     assert result.message_counts["OBSVMCMPB"] == 1
 
 
+def test_command_responses_do_not_break_binary_mode(tmp_path: Path) -> None:
+    data = b"$command,BESTNAVB COM1 1,response: OK*00\r\n" + _binary_frame(2118, b"payload")
+    result = validate_capture_file(_write(tmp_path / "binary-with-response.unc", data), expect_mode="binary")
+
+    assert result.mode_expectation_passed is True
+    assert result.command_response_records == 1
+    assert result.unicore_binary_frames == 1
+
+
 def test_mixed_ascii_binary_stream_passes_mixed_mode(tmp_path: Path) -> None:
     sentence = make_sentence("GNRMC,052000.000,A,5000.0000,N,01400.0000,E,0.0,0.0,300526,,,A")
     data = (sentence + "\r\n").encode("ascii") + _binary_frame(138, b"payload")

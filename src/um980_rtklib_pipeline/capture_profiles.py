@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-UNSAFE_COMMAND_TOKENS = (
+ALWAYS_UNSAFE_COMMAND_TOKENS = (
     "SAVECONFIG",
     "SAVE",
     "FRESET",
@@ -24,14 +24,13 @@ UNSAFE_COMMAND_TOKENS = (
     "UPDATE",
     "UPGRADE",
     "BOOT",
-    "BAUD",
-    "COM",
     "USBMODE",
     "PERMANENT",
     "NVM",
     "FLASH",
     "RESET",
 )
+REVIEWABLE_PORT_COMMAND_TOKENS = ("BAUD", "COM")
 SHELL_METACHAR_RE = re.compile(r"[;&|`$<>]")
 PROFILE_METADATA_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\s*:\s*(.*)$")
 
@@ -99,7 +98,13 @@ def parse_capture_profile_text(text: str, *, path: Path | None = None) -> Captur
             if key == "enabled" and value.lower() == "true":
                 enabled = True
             continue
-        validate_runtime_command(stripped, line_number=line_number, path=profile_path)
+        allow_reviewed_port_commands = metadata.get("allow_reviewed_port_commands", "").lower() == "true"
+        validate_runtime_command(
+            stripped,
+            line_number=line_number,
+            path=profile_path,
+            allow_reviewed_port_commands=allow_reviewed_port_commands,
+        )
         commands.append(stripped)
     if not enabled:
         warnings.append("profile is disabled; add '# enabled: true' only after commands are reviewed safe")
@@ -112,7 +117,13 @@ def parse_capture_profile_text(text: str, *, path: Path | None = None) -> Captur
     )
 
 
-def validate_runtime_command(command: str, *, line_number: int = 0, path: Path | None = None) -> None:
+def validate_runtime_command(
+    command: str,
+    *,
+    line_number: int = 0,
+    path: Path | None = None,
+    allow_reviewed_port_commands: bool = False,
+) -> None:
     """Reject commands that could alter persistent receiver state or shell out."""
 
     if not command.strip():
@@ -120,7 +131,12 @@ def validate_runtime_command(command: str, *, line_number: int = 0, path: Path |
     if SHELL_METACHAR_RE.search(command):
         raise CaptureProfileError(_where(path, line_number) + f"unsafe shell metacharacter in command: {command!r}")
     upper = command.upper()
-    for token in UNSAFE_COMMAND_TOKENS:
+    for token in ALWAYS_UNSAFE_COMMAND_TOKENS:
+        if token in upper:
+            raise CaptureProfileError(_where(path, line_number) + f"unsafe receiver token {token!r} in command: {command!r}")
+    if allow_reviewed_port_commands:
+        return
+    for token in REVIEWABLE_PORT_COMMAND_TOKENS:
         if token in upper:
             raise CaptureProfileError(_where(path, line_number) + f"unsafe receiver token {token!r} in command: {command!r}")
 

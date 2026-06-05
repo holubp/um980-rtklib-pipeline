@@ -1,0 +1,20 @@
+mode: ascii
+expect_mode: ascii
+expected_messages: GGA,RMC,GSA,GSV
+family: ascii_full_navigation
+rate_hz: 20
+stress: true
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+disabled_reason: extreme ASCII navigation profile is disabled unless manually reviewed for stress testing.
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.05
+GNRMC 0.05
+GNVTG 0.05
+GNGSA 0.05
+GNGSV 0.05

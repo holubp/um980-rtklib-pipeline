@@ -1,0 +1,8 @@
+# enabled: true
+mode: passive
+expect_mode: passive
+expected_messages:
+family: passive
+rate_hz: 0
+persistent: no
+commands_active: no

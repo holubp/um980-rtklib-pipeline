@@ -1,0 +1,22 @@
+mode: mixed
+expect_mode: mixed
+expected_messages: GGA,RMC,GSA,GSV,BESTNAVB,OBSVMCMPB
+family: mixed_nmea_navigation_binary_rawobs
+rate_hz: 10
+stress: true
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+disabled_reason: 10 Hz fuller NMEA plus raw observations is a stress profile and disabled by default.
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.1
+GNRMC 0.1
+GNVTG 0.1
+GNGSA 0.1
+GNGSV 0.1
+BESTNAVB COM1 0.1
+OBSVMCMPB COM1 0.1

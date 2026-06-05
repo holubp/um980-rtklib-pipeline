@@ -3303,8 +3303,9 @@ def cmd_rinex(args: argparse.Namespace) -> int:
             logging.info("analysis JSON is not produced for --nav-only; use extract/nav commands for full analysis.")
         if args.solution != "none" or getattr(args, "position_nmea", "all") != "none":
             logging.warning("nav-only mode enabled; solution and position outputs are suppressed.")
-        nav_path = Path(args.out_dir) / f"{basename_for(Path(args.rover_log), args.basename)}.rover-gps.nav"
-        records, _, _, _, observations, rover_nav, _, _, _ = _extract_bundle(args)
+        out_dir = ensure_out_dir(args.out_dir)
+        nav_path = out_dir / f"{basename_for(Path(args.rover_log), args.basename)}.rover-gps.nav"
+        _, records, _, _, observations, rover_nav, _, _, _ = _extract_bundle(args)
         logging.info("extracting rover navigation files (nav-only): base=%s", nav_path)
         nav_report = extract_rover_nav(records, nav_path)
         for kind, path in sorted(nav_report.written.items()):
@@ -3609,6 +3610,8 @@ def cmd_capture_usb(args: argparse.Namespace) -> int:
         altsetting=args.altsetting,
         ep_in=args.ep_in,
         ep_out=args.ep_out,
+        serial_baud=args.serial_baud,
+        command_timeout_s=args.command_timeout_s,
         verbose=bool(args.verbose or args.debug),
     )
     result = run_capture_usb(options)
@@ -4782,6 +4785,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture_usb.add_argument("--altsetting", type=int)
     capture_usb.add_argument("--ep-in")
     capture_usb.add_argument("--ep-out")
+    capture_usb.add_argument("--serial-baud", type=int, help="Configure FTDI USB-serial bridge baud rate and strip FTDI packet status bytes.")
+    capture_usb.add_argument("--command-timeout-s", type=float, help="Wall-clock timeout for the USB helper and extract-check subprocesses.")
     capture_usb.add_argument("-v", "--verbose", action="store_true")
     capture_usb.add_argument("-d", "--debug", action="store_true")
     capture_usb.add_argument("--log-file")

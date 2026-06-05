@@ -26,10 +26,12 @@ class CaptureValidationResult:
     nmea_records: int
     nmea_checksum_ok: int
     nmea_checksum_bad: int
+    command_response_records: int
     unicore_ascii_records: int
     unicore_binary_frames: int
     binary_crc_ok: int | None
     binary_crc_bad: int | None
+    binary_resynchronisation_events: int | None
     unknown_bytes: int | None
     first_timestamp: str | None
     last_timestamp: str | None
@@ -52,10 +54,12 @@ class CaptureValidationResult:
             "nmea_records": self.nmea_records,
             "nmea_checksum_ok": self.nmea_checksum_ok,
             "nmea_checksum_bad": self.nmea_checksum_bad,
+            "command_response_records": self.command_response_records,
             "unicore_ascii_records": self.unicore_ascii_records,
             "unicore_binary_frames": self.unicore_binary_frames,
             "binary_crc_ok": self.binary_crc_ok,
             "binary_crc_bad": self.binary_crc_bad,
+            "binary_resynchronisation_events": self.binary_resynchronisation_events,
             "unknown_bytes": self.unknown_bytes,
             "first_timestamp": self.first_timestamp,
             "last_timestamp": self.last_timestamp,
@@ -111,7 +115,7 @@ def validate_capture_file(
     mode_ok = _mode_passed(
         expect_mode,
         size=size,
-        ascii_records=diagnostics.valid_nmea_records + diagnostics.unicore_ascii_records + diagnostics.command_response_records,
+        ascii_records=diagnostics.valid_nmea_records + diagnostics.unicore_ascii_records,
         binary_records=diagnostics.unicore_binary_records,
     )
     if not mode_ok:
@@ -126,10 +130,12 @@ def validate_capture_file(
         nmea_records=diagnostics.valid_nmea_records,
         nmea_checksum_ok=diagnostics.valid_nmea_records,
         nmea_checksum_bad=diagnostics.invalid_nmea_records,
+        command_response_records=diagnostics.command_response_records,
         unicore_ascii_records=diagnostics.unicore_ascii_records,
         unicore_binary_frames=diagnostics.unicore_binary_records,
         binary_crc_ok=diagnostics.unicore_binary_records,
         binary_crc_bad=diagnostics.invalid_unicore_binary_records,
+        binary_resynchronisation_events=diagnostics.binary_resynchronisation_events,
         unknown_bytes=diagnostics.noise_bytes,
         first_timestamp=timestamps[0] if timestamps else None,
         last_timestamp=timestamps[-1] if timestamps else None,
@@ -181,10 +187,12 @@ def _empty_result(
         nmea_records=0,
         nmea_checksum_ok=0,
         nmea_checksum_bad=0,
+        command_response_records=0,
         unicore_ascii_records=0,
         unicore_binary_frames=0,
         binary_crc_ok=None,
         binary_crc_bad=None,
+        binary_resynchronisation_events=None,
         unknown_bytes=0,
         first_timestamp=None,
         last_timestamp=None,

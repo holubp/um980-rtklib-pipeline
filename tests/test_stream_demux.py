@@ -27,6 +27,15 @@ def test_stream_recovers_noise_and_nmea():
     assert records[1].msg_type == "GNRMC"
 
 
+def test_command_response_is_not_invalid_nmea():
+    records, diag = parse_stream(b"$command,CONFIG COM1 230400,response: OK*21\r\n")
+
+    assert len(records) == 1
+    assert records[0].kind == "command_response"
+    assert diag.command_response_records == 1
+    assert diag.invalid_nmea_records == 0
+
+
 def test_stream_detects_unicore_ascii():
     records, diag = parse_stream(_ascii_record("OBSVMA,COM1,0,0;OBSVMA,2400,1.0,GPS,1,L1,1,2,3,40,0,7"))
     assert diag.unicore_ascii_records == 1

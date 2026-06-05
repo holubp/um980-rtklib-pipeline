@@ -1,0 +1,15 @@
+# enabled: true
+mode: ascii
+expect_mode: ascii
+expected_messages: BESTNAVA
+family: ascii_unicore_solution
+rate_hz: 1
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+BESTNAVA COM1 1

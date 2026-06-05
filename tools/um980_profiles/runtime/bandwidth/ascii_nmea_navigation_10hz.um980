@@ -1,0 +1,19 @@
+mode: ascii
+expect_mode: ascii
+expected_messages: GGA,RMC,GSA,GSV
+family: ascii_nmea_navigation
+rate_hz: 10
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+disabled_reason: 10 Hz fuller NMEA navigation is disabled until 5 Hz evidence confirms adequate margin.
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.1
+GNRMC 0.1
+GNVTG 0.1
+GNGSA 0.1
+GNGSV 0.1

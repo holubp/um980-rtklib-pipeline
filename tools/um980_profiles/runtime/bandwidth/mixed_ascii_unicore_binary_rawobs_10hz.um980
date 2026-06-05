@@ -1,0 +1,18 @@
+mode: mixed
+expect_mode: mixed
+expected_messages: BESTNAVA,BESTNAVB,OBSVMCMPB
+family: mixed_ascii_unicore_binary_rawobs
+rate_hz: 10
+stress: true
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+disabled_reason: ASCII Unicore plus 10 Hz raw observations is a parser stress profile and disabled by default.
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+BESTNAVA COM1 0.1
+BESTNAVB COM1 0.1
+OBSVMCMPB COM1 0.1
