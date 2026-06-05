@@ -117,9 +117,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Arrival to a building (both outside and inside), difficult to capture any good signal.
+- In-device solution quality: Very bad.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=30050210-062300-062600 -->
@@ -139,9 +139,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: recording
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Overall good situation, GPS antenna positioned on the top of the car roof with good views. Except for going under the bridges and through the tunnel and standing still under canopy at the end, the capture conditions and perfect.
+- In-device solution quality: Overall very good, except for the tunnel and then the noise at the end.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end recording=rover_20260531063148 -->
@@ -166,8 +166,8 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 
 - Annotation kind: segment
 - Annotation status: needs-user-review
-- Capture context and conditions: User note: long tunnel; split point approximately 08:41:13 local / 06:41:13 UTC.
-- In-device solution quality:
+- Capture context and conditions: long tunnel; split point approximately 08:41:13 local / 06:41:13 UTC.
+- In-device solution quality: very good, even when passing under bridges; tunnel is approximated by a straight line (after a cca first 50 meters inside the tunnel, where the device was able to continue)
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31063148-063900-064113 -->
@@ -181,7 +181,7 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Recording ID: `rover_20260531063148`
 - Time window UTC: `2026-05-31T06:41:13Z` to `2026-05-31T06:46:00Z`
 - Label: relatively open sky after tunnel
-- Generated capture context: Second part of the earlier recovery/transition segment; relatively open sky after the tunnel.
+- Generated capture context: Second part of the earlier recovery/transition segment; relatively open sky 
 - GPX in-device track: `31063148-064113-064600 in-device`
 <!-- codex-generated:end segment=31063148-064113-064600 -->
 
@@ -189,9 +189,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions: User note: relatively open sky after the tunnel; starts approximately 08:41:13 local / 06:41:13 UTC.
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Open sky, some bridges under which the car passed, highway situation, possible a bit of cutline/forest beyond the boundary of the highway (but the highway is 2-3 lane per direction.
+- In-device solution quality: Very good, some minor systemic shifts and also some small glitches (typically some lateral deflections) after passing under bridges.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31063148-064113-064600 -->
@@ -213,9 +213,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Open sky, some bridges under which the car passed, highway situation, possible a bit of cutline/forest beyond the boundary of the highway (but the highway is 2-3 lane per direction.
+- In-device solution quality: Very good, some minor systemic shifts and also some small glitches (typically some lateral deflections) after passing under bridges.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31063148-070330-070930 -->
@@ -237,9 +237,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Static position under heavy canopy. This segment can be used to test static solution, if it is obtainable at all and with what quality.
+- In-device solution quality: Wandering around as can be expected due to canopy.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31063148-073630-074100 -->
@@ -259,9 +259,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: recording
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Capture context and conditions: Overall good situation, GPS antenna positioned on the top of the car roof with good views. Except for going under the bridges and through two tunnels, the capture conditions and perfect.
+- In-device solution quality: Overall very good, except for the tunnels.
+- Annotation status: user-reviewed
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end recording=rover_20260531095025 -->
@@ -285,9 +285,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Open sky, some bridges under which the car passed, highway situation, possible a bit of cutline/forest beyond the boundary of the highway (but the highway is 2-3 lane per direction.
+- In-device solution quality: Very good, some minor systemic shifts and also some small glitches (typically some lateral deflections) after passing under bridges.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31095025-101230-101930 -->
@@ -309,9 +309,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions: User note: pre-tunnel part of the originally selected stressed/mixed segment; the same tunnel starts after approximately 12:42:21 local / 10:42:21 UTC.
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Open sky, some bridges under which the car passed, highway situation, possible a bit of cutline/forest beyond the boundary of the highway (but the highway is 2-3 lane per direction.
+- In-device solution quality: Very good, some minor systemic shifts and also some small glitches (typically some lateral deflections) after passing under bridges.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31095025-103530-104221 -->
@@ -358,8 +358,8 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 
 - Annotation kind: segment
 - Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Capture context and conditions: Arrival to relatively narrow street with medium height buildings (cca 10m)
+- In-device solution quality: Average (when moving) to subpar (standing)
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31095025-105000-105940 -->
@@ -381,7 +381,7 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 - Annotation kind: recording
 - Annotation status: needs-user-review
 - Capture context and conditions: GPS antenna hosted in the top pocket of a backpack.
-- In-device solution quality:
+- In-device solution quality: Overall good outside of forest and average/usable in the forest.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end recording=rover_20260531184035 -->
@@ -405,9 +405,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: City/village driving in very good conditions, only very small lateral drift occasionally.
+- In-device solution quality: Very good
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31184035-185230-185730 -->
@@ -429,9 +429,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions: User note: typical road/street through a forest.
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Riding on the secondary road in the forest valley, typical road/street through a forest in hills.
+- In-device solution quality: Reasonable given conditions.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31184035-185804-185942 -->
@@ -453,9 +453,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions:
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Stationary in the forest, partially with backpack on my back, partially backpack on the ground. Maybe worth trying to get a static solution.
+- In-device solution quality: Reasonable given difficult conditions, but nowhere near survey grade.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31184035-190315-190945 -->
@@ -477,9 +477,9 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 ### User Subjective Annotation
 
 - Annotation kind: segment
-- Annotation status: needs-user-review
-- Capture context and conditions: User note: typical road/street through a forest.
-- In-device solution quality:
+- Annotation status: user-reviewed
+- Capture context and conditions: Riding on the secondary road in the forest valley, typical road/street through a forest in hills on winding road.
+- In-device solution quality: Reasonable given conditions.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31184035-191511-191555 -->
@@ -502,8 +502,8 @@ Edit only `User Subjective Annotation` sections. Do not manually edit `Codex/GPT
 
 - Annotation kind: segment
 - Annotation status: needs-user-review
-- Capture context and conditions: User note: typical road in a tree alley.
-- In-device solution quality:
+- Capture context and conditions: Typical road outside residential area in a tree alley, with a bit of undulating terrain.
+- In-device solution quality: Good.
 - Reviewer/date:
 - Notes:
 <!-- user-annotation:end segment=31184035-191603-191653 -->
