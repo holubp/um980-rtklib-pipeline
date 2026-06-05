@@ -55,8 +55,9 @@ DEFAULT_RECORDING_ANNOTATIONS: tuple[RecordingAnnotation, ...] = (
         recording_id="rover_20260530050210",
         title="rover_20260530050210",
         codex_context=(
-            "Moto route with substantial forest/canopy. Expected weak and fragmented fixed "
-            "coverage, high diagnostic stress, and non-highway motion profile."
+            "Moto route with standard town/city riding at the beginning and end, and "
+            "substantial hilly forest/canopy in the middle. Expected weak and fragmented "
+            "fixed coverage in the forest, high diagnostic stress, and non-highway motion profile."
         ),
     ),
     RecordingAnnotation(
@@ -92,7 +93,7 @@ DEFAULT_SEGMENT_ANNOTATIONS: tuple[AnnotationSegment, ...] = (
         "rover_20260530050210",
         datetime(2026, 5, 30, 5, 10, 14, tzinfo=timezone.utc),
         datetime(2026, 5, 30, 5, 11, 30, tzinfo=timezone.utc),
-        "reasonably open view",
+        "reasonably open view, town/city driving with smaller buildings, mildly hilly",
         "Reasonably open view with no major obstruction or canopy; useful as an in-device open-view reference.",
     ),
     AnnotationSegment(
@@ -100,15 +101,19 @@ DEFAULT_SEGMENT_ANNOTATIONS: tuple[AnnotationSegment, ...] = (
         "rover_20260530050210",
         datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
         datetime(2026, 5, 30, 5, 26, tzinfo=timezone.utc),
-        "weak/provisional forest moto",
-        "Weak/provisional forest moto segment; expected fragmented fixed and stressed diagnostics.",
+        "weak/provisional forest moto with some scrub segments",
+        (
+            "Weak/provisional forest moto segment with some straight scrub/grass sections "
+            "that may provide a better solution than the denser forest; expected fragmented "
+            "fixed and stressed diagnostics."
+        ),
     ),
     AnnotationSegment(
         "30050210-062052-062203",
         "rover_20260530050210",
         datetime(2026, 5, 30, 6, 20, 52, tzinfo=timezone.utc),
         datetime(2026, 5, 30, 6, 22, 3, tzinfo=timezone.utc),
-        "reasonably open view",
+        "reasonably open view, town/city driving with smaller buildings, mildly hilly",
         "Reasonably open view with no major obstruction or canopy; useful as a second open-view reference.",
     ),
     AnnotationSegment(
@@ -285,9 +290,14 @@ def update_annotation_markdown(
         "",
     ]
 
-    if recordings:
-        lines.extend(["## Whole-Recording Annotations", ""])
+    segments_by_recording: dict[str, list[AnnotationSegment]] = {}
+    for segment in segments:
+        segments_by_recording.setdefault(segment.recording_id, []).append(segment)
+    for grouped_segments in segments_by_recording.values():
+        grouped_segments.sort(key=lambda item: (item.start_time, item.segment_id))
+
     for recording in sorted(recordings, key=lambda item: item.recording_id):
+        lines.extend([f"## Recording: {recording.recording_id}", ""])
         lines.extend(_recording_block(recording))
         key = f"recording={recording.recording_id}"
         block = preserved_user_blocks.get(key) or _default_user_block(key, "recording")
@@ -302,22 +312,32 @@ def update_annotation_markdown(
             lines.extend(_rtk_generated_block(recording.recording_id, run))
             lines.extend([rtk_block, ""])
 
-    if segments:
-        lines.extend(["## Segment Annotations", ""])
-    for segment in sorted(segments, key=lambda item: (item.recording_id, item.start_time, item.segment_id)):
-        lines.extend(_segment_block(segment))
-        key = f"segment={segment.segment_id}"
-        block = preserved_user_blocks.get(key) or _default_user_block(key, "segment")
-        used_user_keys.add(key)
-        lines.extend([block, ""])
-        if rtk_recording_id is not None and segment.recording_id != rtk_recording_id:
-            continue
-        for run in rtk_runs:
-            rtk_key = f"segment={segment.segment_id} rtk-run={run.run_id}"
-            rtk_block = preserved_user_blocks.get(rtk_key) or _default_user_block(rtk_key, "rtk-segment", run.run_id)
-            used_user_keys.add(rtk_key)
-            lines.extend(_rtk_generated_block(segment.segment_id, run))
-            lines.extend([rtk_block, ""])
+        recording_segments = segments_by_recording.pop(recording.recording_id, [])
+        if recording_segments:
+            lines.extend(["### Segments", ""])
+        for segment in recording_segments:
+            lines.extend(_segment_block(segment))
+            key = f"segment={segment.segment_id}"
+            block = preserved_user_blocks.get(key) or _default_user_block(key, "segment")
+            used_user_keys.add(key)
+            lines.extend([block, ""])
+            if rtk_recording_id is not None and segment.recording_id != rtk_recording_id:
+                continue
+            for run in rtk_runs:
+                rtk_key = f"segment={segment.segment_id} rtk-run={run.run_id}"
+                rtk_block = preserved_user_blocks.get(rtk_key) or _default_user_block(rtk_key, "rtk-segment", run.run_id)
+                used_user_keys.add(rtk_key)
+                lines.extend(_rtk_generated_block(segment.segment_id, run))
+                lines.extend([rtk_block, ""])
+
+    for recording_id, recording_segments in sorted(segments_by_recording.items()):
+        lines.extend([f"## Recording: {recording_id}", "", "### Segments", ""])
+        for segment in recording_segments:
+            lines.extend(_segment_block(segment))
+            key = f"segment={segment.segment_id}"
+            block = preserved_user_blocks.get(key) or _default_user_block(key, "segment")
+            used_user_keys.add(key)
+            lines.extend([block, ""])
 
     unused = [
         block
@@ -392,8 +412,7 @@ def _recording_block(recording: RecordingAnnotation) -> list[str]:
         "### Codex/GPT Generated Annotation",
         "",
         f"- Recording ID: `{recording.recording_id}`",
-        f"- Expected context: {recording.codex_context}",
-        "- Annotation status: needs-user-review",
+        f"- Generated capture context: {recording.codex_context}",
         f"<!-- codex-generated:end {key} -->",
         "",
     ]
@@ -402,7 +421,7 @@ def _recording_block(recording: RecordingAnnotation) -> list[str]:
 def _segment_block(segment: AnnotationSegment) -> list[str]:
     key = f"segment={segment.segment_id}"
     return [
-        f"### Segment: {segment.segment_id}",
+        f"#### Segment: {segment.segment_id}",
         "",
         f"<!-- codex-generated:start {key} -->",
         "### Codex/GPT Generated Annotation",
@@ -411,9 +430,8 @@ def _segment_block(segment: AnnotationSegment) -> list[str]:
         f"- Recording ID: `{segment.recording_id}`",
         f"- Time window UTC: `{_format_markdown_time(segment.start_time)}` to `{_format_markdown_time(segment.end_time)}`",
         f"- Label: {segment.label}",
-        f"- Expected context: {segment.codex_context}",
+        f"- Generated capture context: {segment.codex_context}",
         f"- GPX in-device track: `{segment.segment_id} in-device`",
-        "- Annotation status: needs-user-review",
         f"<!-- codex-generated:end {key} -->",
         "",
     ]
@@ -427,7 +445,6 @@ def _rtk_generated_block(owner_id: str, run: RtkAnnotationRun) -> list[str]:
         "",
         f"- RTKLIB run ID: `{run.run_id}`",
         f"- Solution path: `{run.solution_path}`",
-        "- Annotation status: needs-user-review",
         f"<!-- codex-generated:end {key} -->",
         "",
     ]
@@ -442,14 +459,26 @@ def _default_user_block(key: str, kind: str, run_id: str | None = None) -> str:
         heading,
         "",
         f"- Annotation kind: {kind}",
-        "- Actual capture conditions:",
-        "- In-device solution quality:",
-        "- RTKLIB solution quality:",
-        "- Map/trajectory observations:",
-        "- Reviewer/date:",
-        "- Notes:",
-        f"<!-- user-annotation:end {key} -->",
+        "- Annotation status: needs-user-review",
     ]
+    if kind.startswith("rtk-"):
+        prompts.extend(
+            [
+                "- Run-specific solution quality:",
+                "- Reviewer/date:",
+                "- Notes:",
+            ]
+        )
+    else:
+        prompts.extend(
+            [
+                "- Capture context and conditions:",
+                "- In-device solution quality:",
+                "- Reviewer/date:",
+                "- Notes:",
+            ]
+        )
+    prompts.append(f"<!-- user-annotation:end {key} -->")
     return "\n".join(prompts)
 
 
@@ -459,12 +488,72 @@ def _collect_user_blocks(text: str) -> dict[str, str]:
         key = match.group("key")
         if key in blocks:
             raise ValueError(f"duplicate user annotation block for {key}")
-        blocks[key] = match.group(0)
+        blocks[key] = _normalise_user_block(key, match.group(0))
     starts = text.count("<!-- user-annotation:start ")
     ends = text.count("<!-- user-annotation:end ")
     if starts != len(blocks) or ends != len(blocks):
         raise ValueError("malformed user annotation sentinel structure")
     return blocks
+
+
+def _normalise_user_block(key: str, block: str) -> str:
+    """Migrate old user-owned prompt labels without discarding their values."""
+
+    if "rtk-run=" in key:
+        return block.replace("- RTKLIB solution quality:", "- Run-specific solution quality:")
+
+    lines = block.splitlines()
+    migrated: list[str] = []
+    carry_to_notes: list[str] = []
+    has_capture_context = any(line.strip().startswith("- Capture context and conditions:") for line in lines)
+    has_annotation_status = any(line.strip().startswith("- Annotation status:") for line in lines)
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("- Actual capture conditions:"):
+            value = stripped.split(":", 1)[1].strip()
+            if has_capture_context:
+                if value:
+                    carry_to_notes.append(f"Previous capture conditions: {value}")
+                continue
+            migrated.append(raw_line.replace("- Actual capture conditions:", "- Capture context and conditions:", 1))
+            has_capture_context = True
+            continue
+        if stripped.startswith("- RTKLIB solution quality:") or stripped.startswith("- Map/trajectory observations:"):
+            field, value = stripped[2:].split(":", 1)
+            value = value.strip()
+            if value and value.lower() not in {"not-available", "n/a", "none"}:
+                carry_to_notes.append(f"Previous {field}: {value}")
+            continue
+        migrated.append(raw_line)
+
+    if not has_annotation_status:
+        insert_at = _line_after_annotation_kind(migrated)
+        migrated.insert(insert_at, "- Annotation status: needs-user-review")
+
+    if not has_capture_context:
+        insert_at = _line_after_annotation_kind(migrated)
+        if not has_annotation_status:
+            insert_at += 1
+        migrated.insert(insert_at, "- Capture context and conditions:")
+
+    if carry_to_notes:
+        note_text = "; ".join(carry_to_notes)
+        for index, raw_line in enumerate(migrated):
+            if raw_line.strip().startswith("- Notes:"):
+                prefix, value = raw_line.split(":", 1)
+                existing = value.strip()
+                migrated[index] = f"{prefix}: {existing}; {note_text}" if existing else f"{prefix}: {note_text}"
+                break
+        else:
+            migrated.insert(-1, f"- Notes: {note_text}")
+    return "\n".join(migrated)
+
+
+def _line_after_annotation_kind(lines: list[str]) -> int:
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip().startswith("- Annotation kind:"):
+            return index + 1
+    return max(0, len(lines) - 1)
 
 
 def _user_block_has_notes(block: str) -> bool:
@@ -476,6 +565,8 @@ def _user_block_has_notes(block: str) -> bool:
             continue
         key, value = line[2:].split(":", 1)
         if key.strip() == "Annotation kind":
+            continue
+        if key.strip() == "Annotation status" and value.strip() == "needs-user-review":
             continue
         if value.strip():
             return True

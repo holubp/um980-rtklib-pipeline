@@ -77,12 +77,17 @@ def test_markdown_contains_codex_context_and_user_placeholders() -> None:
         rtk_runs=[],
     )
 
-    assert "## Whole Recording: rover_20260530050210" in markdown
+    assert "## Recording: rover_20260530050210" in markdown
+    assert "### Whole Recording: rover_20260530050210" in markdown
     assert "### Codex/GPT Generated Annotation" in markdown
     assert "Moto route with substantial forest/canopy" in markdown
     assert "### User Subjective Annotation" in markdown
-    assert "- Actual capture conditions:" in markdown
-    assert "## Segment: 30050210-052000-052600" in markdown
+    assert "- Generated capture context:" in markdown
+    assert "- Capture context and conditions:" in markdown
+    assert "- Actual capture conditions:" not in markdown
+    assert "- RTKLIB solution quality:" not in markdown
+    assert "- Map/trajectory observations:" not in markdown
+    assert "#### Segment: 30050210-052000-052600" in markdown
     assert "Expected fragmented fixed" in markdown
 
 
@@ -99,7 +104,10 @@ def test_markdown_rerun_updates_codex_block_without_touching_user_annotation() -
         segments=[],
         rtk_runs=[],
     )
-    edited = first.replace("- Actual capture conditions:\n", "- Actual capture conditions: highway, open sky\n")
+    edited = first.replace(
+        "- Capture context and conditions:\n",
+        "- Capture context and conditions: highway, open sky\n",
+    )
 
     second = update_annotation_markdown(
         edited,
@@ -116,7 +124,48 @@ def test_markdown_rerun_updates_codex_block_without_touching_user_annotation() -
 
     assert "Updated Codex context." in second
     assert "Initial Codex context." not in second
-    assert "- Actual capture conditions: highway, open sky" in second
+    assert "- Capture context and conditions: highway, open sky" in second
+
+
+def test_markdown_rerun_migrates_old_user_annotation_fields() -> None:
+    first = update_annotation_markdown(
+        None,
+        recordings=[
+            RecordingAnnotation(
+                recording_id="rover_20260531063148",
+                title="rover_20260531063148",
+                codex_context="Initial Codex context.",
+            )
+        ],
+        segments=[],
+        rtk_runs=[],
+    )
+    edited = first.replace(
+        "- Capture context and conditions:\n",
+        "- Actual capture conditions: old highway note\n"
+        "- RTKLIB solution quality: stale non-run-specific note\n"
+        "- Map/trajectory observations: old map note\n",
+    )
+
+    second = update_annotation_markdown(
+        edited,
+        recordings=[
+            RecordingAnnotation(
+                recording_id="rover_20260531063148",
+                title="rover_20260531063148",
+                codex_context="Updated Codex context.",
+            )
+        ],
+        segments=[],
+        rtk_runs=[],
+    )
+
+    assert "- Capture context and conditions: old highway note" in second
+    assert "- Actual capture conditions:" not in second
+    assert "- RTKLIB solution quality:" not in second
+    assert "- Map/trajectory observations:" not in second
+    assert "Previous RTKLIB solution quality: stale non-run-specific note" in second
+    assert "Previous Map/trajectory observations: old map note" in second
 
 
 def test_markdown_rerun_drops_obsolete_empty_user_placeholders() -> None:
@@ -171,7 +220,7 @@ def test_markdown_rerun_preserves_obsolete_non_empty_user_blocks() -> None:
             )
         ],
         rtk_runs=[],
-    ).replace("- Actual capture conditions:\n", "- Actual capture conditions: keep me\n")
+    ).replace("- Capture context and conditions:\n", "- Capture context and conditions: keep me\n")
 
     second = update_annotation_markdown(
         first,
@@ -181,7 +230,40 @@ def test_markdown_rerun_preserves_obsolete_non_empty_user_blocks() -> None:
     )
 
     assert "## Preserved Unmatched User Annotation Blocks" in second
-    assert "- Actual capture conditions: keep me" in second
+    assert "- Capture context and conditions: keep me" in second
+
+
+def test_segments_are_grouped_under_their_recording() -> None:
+    markdown = update_annotation_markdown(
+        None,
+        recordings=[
+            RecordingAnnotation("rec-a", "rec-a", "context a"),
+            RecordingAnnotation("rec-b", "rec-b", "context b"),
+        ],
+        segments=[
+            AnnotationSegment(
+                "seg-b",
+                "rec-b",
+                datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
+                datetime(2026, 5, 30, 5, 21, tzinfo=timezone.utc),
+                "b",
+                "context",
+            ),
+            AnnotationSegment(
+                "seg-a",
+                "rec-a",
+                datetime(2026, 5, 30, 5, 20, tzinfo=timezone.utc),
+                datetime(2026, 5, 30, 5, 21, tzinfo=timezone.utc),
+                "a",
+                "context",
+            ),
+        ],
+        rtk_runs=[],
+    )
+
+    assert markdown.index("## Recording: rec-a") < markdown.index("#### Segment: seg-a")
+    assert markdown.index("#### Segment: seg-a") < markdown.index("## Recording: rec-b")
+    assert markdown.index("## Recording: rec-b") < markdown.index("#### Segment: seg-b")
 
 
 def test_default_segments_include_open_view_and_split_tunnel_updates() -> None:
@@ -297,8 +379,8 @@ def test_annotation_gpx_cli_generates_markdown_and_local_gpx_without_rtk(tmp_pat
 
     assert rc == 0
     markdown = annotations.read_text(encoding="utf-8")
-    assert "## Whole-Recording Annotations" in markdown
-    assert "## Segment Annotations" in markdown
+    assert "## Recording: rover_20260530050210" in markdown
+    assert "### Segments" in markdown
     assert "seg-a in-device" in gpx.read_text(encoding="utf-8")
     assert "RTKLIB run" not in markdown
 
@@ -323,8 +405,8 @@ def test_annotation_gpx_cli_preserves_user_annotation_on_rerun(tmp_path: Path) -
 
     assert cli.main(args) == 0
     edited = annotations.read_text(encoding="utf-8").replace(
-        "- Actual capture conditions:\n",
-        "- Actual capture conditions: user says open-sky highway\n",
+        "- Capture context and conditions:\n",
+        "- Capture context and conditions: user says open-sky highway\n",
     )
     annotations.write_text(edited, encoding="utf-8")
 
