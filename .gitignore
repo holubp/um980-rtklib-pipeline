@@ -16,7 +16,16 @@ test-euref.zip
 
 # Local/private data and editor backups
 examples-private/
+scratch/
+captures/
 *.unc
+*.UNC
+*.ubx
+*.UBX
+*.rtcm3
+*.trace
+*.stat
+*.usb.json
 *~
 .*.un~
 
@@ -38,3 +47,4 @@ annotations.gpx
 *-rtk.nmea
 *-rtk.pos
 *-rtk.stat
+tools/termux/um980-usb-fd

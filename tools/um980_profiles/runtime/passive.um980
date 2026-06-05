@@ -1,0 +1,10 @@
+# enabled: true
+mode: passive
+expected: current receiver stream
+persistent: no
+commands_active: no
+tested_on_real_um980: pending
+
+# Passive profile.  No commands are sent; capture whatever the receiver is
+# already emitting.  This must pass before any runtime profile with active
+# commands is attempted.

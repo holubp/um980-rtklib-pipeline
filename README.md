@@ -49,6 +49,9 @@ Typical workflow:
 5. Let the pipeline run `rnx2rtkp`, or use `postprocess` when the RINEX inputs
    are prepared separately.
 
+For rootless Android/Termux USB capture directly from a UM980 receiver, see
+[Rootless Termux UM980 USB Capture](docs/termux_um980_rootless_capture.md).
+
 ## Installation
 
 The Python package requires Python 3.11 or newer. RTKLIB-ex tools are separate

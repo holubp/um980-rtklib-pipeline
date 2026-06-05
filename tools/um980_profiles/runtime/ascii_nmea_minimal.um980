@@ -1,0 +1,11 @@
+mode: ascii
+expected: GGA,RMC,VTG
+approximate_rate: modest solution-rate output
+persistent: no
+commands_active: no
+tested_on_real_um980: no
+
+# Disabled intentionally.
+# TODO: enable only after exact UM980 runtime-only LOG syntax is verified safe
+# for this USB interface without SAVECONFIG, COM/USB port changes, or persistent
+# side effects.

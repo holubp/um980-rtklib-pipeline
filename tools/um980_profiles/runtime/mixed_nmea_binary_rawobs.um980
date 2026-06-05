@@ -1,0 +1,10 @@
+mode: mixed
+expected: NMEA solution plus OBSVMB/OBSVMCMPB binary observations
+approximate_rate: modest mixed ASCII/binary stream
+persistent: no
+commands_active: no
+tested_on_real_um980: no
+
+# Disabled intentionally.
+# TODO: enable only after both ASCII and binary runtime command syntax is
+# verified and parser resynchronisation is confirmed on real captures.

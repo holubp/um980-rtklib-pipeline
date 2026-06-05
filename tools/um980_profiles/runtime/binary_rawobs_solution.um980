@@ -1,0 +1,10 @@
+mode: binary
+expected: OBSVMB or OBSVMCMPB plus solution/navigation side messages
+approximate_rate: low/modest raw-observation rate only
+persistent: no
+commands_active: no
+tested_on_real_um980: no
+
+# Disabled intentionally.
+# TODO: keep disabled until a safe low-rate raw-observation runtime profile is
+# verified.  Do not enable high-rate raw observation logging unattended.

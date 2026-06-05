@@ -37,6 +37,7 @@ from .bestnav import (
     parse_bestnav_rate,
     parse_bestnav_sentences,
 )
+from .capture_termux import CaptureUsbOptions, run_capture_usb
 from .config import deep_get, load_config
 from .diagnostics import extract_diagnostics
 from .euref import (
@@ -3582,6 +3583,59 @@ def cmd_quality_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_capture_usb(args: argparse.Namespace) -> int:
+    """Capture UM980 bytes through rootless Termux USB permission handling."""
+
+    _configure_cli_logging(args)
+    options = CaptureUsbOptions(
+        termux_device=args.termux_device,
+        duration_s=float(args.duration),
+        out=Path(args.out) if args.out else None,
+        native_helper=Path(args.native_helper),
+        profile=Path(args.profile) if args.profile else None,
+        probe=bool(args.probe),
+        dry_run_profile=bool(args.dry_run_profile),
+        analysis_json=Path(args.analysis_json) if args.analysis_json else None,
+        validate=bool(args.validate),
+        extract_check=bool(args.extract_check),
+        expect_min_bytes=int(args.expect_min_bytes or 0),
+        expect_mode=args.expect_mode,
+        expect_messages=tuple(args.expect_message or ()),
+        profile_line_delay_ms=args.profile_line_delay_ms,
+        capture_after_profile_delay_ms=args.capture_after_profile_delay_ms,
+        read_timeout_ms=args.read_timeout_ms,
+        max_bytes=args.max_bytes,
+        interface=args.interface,
+        altsetting=args.altsetting,
+        ep_in=args.ep_in,
+        ep_out=args.ep_out,
+        verbose=bool(args.verbose or args.debug),
+    )
+    result = run_capture_usb(options)
+    if args.dry_run_profile and result.profile is not None:
+        print(f"profile: {result.profile.path}")
+        print(f"enabled: {str(result.profile.enabled).lower()}")
+        print(f"mode: {result.profile.mode}")
+        if result.profile.commands:
+            print("commands:")
+            for command in result.profile.commands:
+                print(f"  {command}")
+        else:
+            print("commands: <none>")
+        for warning in result.profile.warnings:
+            print(f"WARNING: {warning}")
+    elif args.validate and result.validation is not None:
+        logging.info(
+            "capture validation passed: bytes=%d mode=%s nmea=%d unicore_ascii=%d unicore_binary=%d",
+            result.validation.bytes_total,
+            result.validation.mode_expectation,
+            result.validation.nmea_records,
+            result.validation.unicore_ascii_records,
+            result.validation.unicore_binary_frames,
+        )
+    return 0
+
+
 def cmd_annotation_gpx(args: argparse.Namespace) -> int:
     """Create or update manual annotation Markdown and a local GPX."""
 
@@ -4705,6 +4759,33 @@ def build_parser() -> argparse.ArgumentParser:
     quality_compare.add_argument("--out", help="Optional comparison output path.")
     _add_common(quality_compare)
     quality_compare.set_defaults(func=cmd_quality_compare)
+
+    capture_usb = sub.add_parser("capture-usb")
+    capture_usb.add_argument("--termux-device", help="Android USB device path granted by termux-usb, e.g. /dev/bus/usb/002/002.")
+    capture_usb.add_argument("--duration", type=float, default=20.0)
+    capture_usb.add_argument("--out", help="Raw capture output path; use .unc for new UM980 captures.")
+    capture_usb.add_argument("--native-helper", default="tools/termux/um980-usb-fd")
+    capture_usb.add_argument("--profile", help="Reviewed runtime profile to validate and send before capture.")
+    capture_usb.add_argument("--probe", action="store_true")
+    capture_usb.add_argument("--dry-run-profile", action="store_true")
+    capture_usb.add_argument("--analysis-json", help="Write merged USB/validation/extract-check JSON summary.")
+    capture_usb.add_argument("--validate", action="store_true")
+    capture_usb.add_argument("--extract-check", action="store_true")
+    capture_usb.add_argument("--expect-min-bytes", type=int, default=0)
+    capture_usb.add_argument("--expect-mode", choices=["passive", "ascii", "binary", "mixed"], default="passive")
+    capture_usb.add_argument("--expect-message", action="append")
+    capture_usb.add_argument("--profile-line-delay-ms", type=int)
+    capture_usb.add_argument("--capture-after-profile-delay-ms", type=int)
+    capture_usb.add_argument("--read-timeout-ms", type=int)
+    capture_usb.add_argument("--max-bytes", type=int)
+    capture_usb.add_argument("--interface", type=int)
+    capture_usb.add_argument("--altsetting", type=int)
+    capture_usb.add_argument("--ep-in")
+    capture_usb.add_argument("--ep-out")
+    capture_usb.add_argument("-v", "--verbose", action="store_true")
+    capture_usb.add_argument("-d", "--debug", action="store_true")
+    capture_usb.add_argument("--log-file")
+    capture_usb.set_defaults(func=cmd_capture_usb)
 
     annotation = sub.add_parser("annotation-gpx")
     annotation.add_argument("rover_log")
