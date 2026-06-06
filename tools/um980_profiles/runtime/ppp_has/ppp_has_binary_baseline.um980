@@ -1,0 +1,19 @@
+# enabled: true
+mode: binary
+expect_mode: binary
+family: ppp_has_binary
+expected_messages: PPPNAVB,ADRNAVB
+expected_rate_hz: PPPNAVB=0.1,ADRNAVB=0.1
+event_driven: TROPINFOB,GPSIONB
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+PPPNAVB 10
+ADRNAVB 10
+TROPINFOB ONCHANGED
+GPSIONB ONCHANGED

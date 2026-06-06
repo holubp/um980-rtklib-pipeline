@@ -116,6 +116,8 @@ def run_capture_usb(options: CaptureUsbOptions) -> CaptureUsbResult:
             options.out,
             expect_mode=options.expect_mode,  # type: ignore[arg-type]
             expected_messages=list(options.expect_messages),
+            profile_path=options.profile,
+            capture_duration_s=options.duration_s,
         )
         if validation.errors:
             raise RuntimeError(f"capture validation failed: {'; '.join(validation.errors)}")

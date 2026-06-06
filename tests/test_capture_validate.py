@@ -51,6 +51,23 @@ def test_unc_and_ubx_suffixes_validate_equivalently(tmp_path: Path) -> None:
     assert unc_dict == ubx_dict
 
 
+def test_suffix_equivalence_includes_timing_metrics(tmp_path: Path) -> None:
+    profile = tmp_path / "gga20.um980"
+    profile.write_text("# enabled: true\nexpected_rate_hz: GNGGA=20\n", encoding="utf-8")
+    data = b"".join(
+        (make_sentence(f"GNGGA,00000{index * 0.05:04.2f},5000.0,N,01400.0,E,4,20,0.7,250.0,M,45.0,M,,") + "\r\n").encode("ascii")
+        for index in range(20)
+    )
+
+    unc = validate_capture_file(_write(tmp_path / "timing.unc", data), expect_mode="ascii", profile_path=profile)
+    ubx = validate_capture_file(_write(tmp_path / "timing.ubx", data), expect_mode="ascii", profile_path=profile)
+
+    unc_timing = unc.as_dict()["timing_completeness"]
+    ubx_timing = ubx.as_dict()["timing_completeness"]
+    assert unc_timing == ubx_timing
+    assert unc_timing["messages"]["GNGGA"]["missing_epoch_count"] == 0  # type: ignore[index]
+
+
 def test_random_binary_does_not_crash_for_legacy_suffixes(tmp_path: Path) -> None:
     data = b"\x00\xff\x01not-a-known-frame"
 

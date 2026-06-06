@@ -1,0 +1,25 @@
+# enabled: true
+mode: mixed
+expect_mode: mixed
+family: ppp_has_mixed
+expected_messages: GGA,RMC,GST,GSV,PPPNAVB,ADRNAVB
+expected_rate_hz: GNGGA=20,GNRMC=20,GNGST=20,GNGSV=1,PPPNAVB=0.1,ADRNAVB=0.1
+event_driven: TROPINFOA,TROPINFOB,GPSIONA,GPSIONB
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.05
+GNRMC 0.05
+GNGST 0.05
+GNGSV 1
+PPPNAVB 10
+ADRNAVB 10
+TROPINFOA ONCHANGED
+TROPINFOB ONCHANGED
+GPSIONA ONCHANGED
+GPSIONB ONCHANGED

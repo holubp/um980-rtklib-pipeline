@@ -8,6 +8,7 @@ metrics and only uses conservative labels.  A result is never called
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import statistics
@@ -25,6 +26,10 @@ from .capture_validate import validate_capture_file
 SMOKE_BAUDS = (115200, 230400, 460800, 921600)
 EVIDENCE_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
 PROFILE_DIR = Path("tools/um980_profiles/runtime/bandwidth")
+PROFILE_FAMILY_DIRS = {
+    "bandwidth": PROFILE_DIR,
+    "ppp_has": Path("tools/um980_profiles/runtime/ppp_has"),
+}
 PROFILE_ORDER = (
     "passive_current",
     "ascii_nmea_minimal_1hz",
@@ -142,6 +147,7 @@ def classify_cell(row: dict[str, object]) -> tuple[str, list[str]]:
     resync = int(row.get("binary_resynchronisation_events") or 0)
     unknown = float(row.get("unknown_bytes") or 0)
     ratio = float(row.get("measured_vs_uart_payload_ratio") or 0)
+    timing_status = str(row.get("timing_overall_status") or "not_applicable")
     if binary_crc_bad > 0 or nmea_bad > 0:
         reasons.append("checksum/frame errors present")
     if resync > 2:
@@ -150,6 +156,12 @@ def classify_cell(row: dict[str, object]) -> tuple[str, list[str]]:
         reasons.append("unknown-byte ratio elevated")
     if ratio >= 0.7:
         reasons.append("throughput near serial 8N1 payload limit")
+    if timing_status == "fail":
+        return "UNSAFE", [*reasons, "timing completeness failed"]
+    if timing_status == "unsupported":
+        return "INCONCLUSIVE", [*reasons, "timing completeness unsupported for expected periodic messages"]
+    if timing_status == "marginal":
+        reasons.append("timing completeness marginal")
     if reasons:
         return "MARGINAL", reasons
     return "PROVISIONALLY_SAFE", ["cell passed; requires repeated evidence before SAFE recommendation"]
@@ -224,17 +236,23 @@ def run_cell(
                     capture_path,
                     expect_mode=profile.metadata.get("expect_mode", profile.mode),  # type: ignore[arg-type]
                     expected_messages=expected,
+                    profile_path=rendered_profile,
+                    capture_duration_s=duration_s,
                 )
                 row.update(_flatten_validation(expected_validation.as_dict()))
             except Exception as validation_exc:  # noqa: BLE001
                 row["validation_errors"] = [str(validation_exc)]
             try:
-                passive_validation = validate_capture_file(capture_path, expect_mode="passive")
+                passive_validation = validate_capture_file(capture_path, expect_mode="passive", capture_duration_s=duration_s)
                 row["passive_structural_metrics"] = passive_validation.as_dict()
             except Exception:
                 pass
     classification, reasons = classify_cell(row)
     row["classification"] = classification
+    row["final_status"] = classification
+    row["parser_status"] = "pass" if row.get("validation_passed") and row.get("extract_check_passed") and not row.get("expected_messages_missing") else "fail"
+    row["throughput_status"] = "marginal" if float(row.get("measured_vs_uart_payload_ratio") or 0) >= 0.7 else "pass"
+    row["timing_status"] = row.get("timing_overall_status") or "not_applicable"
     row["reasons"] = reasons
     return row
 
@@ -291,6 +309,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, object]:
             }
     summary = build_summary(all_rows, stages=stages, out_dir=out_dir, include_stress=include_stress)
     (out_dir / "bandwidth_matrix_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_rows_csv(out_dir / "bandwidth_matrix_rows.csv", all_rows)
     (out_dir / "bandwidth_recommendations.md").write_text(render_markdown(summary), encoding="utf-8")
     return summary
 
@@ -309,6 +328,7 @@ def build_summary(rows: list[dict[str, object]], *, stages: Iterable[str], out_d
             continue
         passing = [row for row in tested if row.get("classification") == "PROVISIONALLY_SAFE"]
         marginal = [row for row in tested if row.get("classification") == "MARGINAL"]
+        inconclusive = [row for row in tested if row.get("classification") == "INCONCLUSIVE"]
         unsafe = [row for row in tested if row.get("classification") == "UNSAFE"]
         if passing:
             min_baud = min(int(row["baud"]) for row in passing)
@@ -316,11 +336,15 @@ def build_summary(rows: list[dict[str, object]], *, stages: Iterable[str], out_d
             label = "PROVISIONALLY_SAFE"
             if evidence_repeats >= 3 and any(row.get("stage") == "boundary" for row in passing):
                 label = "SAFE"
-            notes = "passed structural checks; repeat/boundary evidence required for recommended-safe classification"
+            notes = "passed parser, throughput, and timing checks; repeat/boundary evidence required for recommended-safe classification"
         elif marginal:
             min_baud = min(int(row["baud"]) for row in marginal)
             label = "MARGINAL"
             notes = _join_reasons(marginal)
+        elif inconclusive:
+            min_baud = None
+            label = "INCONCLUSIVE"
+            notes = _join_reasons(inconclusive)
         elif unsafe:
             min_baud = None
             label = "UNSAFE"
@@ -336,6 +360,7 @@ def build_summary(rows: list[dict[str, object]], *, stages: Iterable[str], out_d
                 "minimum_recommended_baud": min_baud,
                 "measured_bytes_per_second_median": _median([row.get("bytes_per_second") for row in tested]),
                 "evidence_cells": len(tested),
+                "timing_statuses": sorted({str(row.get("timing_overall_status") or "not_applicable") for row in tested}),
                 "notes": notes,
             }
         )
@@ -367,13 +392,13 @@ def render_markdown(summary: dict[str, object]) -> str:
         "",
         "## Safe Configurations",
         "",
-        "| Profile | Classification | Minimum baud | Median B/s | Evidence cells | Notes |",
-        "|---|---:|---:|---:|---:|---|",
+        "| Profile | Classification | Minimum baud | Median B/s | Timing | Evidence cells | Notes |",
+        "|---|---:|---:|---:|---|---:|---|",
     ]
     for rec in recs:  # type: ignore[assignment]
         if rec["classification"] in {"SAFE", "PROVISIONALLY_SAFE"}:
             lines.append(_rec_row(rec))
-    lines.extend(["", "## Marginal Configurations", "", "| Profile | Classification | Minimum baud | Median B/s | Evidence cells | Notes |", "|---|---:|---:|---:|---:|---|"])
+    lines.extend(["", "## Marginal Configurations", "", "| Profile | Classification | Minimum baud | Median B/s | Timing | Evidence cells | Notes |", "|---|---:|---:|---:|---|---:|---|"])
     for rec in recs:  # type: ignore[assignment]
         if rec["classification"] == "MARGINAL":
             lines.append(_rec_row(rec))
@@ -396,6 +421,40 @@ def render_markdown(summary: dict[str, object]) -> str:
         )
     lines.extend(
         [
+            "",
+            "## Timing Completeness Summary",
+            "",
+            "Recommendations now require parser success, expected-message presence, throughput margin, and per-message timing completeness where receiver timestamps are supported.",
+            "",
+            "| Profile | Baud | Final status | Timing status | GGA Hz / miss | RMC Hz / miss | GST Hz / miss | GSV Hz / incomplete | PPPNAV Hz / miss | ADRNAV Hz / miss | Max gap s |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in _representative_rows(summary["rows"]):  # type: ignore[index]
+        lines.append(
+            "| {profile} | {baud} | {classification} | {timing} | {gga} | {rmc} | {gst} | {gsv} | {pppnav} | {adrnav} | {gap} |".format(
+                profile=row.get("profile"),
+                baud=row.get("baud") or "n/a",
+                classification=row.get("classification"),
+                timing=row.get("timing_overall_status") or "n/a",
+                gga=_rate_miss(row, "gga"),
+                rmc=_rate_miss(row, "rmc"),
+                gst=_rate_miss(row, "gst"),
+                gsv=f"{_fmt(row.get('gsv_epoch_observed_hz'))} / {_fmt(row.get('gsv_incomplete_group_rate'))}",
+                pppnav=_rate_miss(row, "pppnav"),
+                adrnav=_rate_miss(row, "adrnav"),
+                gap=_fmt(row.get("timing_max_gap_s_overall")),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## PPP/HAS Timing Expectations",
+            "",
+            "- PPP/HAS profiles check GGA/RMC/GST at 20 Hz when those messages are enabled.",
+            "- GSV is assessed by grouped burst epochs, not raw sentence count.",
+            "- PPPNAVA/ADRNAVA and PPPNAVB/ADRNAVB are assessed at 0.1 Hz when enabled and timestamped.",
+            "- ONCHANGED TROPINFO/GPSION messages are reported when seen but absence is not counted as periodic loss.",
             "",
             "## Mixed-Stream Parser Robustness",
             "",
@@ -448,12 +507,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repeat", type=int, default=int(os.environ["UM980_BANDWIDTH_REPEAT"]) if os.environ.get("UM980_BANDWIDTH_REPEAT") else None)
     parser.add_argument("--cooldown-s", type=float, default=2.0)
     parser.add_argument("--out-dir", type=Path)
-    parser.add_argument("--profile-dir", type=Path, default=PROFILE_DIR)
+    profile_family = os.environ.get("UM980_BANDWIDTH_PROFILE_FAMILY", "bandwidth")
+    parser.add_argument("--profile-family", choices=sorted(PROFILE_FAMILY_DIRS), default=profile_family)
+    parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--profile", action="append", help="Limit to one profile stem; repeatable.")
     parser.add_argument("--native-helper", type=Path, default=Path("tools/termux/um980-usb-fd"))
     parser.add_argument("--command-timeout-s", type=float, help="Per-cell timeout; defaults to duration + 120 seconds.")
     parser.add_argument("--stress", action="store_true", default=os.environ.get("UM980_BANDWIDTH_STRESS") == "1")
-    run_matrix(parser.parse_args(argv))
+    args = parser.parse_args(argv)
+    if args.profile_dir is None:
+        args.profile_dir = PROFILE_FAMILY_DIRS[args.profile_family]
+    run_matrix(args)
     return 0
 
 
@@ -480,6 +544,8 @@ def _flatten_usb(usb: dict[str, object], baud: int) -> dict[str, object]:
 
 
 def _flatten_validation(validation: dict[str, object]) -> dict[str, object]:
+    timing = validation.get("timing_completeness") if isinstance(validation.get("timing_completeness"), dict) else {}
+    flattened_timing = _flatten_timing(timing if isinstance(timing, dict) else {})
     return {
         "validation_passed": bool(validation.get("mode_expectation_passed")) and not validation.get("errors"),
         "bytes_total": validation.get("bytes_total"),
@@ -498,6 +564,8 @@ def _flatten_validation(validation: dict[str, object]) -> dict[str, object]:
         "last_timestamp": validation.get("last_timestamp"),
         "validation_errors": validation.get("errors"),
         "validation_warnings": validation.get("warnings"),
+        "timing_completeness": timing,
+        **flattened_timing,
     }
 
 
@@ -567,7 +635,8 @@ def _comparison_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 def _rec_row(rec: dict[str, object]) -> str:
     return (
         f"| {rec['profile']} | {rec['classification']} | {rec.get('minimum_recommended_baud') or 'n/a'} | "
-        f"{_fmt(rec.get('measured_bytes_per_second_median'))} | {rec.get('evidence_cells')} | {rec.get('notes', '')} |"
+        f"{_fmt(rec.get('measured_bytes_per_second_median'))} | {', '.join(rec.get('timing_statuses', []))} | "
+        f"{rec.get('evidence_cells')} | {rec.get('notes', '')} |"
     )
 
 
@@ -593,6 +662,120 @@ def _profile_path_sort_key(path: Path) -> tuple[int, str]:
         return (PROFILE_ORDER.index(path.stem), path.stem)
     except ValueError:
         return (len(PROFILE_ORDER), path.stem)
+
+
+def _flatten_timing(timing: dict[str, object]) -> dict[str, object]:
+    messages = timing.get("messages") if isinstance(timing.get("messages"), dict) else {}
+    out: dict[str, object] = {
+        "timing_overall_passed": timing.get("overall_timing_passed"),
+        "timing_overall_confidence": timing.get("overall_timing_confidence"),
+        "timing_overall_status": timing.get("overall_timing_status"),
+        "timing_key_message_failures": "; ".join(str(item) for item in timing.get("timing_summary_flags", [])[:10])
+        if isinstance(timing.get("timing_summary_flags"), list)
+        else "",
+    }
+    max_gap = None
+    max_missing = None
+    max_duplicate = None
+    for metric in messages.values():  # type: ignore[union-attr]
+        if not isinstance(metric, dict):
+            continue
+        max_gap = _max_optional(max_gap, metric.get("max_receiver_time_gap_s"))
+        max_missing = _max_optional(max_missing, metric.get("missing_epoch_rate"))
+        max_duplicate = _max_optional(max_duplicate, metric.get("duplicate_epoch_rate"))
+    out["timing_max_gap_s_overall"] = max_gap
+    out["timing_missing_epoch_rate_max"] = max_missing
+    out["timing_duplicate_epoch_rate_max"] = max_duplicate
+    for prefix, names in {
+        "gga": ("GNGGA", "GPGGA", "GGA"),
+        "rmc": ("GNRMC", "GPRMC", "RMC"),
+        "gst": ("GNGST", "GPGST", "GST"),
+        "gsv": ("GNGSV", "GPGSV", "GAGSV", "GBGSV", "GSV"),
+        "pppnav": ("PPPNAVA", "PPPNAVB"),
+        "adrnav": ("ADRNAVA", "ADRNAVB"),
+    }.items():
+        metric = _first_metric(messages, names)  # type: ignore[arg-type]
+        out[f"{prefix}_observed_hz"] = metric.get("observed_rate_hz") if metric else None
+        out[f"{prefix}_missing_epoch_rate"] = metric.get("missing_epoch_rate") if metric else None
+        out[f"{prefix}_max_gap_s"] = metric.get("max_receiver_time_gap_s") if metric else None
+        if prefix == "gsv":
+            out["gsv_epoch_observed_hz"] = metric.get("observed_rate_hz") if metric else None
+            out["gsv_incomplete_group_rate"] = metric.get("incomplete_gsv_group_rate") if metric else None
+    return out
+
+
+def _first_metric(messages: dict[str, object], names: tuple[str, ...]) -> dict[str, object] | None:
+    for name in names:
+        metric = messages.get(name)
+        if isinstance(metric, dict):
+            return metric
+    return None
+
+
+def _max_optional(current: object, value: object) -> float | None:
+    values = [float(item) for item in (current, value) if isinstance(item, int | float)]
+    return max(values) if values else None
+
+
+def _write_rows_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    columns = [
+        "profile",
+        "baud",
+        "repeat",
+        "classification",
+        "throughput_status",
+        "parser_status",
+        "timing_status",
+        "bytes_per_second",
+        "measured_vs_uart_payload_ratio",
+        "timing_overall_passed",
+        "timing_overall_confidence",
+        "timing_key_message_failures",
+        "timing_max_gap_s_overall",
+        "timing_missing_epoch_rate_max",
+        "timing_duplicate_epoch_rate_max",
+        "gga_observed_hz",
+        "gga_missing_epoch_rate",
+        "gga_max_gap_s",
+        "rmc_observed_hz",
+        "rmc_missing_epoch_rate",
+        "rmc_max_gap_s",
+        "gst_observed_hz",
+        "gst_missing_epoch_rate",
+        "gst_max_gap_s",
+        "gsv_epoch_observed_hz",
+        "gsv_incomplete_group_rate",
+        "pppnav_observed_hz",
+        "pppnav_missing_epoch_rate",
+        "adrnav_observed_hz",
+        "adrnav_missing_epoch_rate",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _representative_rows(rows: object) -> list[dict[str, object]]:
+    if not isinstance(rows, list):
+        return []
+    typed = [row for row in rows if isinstance(row, dict) and isinstance(row.get("baud"), int)]
+    by_profile: dict[str, dict[str, object]] = {}
+    for row in typed:
+        profile = str(row.get("profile"))
+        current = by_profile.get(profile)
+        if current is None or _classification_rank(str(row.get("classification"))) < _classification_rank(str(current.get("classification"))):
+            by_profile[profile] = row
+    return [by_profile[key] for key in sorted(by_profile)]
+
+
+def _classification_rank(label: str) -> int:
+    return {"PROVISIONALLY_SAFE": 0, "MARGINAL": 1, "INCONCLUSIVE": 2, "UNSAFE": 3}.get(label, 4)
+
+
+def _rate_miss(row: dict[str, object], prefix: str) -> str:
+    return f"{_fmt(row.get(prefix + '_observed_hz'))} / {_fmt(row.get(prefix + '_missing_epoch_rate'))}"
 
 
 if __name__ == "__main__":

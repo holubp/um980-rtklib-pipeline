@@ -1,0 +1,27 @@
+# enabled: true
+mode: ascii
+expect_mode: ascii
+family: ppp_has_ascii
+expected_messages: GGA,RMC,GST,GSV,GSA,GLL,GNS,GRS,PPPNAVA,ADRNAVA
+expected_rate_hz: GNGGA=20,GNRMC=20,GNGST=20,GNGSV=1,GNGSA=1,GPGLL=1,GPGNS=1,GPGRS=0.033333333,PPPNAVA=0.1,ADRNAVA=0.1
+event_driven: TROPINFOA,GPSIONA
+persistent: no
+commands_active: yes
+allow_reviewed_port_commands: true
+
+CONFIG COM1 {baud}
+UNLOG COM1
+MODE ROVER
+CONFIG MMP ENABLE
+GNGGA 0.05
+GNRMC 0.05
+GNGST 0.05
+GNGSV 1
+GNGSA 1
+GPGLL 1
+GPGNS 1
+GPGRS 30
+PPPNAVA 10
+ADRNAVA 10
+TROPINFOA ONCHANGED
+GPSIONA ONCHANGED

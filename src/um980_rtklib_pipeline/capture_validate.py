@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from .solution import extract_solutions
+from .timing_completeness import analyze_timing_completeness
 from .um980_stream import parse_file
 
 
@@ -37,6 +38,7 @@ class CaptureValidationResult:
     last_timestamp: str | None
     message_counts: dict[str, int]
     expected_messages_missing: list[str]
+    timing_completeness: dict[str, object]
     mode_expectation: str
     mode_expectation_passed: bool
     warnings: list[str] = field(default_factory=list)
@@ -65,6 +67,7 @@ class CaptureValidationResult:
             "last_timestamp": self.last_timestamp,
             "message_counts": self.message_counts,
             "expected_messages_missing": self.expected_messages_missing,
+            "timing_completeness": self.timing_completeness,
             "mode_expectation": self.mode_expectation,
             "mode_expectation_passed": self.mode_expectation_passed,
             "warnings": self.warnings,
@@ -77,6 +80,8 @@ def validate_capture_file(
     *,
     expect_mode: CaptureMode = "passive",
     expected_messages: list[str] | None = None,
+    profile_path: Path | None = None,
+    capture_duration_s: float | None = None,
 ) -> CaptureValidationResult:
     """Validate a raw UM980 capture structurally without inferring protocol from suffix."""
 
@@ -112,6 +117,12 @@ def validate_capture_file(
 
     solutions = extract_solutions(records)
     timestamps = [point.time_utc.isoformat().replace("+00:00", "Z") for point in solutions.solution_points]
+    timing = analyze_timing_completeness(
+        records,
+        profile_path=profile_path,
+        expected_messages=expected_messages,
+        capture_duration_s=capture_duration_s,
+    ).as_dict()
     mode_ok = _mode_passed(
         expect_mode,
         size=size,
@@ -141,6 +152,7 @@ def validate_capture_file(
         last_timestamp=timestamps[-1] if timestamps else None,
         message_counts=message_counts,
         expected_messages_missing=expected_missing,
+        timing_completeness=timing,
         mode_expectation=expect_mode,
         mode_expectation_passed=mode_ok,
         warnings=warnings,
@@ -198,6 +210,15 @@ def _empty_result(
         last_timestamp=None,
         message_counts={},
         expected_messages_missing=list(expected_messages),
+        timing_completeness={
+            "profile_name": None,
+            "profile_family": None,
+            "messages": {},
+            "overall_timing_passed": False,
+            "overall_timing_confidence": "unsupported",
+            "overall_timing_status": "unsupported",
+            "timing_summary_flags": ["capture file is empty"],
+        },
         mode_expectation=expect_mode,
         mode_expectation_passed=False,
         warnings=warnings,

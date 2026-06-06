@@ -209,6 +209,18 @@ The report labels per-profile results as `PROVISIONALLY_SAFE`, `MARGINAL`,
 and boundary evidence is available.  Smoke-only results must be treated as
 early evidence, not final recommendations.
 
+Each cell now includes timing-completeness metrics, not only bytes per second
+and parser success.  For periodic messages with supported receiver timestamps
+the matrix records observed Hz, missing epochs, duplicate epochs, robust
+receiver-time gaps, and a timing confidence/status.  A profile cannot be
+recommended safe when key periodic timing is failed or unsupported.
+
+Generated outputs include:
+
+- `bandwidth_matrix_summary.json` with full per-message timing details;
+- `bandwidth_matrix_rows.csv` with bounded key timing columns for comparisons;
+- `bandwidth_recommendations.md` with parser, throughput, and timing status.
+
 Committed bandwidth profiles live in
 `tools/um980_profiles/runtime/bandwidth/`.  They are runtime-only and contain no
 `SAVECONFIG`.  Profiles that require stress testing or unverified syntax remain
@@ -219,6 +231,36 @@ whether it succeeded, measured bytes per second, and the measured load relative
 to an equivalent UART 8N1 payload budget.  This is evidence for whether the USB
 COM line-coding value matters on the observed interface; it is not assumed in
 advance.
+
+### PPP/HAS Timing Profiles
+
+Curated PPP/HAS runtime profiles live in
+`tools/um980_profiles/runtime/ppp_has/`.  They declare exact timing
+expectations for the baseline family:
+
+- `GNGGA`, `GNRMC`, and `GNGST` at 20 Hz;
+- `GNGSV` as grouped 1 Hz bursts;
+- `GNGSA`, `GPGLL`, and `GPGNS` at 1 Hz;
+- `GPGRS` at 1/30 Hz;
+- `PPPNAVA`/`ADRNAVA` or `PPPNAVB`/`ADRNAVB` at 0.1 Hz;
+- `TROPINFO*` and `GPSION*` as `ONCHANGED` event-driven messages.
+
+Run a PPP/HAS smoke matrix with:
+
+```sh
+export UM980_HW_TEST=1
+export UM980_TERMUX_DEVICE="/dev/bus/usb/002/002"
+export UM980_BANDWIDTH_PROFILE_FAMILY=ppp_has
+export UM980_BANDWIDTH_STAGE=smoke
+export UM980_BANDWIDTH_DURATION=30
+export UM980_BANDWIDTH_REPEAT=1
+/data/data/com.termux/files/usr/bin/sh scripts/termux_um980_bandwidth_matrix.sh
+```
+
+Event-driven messages are reported when observed, but absence is not counted as
+timing loss.  Binary PPP/HAS recommendations remain inconclusive unless the
+stream parser recognises the relevant binary message IDs and can extract
+receiver timestamps.
 
 ## Limitations
 
