@@ -42,6 +42,7 @@ class CaptureUsbOptions:
     altsetting: int | None = None
     ep_in: str | None = None
     ep_out: str | None = None
+    profile_baud: int | None = None
     serial_baud: int | None = None
     command_timeout_s: float | None = None
     verbose: bool = False
@@ -236,6 +237,7 @@ def _termux_usb_command(options: CaptureUsbOptions, usb_analysis_path: Path | No
     _append_option(helper_args, "--altsetting", options.altsetting)
     _append_option(helper_args, "--ep-in", options.ep_in)
     _append_option(helper_args, "--ep-out", options.ep_out)
+    _append_option(helper_args, "--profile-baud", options.profile_baud)
     _append_option(helper_args, "--serial-baud", options.serial_baud)
     _append_option(helper_args, "--expect-min-bytes", options.expect_min_bytes if options.expect_min_bytes > 0 else None)
     if options.verbose:

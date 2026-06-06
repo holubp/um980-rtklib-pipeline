@@ -46,6 +46,7 @@ struct options {
     int ep_in_override;
     int ep_out_override;
     long long expect_min_bytes;
+    int profile_baud;
     int serial_baud;
     int fd;
 };
@@ -85,6 +86,7 @@ struct run_summary {
     int altsetting;
     int id_vendor;
     int id_product;
+    int profile_baud;
     int serial_baud;
     bool ftdi_serial_mode;
     const char *output_path;
@@ -126,6 +128,7 @@ static void usage(FILE *stream) {
             "  --ep-in 0xNN\n"
             "  --ep-out 0xNN\n"
             "  --expect-min-bytes N\n"
+            "  --profile-baud N\n"
             "  --serial-baud N\n"
             "  --verbose\n"
             "  --help\n");
@@ -285,6 +288,7 @@ static int parse_args(int argc, char **argv, struct options *opts) {
     opts->altsetting_override = -1;
     opts->ep_in_override = -1;
     opts->ep_out_override = -1;
+    opts->profile_baud = 0;
     opts->serial_baud = 0;
     opts->fd = -1;
     static const struct option long_options[] = {
@@ -308,6 +312,7 @@ static int parse_args(int argc, char **argv, struct options *opts) {
         {"expect-min-bytes", required_argument, 0, 18},
         {"serial-baud", required_argument, 0, 19},
         {"verbose", no_argument, 0, 20},
+        {"profile-baud", required_argument, 0, 21},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -342,6 +347,7 @@ static int parse_args(int argc, char **argv, struct options *opts) {
         case 18: opts->expect_min_bytes = atoll(optarg); break;
         case 19: opts->serial_baud = atoi(optarg); break;
         case 20: opts->verbose = true; break;
+        case 21: opts->profile_baud = atoi(optarg); break;
         case 'h': usage(stdout); exit(0);
         default: usage(stderr); return -1;
         }
@@ -502,12 +508,19 @@ static int configure_ftdi_serial(libusb_device_handle *handle, int interface_num
         snprintf(error, error_len, "FTDI 8N1 setup failed: %s", libusb_error_name(rc));
         return -1;
     }
-    int divisor = (3000000 + baud / 2) / baud;
-    if (divisor <= 0) {
+    static const unsigned char frac_code[8] = {0, 3, 2, 4, 1, 5, 6, 7};
+    int divisor3 = (24000000 + baud / 2) / baud;
+    if (divisor3 <= 0) {
+        divisor3 = 1;
+    }
+    int divisor = (divisor3 >> 3) | (frac_code[divisor3 & 7] << 14);
+    if (divisor == 1) {
+        divisor = 0;
+    } else if (divisor == 0x4001) {
         divisor = 1;
     }
     int value = divisor & 0xffff;
-    int baud_index = index | ((divisor >> 16) & 0xffff);
+    int baud_index = index | ((divisor >> 8) & 0xff00);
     rc = libusb_control_transfer(handle, 0x40, 3, value, baud_index, NULL, 0, 1000);
     if (rc < 0) {
         snprintf(error, error_len, "FTDI baud setup failed: %s", libusb_error_name(rc));
@@ -669,6 +682,7 @@ static int write_analysis_json(const char *path, const struct run_summary *s) {
             "  \"altsetting\": %d,\n"
             "  \"id_vendor\": \"0x%04x\",\n"
             "  \"id_product\": \"0x%04x\",\n"
+            "  \"profile_baud\": %d,\n"
             "  \"serial_baud\": %d,\n"
             "  \"ftdi_serial_mode\": %s,\n"
             "  \"output_path\": \"%s\",\n"
@@ -681,7 +695,7 @@ static int write_analysis_json(const char *path, const struct run_summary *s) {
             s->endpoint_in,
             endpoint_out_json,
             s->interface_number, s->altsetting, s->id_vendor, s->id_product,
-            s->serial_baud, s->ftdi_serial_mode ? "true" : "false",
+            s->profile_baud, s->serial_baud, s->ftdi_serial_mode ? "true" : "false",
             s->output_path ? s->output_path : "", s->exit_status, s->error_message ? s->error_message : "");
     fclose(fp);
     return 0;
@@ -826,8 +840,9 @@ int main(int argc, char **argv) {
     summary.altsetting = selected.altsetting;
     summary.id_vendor = dd.idVendor;
     summary.id_product = dd.idProduct;
+    summary.profile_baud = opts.profile_baud;
     summary.serial_baud = opts.serial_baud;
-    summary.ftdi_serial_mode = (dd.idVendor == 0x0403 && opts.serial_baud > 0);
+    summary.ftdi_serial_mode = (dd.idVendor == 0x0403 && (opts.profile_baud > 0 || opts.serial_baud > 0));
     summary.output_path = opts.out_path;
     summary.exit_status = 0;
     summary.error_message = "";
@@ -845,7 +860,8 @@ int main(int argc, char **argv) {
             }
             bool ftdi_serial_mode = summary.ftdi_serial_mode;
             if (ftdi_serial_mode) {
-                if (configure_ftdi_serial(handle, selected.interface_number, opts.serial_baud, error, sizeof(error)) != 0) {
+                int baud_for_profile = opts.profile_baud > 0 ? opts.profile_baud : opts.serial_baud;
+                if (baud_for_profile > 0 && configure_ftdi_serial(handle, selected.interface_number, baud_for_profile, error, sizeof(error)) != 0) {
                     fprintf(stderr, "%s\n", error);
                     summary.exit_status = 1;
                     summary.error_message = "failed to configure FTDI serial bridge";
@@ -859,6 +875,11 @@ int main(int argc, char **argv) {
             if (send_profile(handle, &selected, &opts, &profile) != 0) {
                 summary.exit_status = 1;
                 summary.error_message = "failed to send profile";
+            } else if (ftdi_serial_mode && opts.profile_baud > 0 && opts.serial_baud > 0 && opts.profile_baud != opts.serial_baud &&
+                       configure_ftdi_serial(handle, selected.interface_number, opts.serial_baud, error, sizeof(error)) != 0) {
+                fprintf(stderr, "%s\n", error);
+                summary.exit_status = 1;
+                summary.error_message = "failed to configure FTDI serial bridge after profile";
             } else if (discard_after_profile_loop(handle, &selected, &opts, &summary, ftdi_serial_mode) != 0) {
                 summary.exit_status = 1;
             } else if (capture_loop(handle, &selected, &opts, &summary, ftdi_serial_mode) != 0) {

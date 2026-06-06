@@ -78,6 +78,30 @@ strip the FTDI two-byte status header from incoming packets.  Use
 `--serial-baud 230400` for the normal UM980 `COM1 230400` runtime profile, or
 let the bandwidth matrix set the requested baud for each cell.
 
+When changing the receiver baud, send the runtime profile at the currently
+working receiver rate and then switch the host bridge to the target capture
+rate:
+
+```sh
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli capture-usb \
+  --termux-device "/dev/bus/usb/002/002" \
+  --duration 20 \
+  --profile captures/rendered/binary_rawobs_solution_5hz-460800.um980 \
+  --profile-baud 230400 \
+  --serial-baud 460800 \
+  --discard-after-profile-ms 3000 \
+  --out captures/test-460800.unc \
+  --analysis-json captures/test-460800.analysis.json \
+  --validate \
+  --extract-check \
+  --expect-mode binary \
+  -v
+```
+
+The native helper uses FTDI fractional baud divisors.  Whole-divisor-only
+configuration is not sufficient for rates such as 460800 or 921600 on the
+tested interface.
+
 ## Passive Capture
 
 Preferred suffix for new UM980/Unicore raw captures is `.unc`:
@@ -205,6 +229,10 @@ export UM980_TERMUX_DEVICE="/dev/bus/usb/002/002"
 Default stage is `smoke`: all enabled non-stress profiles are tried once at
 115200, 230400, 460800, and 921600 baud for a short capture.  The generated
 report is written under `captures/bandwidth-*/bandwidth_recommendations.md`.
+On the tested UM980/Redmi Pad Pro/FTDI bridge setup, 230400 and 460800 passed
+binary raw-observation capture; 921600 also passed short validation runs; and
+1843200/3686400 did not take effect through `CONFIG COM1 <baud>` from 921600.
+Treat this as hardware/interface evidence, not a universal UM980 limit.
 
 Longer evidence collection is explicit:
 

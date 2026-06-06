@@ -55,6 +55,8 @@ def test_capture_usb_passes_options_to_wrapper(tmp_path: Path, monkeypatch) -> N
             "helper",
             "--serial-baud",
             "230400",
+            "--profile-baud",
+            "115200",
             "--discard-after-profile-ms",
             "1500",
             "--discard-after-profile-bytes",
@@ -73,6 +75,7 @@ def test_capture_usb_passes_options_to_wrapper(tmp_path: Path, monkeypatch) -> N
     assert seen["options"].expect_messages == ("GGA",)
     assert seen["options"].native_helper == Path("helper")
     assert seen["options"].serial_baud == 230400
+    assert seen["options"].profile_baud == 115200
     assert seen["options"].discard_after_profile_ms == 1500
     assert seen["options"].discard_after_profile_bytes == 4096
     assert seen["options"].command_timeout_s == 7
@@ -86,6 +89,7 @@ def test_termux_helper_command_includes_post_profile_discard(tmp_path: Path) -> 
             out=tmp_path / "capture.unc",
             native_helper=Path("helper"),
             profile=tmp_path / "profile.um980",
+            profile_baud=115200,
             discard_after_profile_ms=1500,
             discard_after_profile_bytes=4096,
         ),
@@ -93,6 +97,7 @@ def test_termux_helper_command_includes_post_profile_discard(tmp_path: Path) -> 
     )
 
     helper_command = command[2]
+    assert "--profile-baud 115200" in helper_command
     assert "--discard-after-profile-ms 1500" in helper_command
     assert "--discard-after-profile-bytes 4096" in helper_command
 

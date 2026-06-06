@@ -52,6 +52,10 @@
   directory and append the wildcard filename unchanged.
 - Termux executable mirroring must only run under Termux/Android. Never rewrite
   Cygwin or desktop RTKLIB executable paths into `/data/data/com.termux/...`.
+- Rootless Termux FTDI capture at non-default baud rates must use fractional
+  FTDI divisors, not whole-divisor rounding. When changing UM980 `COM1` baud,
+  send the runtime profile at the currently working receiver baud and switch
+  the host bridge to the target baud only after the profile has been sent.
 - Explicit RTKLIB helper paths, such as `--crx2rnx ./crx2rnx.exe`, must be
   honored before `--rtklib-dir` search logic. Only bare tool names should be
   combined with configured install directories.

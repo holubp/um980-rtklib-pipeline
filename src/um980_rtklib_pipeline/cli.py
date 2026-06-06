@@ -3612,6 +3612,7 @@ def cmd_capture_usb(args: argparse.Namespace) -> int:
         altsetting=args.altsetting,
         ep_in=args.ep_in,
         ep_out=args.ep_out,
+        profile_baud=args.profile_baud,
         serial_baud=args.serial_baud,
         command_timeout_s=args.command_timeout_s,
         verbose=bool(args.verbose or args.debug),
@@ -4800,6 +4801,7 @@ def build_parser() -> argparse.ArgumentParser:
     capture_usb.add_argument("--altsetting", type=int)
     capture_usb.add_argument("--ep-in")
     capture_usb.add_argument("--ep-out")
+    capture_usb.add_argument("--profile-baud", type=int, help="Send the runtime profile at this current receiver baud before switching to --serial-baud for capture.")
     capture_usb.add_argument("--serial-baud", type=int, help="Configure FTDI USB-serial bridge baud rate and strip FTDI packet status bytes.")
     capture_usb.add_argument("--command-timeout-s", type=float, help="Wall-clock timeout for the USB helper and extract-check subprocesses.")
     capture_usb.add_argument("-v", "--verbose", action="store_true")
