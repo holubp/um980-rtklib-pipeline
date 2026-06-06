@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -170,6 +171,8 @@ def detect_rinex_nav_systems(path: str | Path) -> set[str]:
         return {"I"}
     if suffix == ".sbs":
         return {"S"}
+    if re.fullmatch(r"\.\d{2}n", suffix):
+        return {"G"}
     if any(token in name for token in ("BRDC", "BRDM", "BRD4")) or "_MN" in name:
         return {"G", "R", "E", "C", "J"}
 

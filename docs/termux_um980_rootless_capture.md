@@ -95,6 +95,30 @@ PYTHONPATH=src python -m um980_rtklib_pipeline.cli capture-usb \
   -v
 ```
 
+When a runtime profile is sent before capture, use a short post-profile drain so
+bytes already buffered under the previous receiver output configuration do not
+appear at the start of the saved `.unc` file:
+
+```sh
+PYTHONPATH=src python -m um980_rtklib_pipeline.cli capture-usb \
+  --termux-device "/dev/bus/usb/002/002" \
+  --duration 20 \
+  --profile tools/um980_profiles/runtime/binary_rawobs_solution.um980 \
+  --discard-after-profile-ms 2000 \
+  --out captures/profiled-clean.unc \
+  --analysis-json captures/profiled-clean.analysis.json \
+  --serial-baud 230400 \
+  --validate \
+  --extract-check \
+  --expect-mode binary \
+  -v
+```
+
+`--capture-after-profile-delay-ms` only sleeps.  `--discard-after-profile-ms`
+actively reads and discards startup/profile-transition output before the capture
+file is opened.  `--discard-after-profile-bytes` can be added when a device has
+a larger backlog to drain.
+
 The native helper can also be invoked directly through `termux-usb` when the
 helper path is executable:
 

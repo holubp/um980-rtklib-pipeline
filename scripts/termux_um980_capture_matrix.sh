@@ -14,6 +14,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 DURATION="${UM980_CAPTURE_DURATION:-20}"
+PROFILE_DISCARD_MS="${UM980_PROFILE_DISCARD_MS:-2000}"
 OUTDIR="captures/termux-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUTDIR"
 CASES_JSONL="$OUTDIR/hw_matrix_cases.jsonl"
@@ -82,6 +83,9 @@ run_case() {
   cmd="PYTHONPATH=src python -m um980_rtklib_pipeline.cli capture-usb --termux-device '$UM980_TERMUX_DEVICE' --duration '$DURATION' --out '$capture' --analysis-json '$analysis' --validate --extract-check --expect-mode '$mode' -v"
   if [ -n "$profile" ]; then
     cmd="$cmd --profile '$profile'"
+    if [ "$name" != "01_passive_current_stream" ] && [ "$PROFILE_DISCARD_MS" -gt 0 ]; then
+      cmd="$cmd --discard-after-profile-ms '$PROFILE_DISCARD_MS'"
+    fi
   fi
   echo "running $name"
   if sh -c "$cmd" > "$log" 2>&1; then

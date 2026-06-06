@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from um980_rtklib_pipeline import cli
 from um980_rtklib_pipeline import capture_termux
-from um980_rtklib_pipeline.capture_termux import CaptureUsbResult
+from um980_rtklib_pipeline.capture_termux import CaptureUsbOptions, CaptureUsbResult
 
 
 def test_capture_usb_refuses_missing_termux_device(tmp_path: Path, capsys) -> None:
@@ -55,6 +55,10 @@ def test_capture_usb_passes_options_to_wrapper(tmp_path: Path, monkeypatch) -> N
             "helper",
             "--serial-baud",
             "230400",
+            "--discard-after-profile-ms",
+            "1500",
+            "--discard-after-profile-bytes",
+            "4096",
             "--command-timeout-s",
             "7",
         ]
@@ -69,7 +73,28 @@ def test_capture_usb_passes_options_to_wrapper(tmp_path: Path, monkeypatch) -> N
     assert seen["options"].expect_messages == ("GGA",)
     assert seen["options"].native_helper == Path("helper")
     assert seen["options"].serial_baud == 230400
+    assert seen["options"].discard_after_profile_ms == 1500
+    assert seen["options"].discard_after_profile_bytes == 4096
     assert seen["options"].command_timeout_s == 7
+
+
+def test_termux_helper_command_includes_post_profile_discard(tmp_path: Path) -> None:
+    command = capture_termux._termux_usb_command(
+        CaptureUsbOptions(
+            termux_device="/dev/bus/usb/002/002",
+            duration_s=2,
+            out=tmp_path / "capture.unc",
+            native_helper=Path("helper"),
+            profile=tmp_path / "profile.um980",
+            discard_after_profile_ms=1500,
+            discard_after_profile_bytes=4096,
+        ),
+        None,
+    )
+
+    helper_command = command[2]
+    assert "--discard-after-profile-ms 1500" in helper_command
+    assert "--discard-after-profile-bytes 4096" in helper_command
 
 
 def test_hardware_capture_tests_are_opt_in(monkeypatch) -> None:

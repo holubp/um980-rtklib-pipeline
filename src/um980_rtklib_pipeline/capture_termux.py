@@ -34,6 +34,8 @@ class CaptureUsbOptions:
     expect_messages: tuple[str, ...] = ()
     profile_line_delay_ms: int | None = None
     capture_after_profile_delay_ms: int | None = None
+    discard_after_profile_ms: int | None = None
+    discard_after_profile_bytes: int | None = None
     read_timeout_ms: int | None = None
     max_bytes: int | None = None
     interface: int | None = None
@@ -226,6 +228,8 @@ def _termux_usb_command(options: CaptureUsbOptions, usb_analysis_path: Path | No
         helper_args.extend(["--profile", str(options.profile)])
     _append_option(helper_args, "--profile-line-delay-ms", options.profile_line_delay_ms)
     _append_option(helper_args, "--capture-after-profile-delay-ms", options.capture_after_profile_delay_ms)
+    _append_option(helper_args, "--discard-after-profile-ms", options.discard_after_profile_ms)
+    _append_option(helper_args, "--discard-after-profile-bytes", options.discard_after_profile_bytes)
     _append_option(helper_args, "--read-timeout-ms", options.read_timeout_ms)
     _append_option(helper_args, "--max-bytes", options.max_bytes)
     _append_option(helper_args, "--interface", options.interface)

@@ -178,6 +178,7 @@ def run_cell(
     termux_device: str,
     native_helper: Path,
     command_timeout_s: float,
+    profile_discard_ms: int = 0,
 ) -> dict[str, object]:
     """Run one matrix cell and return metrics."""
 
@@ -185,6 +186,12 @@ def run_cell(
     capture_path = out_dir / f"{stem}.unc"
     analysis_path = out_dir / f"{stem}.analysis.json"
     expected = _csv(profile.metadata.get("expected_messages", ""))
+    metadata_discard_ms = int(
+        getattr(profile, "metadata", {}).get("discard_after_profile_ms")
+        or getattr(profile, "metadata", {}).get("settle_discard_ms")
+        or 0
+    )
+    effective_discard_ms = metadata_discard_ms or profile_discard_ms
     row: dict[str, object] = {
         "profile": profile.path.stem,
         "profile_path": str(profile.path),
@@ -215,6 +222,7 @@ def run_cell(
                 expect_mode=profile.metadata.get("expect_mode", profile.mode),
                 expect_messages=tuple(expected),
                 serial_baud=baud,
+                discard_after_profile_ms=effective_discard_ms or None,
                 command_timeout_s=command_timeout_s,
                 verbose=False,
             )
@@ -297,6 +305,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, object]:
                         termux_device=args.termux_device,
                         native_helper=args.native_helper,
                         command_timeout_s=max(args.command_timeout_s or 0.0, plan.duration_s + 120.0),
+                        profile_discard_ms=0 if not profile.commands else int(getattr(args, "profile_discard_ms", 0) or 0),
                     )
                     stage_rows.append(row)
                     all_rows.append(row)
@@ -513,6 +522,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", action="append", help="Limit to one profile stem; repeatable.")
     parser.add_argument("--native-helper", type=Path, default=Path("tools/termux/um980-usb-fd"))
     parser.add_argument("--command-timeout-s", type=float, help="Per-cell timeout; defaults to duration + 120 seconds.")
+    parser.add_argument(
+        "--profile-discard-ms",
+        type=int,
+        default=int(os.environ["UM980_PROFILE_DISCARD_MS"]) if os.environ.get("UM980_PROFILE_DISCARD_MS") else 2000,
+        help="For active runtime profiles, discard receiver output for this many milliseconds before starting each capture.",
+    )
     parser.add_argument("--stress", action="store_true", default=os.environ.get("UM980_BANDWIDTH_STRESS") == "1")
     args = parser.parse_args(argv)
     if args.profile_dir is None:

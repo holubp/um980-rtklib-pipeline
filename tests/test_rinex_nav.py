@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from um980_rtklib_pipeline import cli
-from um980_rtklib_pipeline.files import classify_rinex_file
+from um980_rtklib_pipeline.files import classify_rinex_file, detect_rinex_nav_systems
 from um980_rtklib_pipeline.rinex_nav import extract_rover_nav, rover_nav_files
 from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32, unicore_crc32
 
@@ -14,6 +14,19 @@ from um980_rtklib_pipeline.stream import parse_stream, unicore_binary_crc32, uni
 def _ascii_record(body: bytes) -> bytes:
     crc = unicore_crc32(body)
     return b"#" + body + f"*{crc:08X}\r\n".encode("ascii")
+
+
+def test_legacy_rinex2_gps_nav_suffix_is_detected_as_gps(tmp_path: Path) -> None:
+    nav = tmp_path / "auto1570.26n"
+    nav.write_text(
+        "     2.11           NAVIGATION DATA                         RINEX VERSION / TYPE\n"
+        "                                                            END OF HEADER\n"
+        " 1 26  6  6  0  0  0.0 0.0 0.0 0.0\n",
+        encoding="ascii",
+    )
+
+    assert classify_rinex_file(nav) == "nav"
+    assert detect_rinex_nav_systems(nav) == {"G"}
 
 
 GPS_LINE = _ascii_record(

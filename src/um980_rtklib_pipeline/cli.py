@@ -3604,6 +3604,8 @@ def cmd_capture_usb(args: argparse.Namespace) -> int:
         expect_messages=tuple(args.expect_message or ()),
         profile_line_delay_ms=args.profile_line_delay_ms,
         capture_after_profile_delay_ms=args.capture_after_profile_delay_ms,
+        discard_after_profile_ms=args.discard_after_profile_ms,
+        discard_after_profile_bytes=args.discard_after_profile_bytes,
         read_timeout_ms=args.read_timeout_ms,
         max_bytes=args.max_bytes,
         interface=args.interface,
@@ -4782,6 +4784,16 @@ def build_parser() -> argparse.ArgumentParser:
     capture_usb.add_argument("--expect-message", action="append")
     capture_usb.add_argument("--profile-line-delay-ms", type=int)
     capture_usb.add_argument("--capture-after-profile-delay-ms", type=int)
+    capture_usb.add_argument(
+        "--discard-after-profile-ms",
+        type=int,
+        help="After sending a runtime profile, read and discard USB input for this many milliseconds before opening the capture file.",
+    )
+    capture_usb.add_argument(
+        "--discard-after-profile-bytes",
+        type=int,
+        help="After sending a runtime profile, keep discarding until at least this many payload bytes have been drained.",
+    )
     capture_usb.add_argument("--read-timeout-ms", type=int)
     capture_usb.add_argument("--max-bytes", type=int)
     capture_usb.add_argument("--interface", type=int)

@@ -37,6 +37,8 @@ struct options {
     const char *profile_path;
     int profile_line_delay_ms;
     int capture_after_profile_delay_ms;
+    int discard_after_profile_ms;
+    long long discard_after_profile_bytes;
     int read_timeout_ms;
     long long max_bytes;
     int interface_override;
@@ -73,6 +75,10 @@ struct run_summary {
     double bytes_per_second;
     long long read_timeouts;
     long long read_errors;
+    double discard_after_profile_elapsed_s;
+    long long discarded_after_profile_bytes;
+    long long discard_read_timeouts;
+    long long discard_read_errors;
     int endpoint_in;
     int endpoint_out;
     int interface_number;
@@ -111,6 +117,8 @@ static void usage(FILE *stream) {
             "  --dry-run-profile\n"
             "  --profile-line-delay-ms N\n"
             "  --capture-after-profile-delay-ms N\n"
+            "  --discard-after-profile-ms N\n"
+            "  --discard-after-profile-bytes N\n"
             "  --read-timeout-ms N\n"
             "  --max-bytes N\n"
             "  --interface N\n"
@@ -270,6 +278,8 @@ static int parse_args(int argc, char **argv, struct options *opts) {
     opts->read_timeout_ms = 1000;
     opts->profile_line_delay_ms = 100;
     opts->capture_after_profile_delay_ms = 500;
+    opts->discard_after_profile_ms = 0;
+    opts->discard_after_profile_bytes = 0;
     opts->max_bytes = 0;
     opts->interface_override = -1;
     opts->altsetting_override = -1;
@@ -287,15 +297,17 @@ static int parse_args(int argc, char **argv, struct options *opts) {
         {"dry-run-profile", no_argument, 0, 7},
         {"profile-line-delay-ms", required_argument, 0, 8},
         {"capture-after-profile-delay-ms", required_argument, 0, 9},
-        {"read-timeout-ms", required_argument, 0, 10},
-        {"max-bytes", required_argument, 0, 11},
-        {"interface", required_argument, 0, 12},
-        {"altsetting", required_argument, 0, 13},
-        {"ep-in", required_argument, 0, 14},
-        {"ep-out", required_argument, 0, 15},
-        {"expect-min-bytes", required_argument, 0, 16},
-        {"serial-baud", required_argument, 0, 17},
-        {"verbose", no_argument, 0, 18},
+        {"discard-after-profile-ms", required_argument, 0, 10},
+        {"discard-after-profile-bytes", required_argument, 0, 11},
+        {"read-timeout-ms", required_argument, 0, 12},
+        {"max-bytes", required_argument, 0, 13},
+        {"interface", required_argument, 0, 14},
+        {"altsetting", required_argument, 0, 15},
+        {"ep-in", required_argument, 0, 16},
+        {"ep-out", required_argument, 0, 17},
+        {"expect-min-bytes", required_argument, 0, 18},
+        {"serial-baud", required_argument, 0, 19},
+        {"verbose", no_argument, 0, 20},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -313,21 +325,23 @@ static int parse_args(int argc, char **argv, struct options *opts) {
         case 7: opts->dry_run_profile = true; break;
         case 8: opts->profile_line_delay_ms = atoi(optarg); break;
         case 9: opts->capture_after_profile_delay_ms = atoi(optarg); break;
-        case 10: opts->read_timeout_ms = atoi(optarg); break;
-        case 11: opts->max_bytes = atoll(optarg); break;
-        case 12: opts->interface_override = atoi(optarg); break;
-        case 13: opts->altsetting_override = atoi(optarg); break;
-        case 14:
+        case 10: opts->discard_after_profile_ms = atoi(optarg); break;
+        case 11: opts->discard_after_profile_bytes = atoll(optarg); break;
+        case 12: opts->read_timeout_ms = atoi(optarg); break;
+        case 13: opts->max_bytes = atoll(optarg); break;
+        case 14: opts->interface_override = atoi(optarg); break;
+        case 15: opts->altsetting_override = atoi(optarg); break;
+        case 16:
             if (!parse_int_auto(optarg, &value)) return -1;
             opts->ep_in_override = value;
             break;
-        case 15:
+        case 17:
             if (!parse_int_auto(optarg, &value)) return -1;
             opts->ep_out_override = value;
             break;
-        case 16: opts->expect_min_bytes = atoll(optarg); break;
-        case 17: opts->serial_baud = atoi(optarg); break;
-        case 18: opts->verbose = true; break;
+        case 18: opts->expect_min_bytes = atoll(optarg); break;
+        case 19: opts->serial_baud = atoi(optarg); break;
+        case 20: opts->verbose = true; break;
         case 'h': usage(stdout); exit(0);
         default: usage(stderr); return -1;
         }
@@ -523,6 +537,25 @@ static size_t write_ftdi_payload(FILE *out, const unsigned char *buffer, int tra
     return written;
 }
 
+static size_t ftdi_payload_len(int transferred, int max_packet_size) {
+    if (max_packet_size <= 2) {
+        max_packet_size = 64;
+    }
+    size_t payload = 0;
+    int offset = 0;
+    while (offset < transferred) {
+        int packet_len = transferred - offset;
+        if (packet_len > max_packet_size) {
+            packet_len = max_packet_size;
+        }
+        if (packet_len > 2) {
+            payload += (size_t)(packet_len - 2);
+        }
+        offset += packet_len;
+    }
+    return payload;
+}
+
 static int send_profile(libusb_device_handle *handle, const struct selected_endpoint *selected, const struct options *opts, const struct command_profile *profile) {
     if (profile->count <= 0) {
         return 0;
@@ -550,6 +583,63 @@ static int send_profile(libusb_device_handle *handle, const struct selected_endp
     return 0;
 }
 
+static int discard_after_profile_loop(libusb_device_handle *handle, const struct selected_endpoint *selected, const struct options *opts, struct run_summary *summary, bool ftdi_serial_mode) {
+    if (opts->discard_after_profile_ms <= 0 && opts->discard_after_profile_bytes <= 0) {
+        return 0;
+    }
+    unsigned char buffer[BUF_SIZE];
+    double start = monotonic_s();
+    double min_elapsed_s = opts->discard_after_profile_ms > 0 ? (double)opts->discard_after_profile_ms / 1000.0 : 0.0;
+    long long discarded = 0;
+    long long timeouts = 0;
+    long long errors = 0;
+    int quiet_timeouts = 0;
+    while (!stop_requested) {
+        double now = monotonic_s();
+        bool time_met = min_elapsed_s <= 0.0 || now - start >= min_elapsed_s;
+        bool bytes_met = opts->discard_after_profile_bytes <= 0 || discarded >= opts->discard_after_profile_bytes;
+        if (time_met && bytes_met) {
+            break;
+        }
+        if (min_elapsed_s <= 0.0 && opts->discard_after_profile_bytes > 0 && quiet_timeouts >= 20) {
+            break;
+        }
+        int transferred = 0;
+        int rc;
+        if (selected->ep_in_type == LIBUSB_TRANSFER_TYPE_INTERRUPT) {
+            rc = libusb_interrupt_transfer(handle, selected->ep_in, buffer, BUF_SIZE, &transferred, opts->read_timeout_ms);
+        } else {
+            rc = libusb_bulk_transfer(handle, selected->ep_in, buffer, BUF_SIZE, &transferred, opts->read_timeout_ms);
+        }
+        if (transferred > 0) {
+            discarded += (long long)(ftdi_serial_mode ? ftdi_payload_len(transferred, selected->ep_in_max_packet_size) : (size_t)transferred);
+            quiet_timeouts = 0;
+        }
+        if (rc == LIBUSB_ERROR_TIMEOUT) {
+            timeouts++;
+            quiet_timeouts++;
+            continue;
+        }
+        if (rc == LIBUSB_ERROR_NO_DEVICE) {
+            summary->error_message = "USB device disconnected during post-profile discard";
+            errors++;
+            break;
+        }
+        if (rc != 0) {
+            errors++;
+            if (errors > 20) {
+                summary->error_message = "too many USB discard read errors";
+                break;
+            }
+        }
+    }
+    summary->discard_after_profile_elapsed_s = monotonic_s() - start;
+    summary->discarded_after_profile_bytes = discarded;
+    summary->discard_read_timeouts = timeouts;
+    summary->discard_read_errors = errors;
+    return errors > 20 ? -1 : 0;
+}
+
 static int write_analysis_json(const char *path, const struct run_summary *s) {
     if (path == NULL) return 0;
     FILE *fp = fopen(path, "w");
@@ -569,6 +659,10 @@ static int write_analysis_json(const char *path, const struct run_summary *s) {
             "  \"bytes_per_second\": %.3f,\n"
             "  \"read_timeouts\": %lld,\n"
             "  \"read_errors\": %lld,\n"
+            "  \"discard_after_profile_elapsed_s\": %.3f,\n"
+            "  \"discarded_after_profile_bytes\": %lld,\n"
+            "  \"discard_read_timeouts\": %lld,\n"
+            "  \"discard_read_errors\": %lld,\n"
             "  \"endpoint_in\": \"0x%02x\",\n"
             "  \"endpoint_out\": %s,\n"
             "  \"interface_number\": %d,\n"
@@ -582,7 +676,9 @@ static int write_analysis_json(const char *path, const struct run_summary *s) {
             "  \"error_message\": \"%s\"\n"
             "}\n",
             s->duration_requested_s, s->duration_actual_s, s->bytes_written, s->bytes_per_second,
-            s->read_timeouts, s->read_errors, s->endpoint_in,
+            s->read_timeouts, s->read_errors, s->discard_after_profile_elapsed_s,
+            s->discarded_after_profile_bytes, s->discard_read_timeouts, s->discard_read_errors,
+            s->endpoint_in,
             endpoint_out_json,
             s->interface_number, s->altsetting, s->id_vendor, s->id_product,
             s->serial_baud, s->ftdi_serial_mode ? "true" : "false",
@@ -763,6 +859,8 @@ int main(int argc, char **argv) {
             if (send_profile(handle, &selected, &opts, &profile) != 0) {
                 summary.exit_status = 1;
                 summary.error_message = "failed to send profile";
+            } else if (discard_after_profile_loop(handle, &selected, &opts, &summary, ftdi_serial_mode) != 0) {
+                summary.exit_status = 1;
             } else if (capture_loop(handle, &selected, &opts, &summary, ftdi_serial_mode) != 0) {
                 summary.exit_status = 1;
             }
