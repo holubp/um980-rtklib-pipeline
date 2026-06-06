@@ -461,8 +461,10 @@ um980-ppk pipeline rover.ubx \
 
 `--base-rtcm` and `--download-base` are mutually exclusive. The RTCM stream is
 converted with RTKLIB `convbin -r rtcm3` into a base OBS/NAV pair and then fed
-to the existing RTKLIB pipeline. If both converted base NAV and rover/downloaded
-NAV are available, normal `--nav-merge` selection applies.
+to the existing RTKLIB pipeline. Compressed `.rtcm3.xz` recordings from
+`record-base-rt` are decompressed locally before conversion and anchored with
+their sidecar recording start time when available. If both converted base NAV
+and rover/downloaded NAV are available, normal `--nav-merge` selection applies.
 
 ## Effective Run And NAV Diagnostics
 

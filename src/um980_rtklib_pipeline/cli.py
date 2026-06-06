@@ -4402,7 +4402,9 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         if getattr(args, "base_obs_list", None):
             base_obs.extend(_read_path_list(Path(args.base_obs_list)))
     converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
-    converted_base_obs, base_rtcm_nav = _convert_base_rtcm_if_requested(args, out_dir, base)
+    if getattr(args, "base_rtcm", None):
+        raw_base_rtcm = Path(args.base_rtcm).resolve(strict=False)
+        base_obs = [path for path in base_obs if Path(path).resolve(strict=False) != raw_base_rtcm]
     base_obs.extend(converted_base_obs)
     if args.station and args.download_base:
         base_started = time.perf_counter()
@@ -4446,6 +4448,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         return 0
     if not base_obs:
         raise ValueError("--base-obs or --download-base is required when pipeline runs RTKLIB")
+    base_obs = _dedupe_paths([Path(path) for path in base_obs])
     logging.info("pipeline step 3/3: run RTKLIB postprocessing")
     logging.info("checking rover/base observation time overlap: rover=%s base_files=%d", rover_obs, len(base_obs))
     base_obs, overlap_warnings = filter_rinex_obs_by_overlap(rover_obs, base_obs)

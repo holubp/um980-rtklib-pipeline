@@ -306,8 +306,11 @@ um980-ppk pipeline rover.ubx \
 
 The pipeline rejects `--base-rtcm` together with `--download-base` to avoid
 ambiguous base-source selection. Recorded RTCM is converted with RTKLIB
-`convbin -r rtcm3`; the converted base OBS is used as the base observation
-input and any converted NAV is included in normal `--nav-merge` selection.
+`convbin -r rtcm3`; compressed `.rtcm3.xz` recordings from `record-base-rt`
+are decompressed locally first, and the recording sidecar start time is passed
+to `convbin -tr` when available. The converted base OBS is used as the base
+observation input and any converted NAV is included in normal `--nav-merge`
+selection.
 
 RTK2Go is handled as a generic NTRIP caster. Use `ntrip-sourcetable` to fetch a
 grep-friendly raw sourcetable:

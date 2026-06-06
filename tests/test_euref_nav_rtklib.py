@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import lzma
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1535,7 +1536,11 @@ def test_pipeline_passes_base_resolution_to_resolver(tmp_path: Path, monkeypatch
             datetime(2026, 5, 23, 5, 31, tzinfo=UTC),
         ),
     )
-    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs: (base_obs, []))
+    def fake_filter_overlap(_rover, base_obs_arg):
+        assert [Path(item) for item in base_obs_arg] == [base]
+        return base_obs_arg, []
+
+    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", fake_filter_overlap)
     monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
 
     class Candidate:
@@ -1778,6 +1783,45 @@ def test_convert_base_rtcm_invokes_convbin(tmp_path: Path, monkeypatch):
     assert commands[0][commands[0].index("-r") + 1] == "rtcm3"
 
 
+def test_convert_base_rtcm_decompresses_xz_before_convbin(tmp_path: Path, monkeypatch):
+    rtcm = tmp_path / "base.rtcm3.xz"
+    rtcm.write_bytes(lzma.compress(b"rtcm"))
+    (tmp_path / "base.meta.json").write_text(
+        json.dumps({"start_time_utc": "2026-05-30T04:57:07.167866+00:00"}),
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(base_rt, "executable_exists", lambda _tool: True)
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        staged_input = Path(command[1])
+        assert staged_input.name == "run.input.rtcm3"
+        assert staged_input.read_bytes() == b"rtcm"
+        obs = Path(command[command.index("-o") + 1])
+        nav = Path(command[command.index("-n") + 1])
+        obs.write_text("     3.04           OBSERVATION DATA    M                   RINEX VERSION / TYPE\n", encoding="ascii")
+        nav.write_text("     3.04           NAVIGATION DATA     G                   RINEX VERSION / TYPE\nBODY\n", encoding="ascii")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(base_rt.subprocess, "run", fake_run)
+
+    obs, nav_files = base_rt.convert_rtcm_to_rinex(
+        rtcm_path=rtcm,
+        out_dir=tmp_path,
+        basename="run",
+        convbin="convbin",
+    )
+
+    assert obs == tmp_path / "run.base.obs"
+    assert nav_files == [tmp_path / "run.base.nav"]
+    assert commands
+    assert commands[0][commands[0].index("-tr") + 1 : commands[0].index("-tr") + 3] == [
+        "2026/05/30",
+        "04:57:07",
+    ]
+
+
 def test_pipeline_base_rtcm_conflicts_with_download_base(tmp_path: Path):
     args = cli.build_parser().parse_args(
         [
@@ -1824,8 +1868,20 @@ def test_pipeline_base_rtcm_skips_archive_download(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cli, "cmd_extract", lambda _args: 0)
     monkeypatch.setattr(cli, "cmd_rinex", lambda _args: 0)
     monkeypatch.setattr(cli, "_download_base_files_for_window", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("download should not run")))
-    monkeypatch.setattr(cli, "_convert_base_rtcm_if_requested", lambda *_args: ([base_obs], []))
-    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", lambda _rover, base_obs_arg: (base_obs_arg, []))
+    convert_calls = 0
+
+    def fake_convert(*_args):
+        nonlocal convert_calls
+        convert_calls += 1
+        return [base_obs], []
+
+    monkeypatch.setattr(cli, "_convert_base_rtcm_if_requested", fake_convert)
+    def fake_filter_overlap(_rover, base_obs_arg):
+        assert Path(base_rtcm) not in [Path(item) for item in base_obs_arg]
+        assert base_obs in [Path(item) for item in base_obs_arg]
+        return base_obs_arg, []
+
+    monkeypatch.setattr(cli, "filter_rinex_obs_by_overlap", fake_filter_overlap)
     monkeypatch.setattr(cli, "resolve_rtklib_tool", lambda tool, rtklib_dir=None: tool)
 
     class Candidate:
@@ -1839,6 +1895,7 @@ def test_pipeline_base_rtcm_skips_archive_download(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cli, "_run_rtklib_output_formats", lambda **_kwargs: [])
 
     assert cli.cmd_pipeline(args) == 0
+    assert convert_calls == 1
 
 
 def test_pipeline_executes_rtklib_with_generated_rover_obs(tmp_path: Path, monkeypatch):

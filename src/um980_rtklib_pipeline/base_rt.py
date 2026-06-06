@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import lzma
 import logging
+import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -63,6 +65,42 @@ class BaseRtRecordingResult:
 
 
 PopenFactory = Callable[..., subprocess.Popen]
+
+
+def _base_rtcm_metadata_candidates(rtcm_path: Path) -> list[Path]:
+    """Return sidecar metadata paths used by recorded RTCM streams."""
+
+    candidates = [rtcm_path.with_suffix(".meta.json")]
+    name = rtcm_path.name
+    for suffix in (".rtcm3.xz", ".rtcm3"):
+        if name.endswith(suffix):
+            candidates.append(rtcm_path.with_name(name[: -len(suffix)] + ".meta.json"))
+    return list(dict.fromkeys(candidates))
+
+
+def _base_rtcm_approx_time(rtcm_path: Path) -> datetime | None:
+    """Return approximate RTCM start time from recording metadata, if available."""
+
+    for candidate in _base_rtcm_metadata_candidates(rtcm_path):
+        if not candidate.exists():
+            continue
+        try:
+            metadata = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logging.warning("could not read base RTCM metadata sidecar: %s", candidate)
+            continue
+        value = metadata.get("start_time_utc")
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            logging.warning("could not parse base RTCM start_time_utc from %s: %s", candidate, value)
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    return None
 
 
 def build_ntrip_url(*, caster: str, port: int, mountpoint: str, user: str | None, password: str | None) -> str:
@@ -221,12 +259,23 @@ def convert_rtcm_to_rinex(
     if not rtcm_path.exists() or rtcm_path.stat().st_size <= 0:
         raise FileNotFoundError(f"base RTCM input is missing or empty: {rtcm_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    convbin_input = rtcm_path
+    if rtcm_path.suffix.lower() == ".xz":
+        convbin_input = out_dir / f"{basename}.input.rtcm3"
+        with lzma.open(rtcm_path, "rb") as source, convbin_input.open("wb") as target:
+            while chunk := source.read(1024 * 1024):
+                target.write(chunk)
+        if convbin_input.stat().st_size <= 0:
+            raise RuntimeError(f"decompressed base RTCM input is empty: {rtcm_path}")
+        source_stat = rtcm_path.stat()
+        os.utime(convbin_input, (source_stat.st_atime, source_stat.st_mtime))
+        logging.info("decompressed base RTCM for convbin: %s -> %s", rtcm_path, convbin_input)
     obs = out_dir / f"{basename}.base.obs"
     nav = out_dir / f"{basename}.base.nav"
     resolved_style = detect_rtklib_path_style(resolved_convbin, path_style)
     command = [
         executable_for_subprocess(resolved_convbin),
-        path_for_rtklib_argument(rtcm_path, resolved_style),
+        path_for_rtklib_argument(convbin_input, resolved_style),
         "-r",
         "rtcm3",
         "-od",
@@ -238,6 +287,9 @@ def convert_rtcm_to_rinex(
         "-n",
         path_for_rtklib_argument(nav, resolved_style),
     ]
+    approx_time = _base_rtcm_approx_time(rtcm_path)
+    if approx_time is not None:
+        command[2:2] = ["-tr", approx_time.strftime("%Y/%m/%d"), approx_time.strftime("%H:%M:%S")]
     logging.info("converting recorded base RTCM to RINEX: %s", format_command(command))
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     stdout_log = obs.with_suffix(".convbin.stdout.log")
